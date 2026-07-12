@@ -402,7 +402,7 @@ headline comparisons (all current-env):
 
 - parity @1024: coupled 0.61 -> signed-tanh 0.996 (n=6); GRU 1.0.
 - S3 @256: coupled L=4 0.54 -> rotation-snap 0.987 (n=8); GRU 1.0.
-- S3 @1024: coupled L=4 0.33 -> rotation-snap 0.889 (n=8); GRU 1.0.
+- S3 @1024: coupled L=4 0.34 -> rotation-snap 0.889 (n=8); GRU 1.0.
 
 Not run (scoped out, review rec 1): Grazzi-parameterized incumbent,
 DeltaNet. Signed-tanh should be presented as the Grazzi negative-

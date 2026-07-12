@@ -21,7 +21,7 @@ certificate.
 | parity @256 | 0.894 (coupled L=1) | signed-tanh L=1 | ≥0.9999 all 6 seeds |
 | parity @1024 | 0.610 | signed-tanh L=1 | mean 0.996, worst 0.979 (n=6) |
 | S3 @256 | 0.54 (coupled L=4) | rotation-snap L=1 | mean 0.987 (n=8) |
-| S3 @1024 | 0.33 (coupled L=4) | rotation-snap L=1 | mean 0.889; exact 1.0 in 2/8 seeds |
+| S3 @1024 | 0.34 (coupled L=4) | rotation-snap L=1 | mean 0.889; exact 1.0 in 2/8 seeds |
 | reference | GRU L=1: 1.0 everywhere (verified @1024, 3 seeds) | | |
 
 Mechanism verified: winning S3 models contain extractable 2×2
