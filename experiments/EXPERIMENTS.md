@@ -408,3 +408,42 @@ Not run (scoped out, review rec 1): Grazzi-parameterized incumbent,
 DeltaNet. Signed-tanh should be presented as the Grazzi negative-
 eigenvalue mechanism instantiated in minGRU until that comparison
 runs — a repo improvement, not a novelty claim.
+
+## Repair rounds 1-2 (`repair_probes.py`, `repair_round2.py`)
+
+Tested whether any cheap intervention converts the failed
+rotation-snap seeds. All four arms closed; none ships.
+
+**R1a — inference-time O(2) projection** (snap tanh(u) -> +/-1 on
+identified near-hom blocks; zero training): s2 0.726 -> 0.807@1024,
+s6 0.616 -> 0.645. Partial — most of the residual failure is
+readout-side, not transition calibration. Control clean (s0 stays
+1.0). Projecting ALL blocks hurts even s0 (1.0 -> 0.673@1024):
+Round 5's exactness-must-be-local law reproduced at inference with
+zero training.
+
+**R1b — injection probes**: the two perfect seeds implement
+DIFFERENT exact solutions. s0 = orbit automaton (ablating its
+automaton-block injections costs nothing). s1 = injection-driven:
+its automaton block's ||b|| is 2.35 (10x median) and ablating it
+collapses the model to 0.64 even at train length. With exact group
+transitions the injection sum is a group-convolution feature —
+signal, not noise. Round-5 law restated: injections through exact
+transitions are signal; injections trapped in non-contracting
+NON-automaton channels are noise.
+
+**R2a — projection + 400-step fine-tune**: trades in-distribution
+accuracy for length robustness instead of repairing (s6 mask-off:
+0.807@1024, +19, but @64 drops 0.99 -> 0.93; val@128 falls during
+fine-tune). Failed seeds are globally mis-oriented, not
+under-polished. Retired.
+
+**R2b — hom-error vs val@128 checkpoint selection**: exact null.
+Both criteria select the IDENTICAL checkpoint on both failed seeds.
+Standard best-validation practice is sufficient; the homomorphism
+certificate remains a diagnostic (mechanism verification + horizon
+prediction via eps*T), not a selector. Retired.
+
+**Closed shipping story**: rotation-snap + best-val@128 selection +
+retry-on-flag (best val < 1.0 flags every bad run). No repair
+machinery earned a place.

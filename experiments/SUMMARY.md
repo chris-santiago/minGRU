@@ -152,22 +152,36 @@ Implications:
    select checkpoints on a held-out moderate length (or better:
    on hom error, see next work).
 
+## Repair agenda — CLOSED (rounds 1-2, negative)
+
+All cheap repairs tested and retired (`repair_probes.py`,
+`repair_round2.py`, results in `repair_results.json` /
+`repair2_results.json`; detail in EXPERIMENTS.md):
+
+- Inference-time projection: partial (+3..8 pts @1024); residual
+  failure is readout-side. Projecting all blocks hurts even perfect
+  seeds — exactness-must-be-local confirmed at inference.
+- Projection + fine-tune: trades in-dist accuracy for length
+  robustness; no clean recovery. Failed seeds are globally
+  mis-oriented, not under-polished.
+- Hom-error checkpoint selection: exact null vs best-val@128 (same
+  checkpoint selected on both failed seeds). Standard best-val
+  practice suffices; the certificate is a diagnostic, not a selector.
+- New finding: the two perfect seeds implement DIFFERENT exact
+  solutions — s0 orbit-based (injections ablatable), s1
+  injection-driven (automaton-block ||b|| 10x median; ablation
+  collapses it). Injections through exact transitions are signal.
+
+**Final shipping story: variant + best-val@128 selection +
+retry-on-flag (best val < 1.0 catches every bad run).**
+
 ## Open work, prioritized
 
-1. **Repair experiments (~one afternoon, highest value):**
-   a. Inference-time projection: snap tanh(u) → ±1 on identified
-      automaton blocks of failed seeds (θ already snapped). Might
-      convert s2/s6 with zero retraining.
-   b. Local hardening: brief fine-tune with u-STE applied ONLY to
-      identified automaton blocks (resolves the Round-5 tension —
-      exactness where the automaton lives, contraction elsewhere).
-   c. Hom-error checkpoint selection: replace val@128 (which
-      saturates) with min hom error — finer, data-free.
-   d. Head sparsification: prune readout to certified channels
-      (targets the readout-leak anomalies; minutes).
-2. **Probe gaps:** measure ||b|| (not just z) on automaton blocks;
-   ablate injection at inference on s1; add readout-attribution
-   weighting to the block ranking.
+1. **Head sparsification** (only remaining repair candidate,
+   readout-side): prune the head to certified channels; targets the
+   anomalies (s6 paradox, parity s2 leak). Task-side machinery —
+   does not block promotion.
+2. **Probe gap:** readout-attribution weighting for block ranking.
 3. **Incumbent grid (external review rec 1, gates novelty claims):**
    Grazzi-parameterized signed scan (near-free — a `_coeffs`
    variant), GRU already done, DeltaNet n_h∈{1,2} (expensive:

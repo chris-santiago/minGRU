@@ -175,6 +175,13 @@ class RotationMinGRU(nn.Module):
                     [2 * math.pi / snap[j % len(snap)] for j in range(self.n_blocks)]
                 ),
             )
+        # Post-hoc analysis hooks (repair round 1); both default-off.
+        # project_mask (n,) bool: snap tanh(u) -> +/-1 on masked blocks at
+        # inference (theta is already snapped; this removes the remaining
+        # reflection-magnitude inexactness). ablate_b_mask (n,) bool: zero
+        # the injection b on masked blocks at inference.
+        self.project_mask: torch.Tensor | None = None
+        self.ablate_b_mask: torch.Tensor | None = None
 
     def _transitions(self, x):
         theta = self.linear_theta(x)                      # (B, T, n)
@@ -187,6 +194,9 @@ class RotationMinGRU(nn.Module):
         d = torch.tanh(self.linear_u(x))
         if self.ortho:
             d = d + (torch.sign(d) - d).detach()
+        elif self.project_mask is not None:
+            d_exact = torch.where(d >= 0, torch.ones_like(d), -torch.ones_like(d))
+            d = torch.where(self.project_mask, d_exact, d)
         # R(theta) @ diag(1, d) = [[c, -s*d], [s, c*d]]
         row1 = torch.stack([c, -s * d], dim=-1)
         row2 = torch.stack([s, c * d], dim=-1)
@@ -196,6 +206,8 @@ class RotationMinGRU(nn.Module):
         B, T, _ = x.shape
         z = torch.sigmoid(self.linear_z(x))
         b = (z * self.linear_h(x)).view(B, T, self.n_blocks, 2)
+        if self.ablate_b_mask is not None:
+            b = torch.where(self.ablate_b_mask[:, None], torch.zeros_like(b), b)
         M = self._transitions(x)
         A, Bc = matrix_scan(M, b)
         h0 = self.h0.expand(B, self.n_blocks, 2) if h_0 is None else h_0
