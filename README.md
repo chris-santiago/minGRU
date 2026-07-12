@@ -178,7 +178,16 @@ All exposed state is **real hidden state** — an output of `forward()` or
   put all three mixers in the same broad class as Mamba/S6 and GLA:
   fixed-depth stacks are TC⁰ (Merrill et al., *The Illusion of State in
   State-Space Models*) and cannot do unbounded state tracking that a
-  single nonlinear GRU layer can. Depth recovers bounded-depth nonlinear
+  single nonlinear GRU layer can. (Circuit-complexity shorthand used
+  throughout: **TC⁰** is the class of problems solvable by
+  constant-depth parallel circuits — depth that does *not* grow with
+  sequence length, which is exactly what a stack of parallel scans is.
+  **NC¹** is the strictly-harder-believed class needing depth that
+  grows logarithmically with input length; its complete problems, like
+  composing arbitrary permutations of 5 elements (S5), are the
+  canonical "inherently sequential" computations — the ones a true
+  recurrence handles step by step and a constant-depth parallel model
+  is believed unable to.) Depth recovers bounded-depth nonlinear
   interaction with history, not sequential computation. Depth-matched
   comparisons against a standard GRU confound layer count with
   mechanism. Non-diagonal transitions (`RotationMinGRU`) lift the
@@ -283,6 +292,19 @@ one layer exactly represents the S3 running-product task; see the
 mechanism verification in `experiments/SUMMARY.md` (per-block matrices
 extracted from a trained model satisfy the D3 composition table to
 ~1e-4 — a certifiable automaton, not an inferred one).
+
+The underlying idea — non-diagonal transitions from the orthogonal
+family unlocking non-abelian state tracking in a parallelizable linear
+RNN — is DeltaProduct's (Siems et al., NeurIPS 2025): they build
+transitions as products of generalized Householder reflections (two
+reflections compose to a rotation) and demonstrate group state
+tracking including dihedral tasks. What is specific to this variant is
+the fixed 2x2 planar-block parameterization with an explicit angle
+head, the STE snap grid that manufactures attractors at exact group
+angles, and the weights-level homomorphism certificate. No head-to-head
+comparison against DeltaProduct/DeltaNet has been run here (see
+`experiments/SUMMARY.md`, Open work) — treat this as a minGRU-native
+take on their mechanism, not a claimed improvement over it.
 
 **Angle snapping (`snap`).** With `snap` set (default `(2, 3, 4, 6)`,
 cycled across blocks), `theta_t` is quantized per block to an exact
@@ -527,3 +549,7 @@ in State-Space Models.* ICML 2024. arXiv:2404.08819.
 
 Grazzi, R., et al. (2025). *Unlocking State-Tracking in Linear RNNs
 Through Negative Eigenvalues.* ICLR 2025.
+
+Siems, J., Carstensen, T., Zela, A., Hutter, F., Pontil, M., &
+Grazzi, R. (2025). *DeltaProduct: Improving State-Tracking in Linear
+RNNs via Householder Products.* NeurIPS 2025. arXiv:2502.10297.
