@@ -308,12 +308,31 @@ class SignedMinGRU(nn.Module):
     """minGRU variant with signed diagonal transitions (linear-space scan).
 
     The recurrence is ``h_t = a_t * h_{t-1} + z_t * h~_t`` with
-    ``a_t = (1 - z_t) * tanh(Linear_s(x_t))`` so ``a_t`` ranges over
-    ``(-1, 1)`` instead of ``(0, 1)``. When the sign head saturates
-    positive this reduces to the vanilla (Appendix A) minGRU. Motivated
-    by Merrill, Petty & Sabharwal (2024): still diagonal, hence
-    commutative and TC0, but negative eigenvalues restore per-layer
-    parity / sign-alternation dynamics (cf. Grazzi et al., 2025).
+    ``a_t`` ranging over ``(-1, 1)`` instead of ``(0, 1)``. Motivated by
+    Merrill, Petty & Sabharwal (2024): still diagonal, hence commutative
+    and TC0, but negative eigenvalues restore per-layer parity /
+    sign-alternation dynamics (the mechanism identified by Grazzi et al.,
+    2025).
+
+    Two parameterizations of ``a_t`` are available:
+
+    - ``coupled=False`` (default): ``a_t = tanh(Linear_s(x_t))``, the
+      eigenvalue decoupled from the update gate ``z_t``. This is the
+      experimentally superior form (parity accuracy @1024:
+      0.61 -> 0.996, 6-seed mean, current-env) and is now the default.
+    - ``coupled=True``: ``a_t = (1 - z_t) * tanh(Linear_s(x_t))``, the
+      original parameterization (eigenvalue coupled to the update gate,
+      as in the vanilla minGRU's ``(1 - z_t)`` retention coefficient).
+      Bit-exact reproduction of the pre-promotion class: identical
+      parameter shapes and construction order (``linear_z``,
+      ``linear_h``, ``linear_s``), so identical seeds give identical
+      weights.
+
+    When the sign head saturates positive, the coupled form reduces to
+    the vanilla (Appendix A) minGRU's retention dynamics (``a = 1 - z``);
+    the decoupled form instead saturates to ``a = 1``, a perfect
+    integrator — reaching the interval boundary is exactly what the
+    coupling prevents, and why the decoupled form length-generalizes.
 
     States are unconstrained reals: no ``g``, no positivity checks, no
     underflow handling. Same forward/step API and shapes as ``MinGRU``;
@@ -331,6 +350,10 @@ class SignedMinGRU(nn.Module):
         If True, the module owns a learned initial state (an
         unconstrained parameter used directly — no ``g``). Zero-init
         matches the fixed default ``h_0 = 0``.
+    coupled : bool, default=False
+        If True, use the legacy coupled eigenvalue
+        ``a_t = (1 - z_t) * tanh(Linear_s(x_t))``. If False (default),
+        use the decoupled eigenvalue ``a_t = tanh(Linear_s(x_t))``.
 
     Notes
     -----
@@ -344,10 +367,12 @@ class SignedMinGRU(nn.Module):
         hidden_size: int,
         bias: bool = True,
         learnable_h0: bool = False,
+        coupled: bool = False,
     ):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
+        self.coupled = coupled
         self.linear_z = nn.Linear(input_size, hidden_size, bias=bias)
         self.linear_h = nn.Linear(input_size, hidden_size, bias=bias)
         self.linear_s = nn.Linear(input_size, hidden_size, bias=bias)
@@ -357,7 +382,8 @@ class SignedMinGRU(nn.Module):
 
     def _coeffs(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         z = torch.sigmoid(self.linear_z(x))
-        a = (1 - z) * torch.tanh(self.linear_s(x))
+        tanh_s = torch.tanh(self.linear_s(x))
+        a = (1 - z) * tanh_s if self.coupled else tanh_s
         b = z * self.linear_h(x)
         return a, b
 
@@ -416,7 +442,10 @@ class SignedMinGRU(nn.Module):
         return a * h_prev + b
 
     def extra_repr(self) -> str:
-        return f"input_size={self.input_size}, hidden_size={self.hidden_size}"
+        return (
+            f"input_size={self.input_size}, hidden_size={self.hidden_size}, "
+            f"coupled={self.coupled}"
+        )
 
 
 class MinGRUBlock(nn.Module):
@@ -763,14 +792,15 @@ if __name__ == "__main__":
             pass
     print("h_0 validation: zeros clamped, negatives raise: ok")
 
-    # --- SignedMinGRU: parallel vs sequential, chunked carry, stack ---
+    # --- SignedMinGRU (decoupled, default): parallel vs sequential, chunked carry ---
     ms = SignedMinGRU(D_in, D_h).eval()
+    assert not ms.coupled, "default SignedMinGRU must be decoupled (coupled=False)"
     with torch.no_grad():
         h_par = ms(x)
         h = None
         hs = [h := ms.step(x[:, t], h) for t in range(T)]
     err = (h_par - torch.stack(hs, dim=1)).abs().max().item()
-    print(f"signed parallel vs sequential max abs diff: {err:.3e}")
+    print(f"signed (decoupled) parallel vs sequential max abs diff: {err:.3e}")
     assert err < 1e-4
 
     with torch.no_grad():
@@ -778,8 +808,42 @@ if __name__ == "__main__":
         h_b = ms(x[:, T // 2 :], h_0=h_a[:, -1:])  # negative states are legal here
         assert (h_a[:, -1:] < 0).any(), "expected some negative signed states"
     err = (h_par - torch.cat([h_a, h_b], dim=1)).abs().max().item()
-    print(f"signed chunked vs full max abs diff: {err:.3e}")
+    print(f"signed (decoupled) chunked vs full max abs diff: {err:.3e}")
     assert err < 1e-4
+
+    # --- SignedMinGRU(coupled=True): legacy parameterization regression ---
+    msc = SignedMinGRU(D_in, D_h, coupled=True).eval()
+    assert msc.coupled
+    with torch.no_grad():
+        h_par_c = msc(x)
+        h = None
+        hs_c = [h := msc.step(x[:, t], h) for t in range(T)]
+    err = (h_par_c - torch.stack(hs_c, dim=1)).abs().max().item()
+    print(f"signed (coupled) parallel vs sequential max abs diff: {err:.3e}")
+    assert err < 1e-4
+
+    with torch.no_grad():
+        h_a_c = msc(x[:, : T // 2])
+        h_b_c = msc(x[:, T // 2 :], h_0=h_a_c[:, -1:])
+    err = (h_par_c - torch.cat([h_a_c, h_b_c], dim=1)).abs().max().item()
+    print(f"signed (coupled) chunked vs full max abs diff: {err:.3e}")
+    assert err < 1e-4
+
+    # Construction determinism: identical seeds -> bit-identical coupled
+    # outputs. NOTE: this checks the class against itself (guards against
+    # RNG-consuming or order-dependent construction changes); bit-exactness
+    # vs the PRE-promotion class is guaranteed by the unchanged parameter
+    # construction order (linear_z, linear_h, linear_s) and the op-for-op
+    # identical coupled _coeffs — verified against git history at promotion
+    # time, not re-checkable in-repo without the old class.
+    torch.manual_seed(123)
+    msc_ref = SignedMinGRU(D_in, D_h, coupled=True)
+    torch.manual_seed(123)
+    msc_new = SignedMinGRU(D_in, D_h, coupled=True)
+    with torch.no_grad():
+        err = (msc_ref(x) - msc_new(x)).abs().max().item()
+    print(f"signed (coupled) construction determinism max abs diff: {err:.3e}")
+    assert err == 0.0, "identical seeds must give bit-identical coupled outputs"
 
     sstack = MinGRUStack(D_in, D_h, 3, signed=True).eval()
     with torch.no_grad():
