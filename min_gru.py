@@ -34,6 +34,8 @@ provides cross-channel interaction that the diagonal scan cannot.
 forward and O(1)-memory streaming via step().
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -304,6 +306,63 @@ def linear_scan(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.T
     return A, Bc
 
 
+def matrix_scan(M: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Associative scan for ``h_t = M_t @ h_{t-1} + b_t``, 2x2 block transitions.
+
+    The non-commutative generalization of ``linear_scan``: transitions
+    are 2x2 matrices composed by matrix multiplication instead of
+    scalars multiplied together, so the running product depends on
+    order. This is what lets a mixer built on ``matrix_scan``
+    (``RotationMinGRU``) express non-abelian state tracking that a
+    diagonal/commutative scan (``linear_scan``, ``parallel_scan_log``)
+    provably cannot. Same Hillis-Steele doubling scheme as
+    ``linear_scan``, over the affine 2x2 monoid
+    ``(A1, B1) o (A2, B2) = (A2 @ A1, A2 @ B1 + B2)``: O(T log T) work,
+    O(log T) depth, pure torch ops, differentiable. The identity
+    padding is the 2x2 identity matrix (not 1.0), and composition order
+    is ``A_current @ A_earlier`` — matrix multiplication does not
+    commute, unlike ``linear_scan``'s scalar product.
+
+    Parameters
+    ----------
+    M : torch.Tensor
+        Shape ``(B, T, n, 2, 2)``. Per-block transition matrices
+        ``M_t``; stability expects ``M_t``'s spectral norm ``<= 1`` but
+        this is not enforced.
+    b : torch.Tensor
+        Shape ``(B, T, n, 2)``. Additive inputs ``b_t``, viewed as
+        ``n`` 2-vectors per timestep.
+
+    Returns
+    -------
+    tuple of torch.Tensor
+        ``(A, Bc)``, shapes ``(B, T, n, 2, 2)`` and ``(B, T, n, 2)``,
+        each aligned to ``t``, where ``h_t = A_t @ h_0 + Bc_t`` with
+        ``A_t`` the running matrix product of ``M`` and ``Bc_t`` the
+        ``h_0 = 0`` solution of the recurrence.
+
+    Notes
+    -----
+    Same simplicity-over-efficiency tradeoff as ``linear_scan``:
+    Hillis-Steele is work-inefficient (O(T log T) vs O(T)) and retains
+    O(log T) full ``(B, T, n, 2, 2)`` tensors for autograd. Fine at
+    this repo's target sequence lengths (T <= 256); revisit if
+    sequences grow large.
+    """
+    B_, T, n = M.shape[:3]
+    eye = torch.eye(2, dtype=M.dtype, device=M.device)
+    A, Bc = M, b
+    offset = 1
+    while offset < T:
+        pad_A = eye.expand(B_, offset, n, 2, 2)
+        A_prev = torch.cat([pad_A, A[:, : T - offset]], dim=1)
+        B_prev = torch.cat([b.new_zeros(B_, offset, n, 2), Bc[:, : T - offset]], dim=1)
+        Bc = torch.einsum("btnij,btnj->btni", A, B_prev) + Bc
+        A = A @ A_prev
+        offset *= 2
+    return A, Bc
+
+
 class SignedMinGRU(nn.Module):
     """minGRU variant with signed diagonal transitions (linear-space scan).
 
@@ -445,6 +504,246 @@ class SignedMinGRU(nn.Module):
         return (
             f"input_size={self.input_size}, hidden_size={self.hidden_size}, "
             f"coupled={self.coupled}"
+        )
+
+
+class RotationMinGRU(nn.Module):
+    """minGRU variant with 2x2 block rotation transitions (non-diagonal).
+
+    State is ``n = hidden_size / 2`` independent planar (2D) blocks.
+    Per block, the recurrence is a full 2x2 affine map instead of a
+    scalar one:
+
+        M_t = R(theta_t) @ diag(1, tanh(u_t))
+        h_t = M_t @ h_{t-1} + b_t,     b_t = z_t * Linear_h(x_t)
+
+    (``h_{t-1}``, ``h_t``, ``b_t`` viewed as 2-vectors per block).
+    Unlike ``MinGRU`` and ``SignedMinGRU``, per-block transitions do
+    not commute (2x2 rotation/reflection matrices form a non-abelian
+    group under composition), so this mixer — with a non-commutative
+    parallel scan, ``matrix_scan`` — can represent state-tracking
+    automata over non-abelian groups that a diagonal (commutative)
+    scan provably cannot. D3 (isomorphic to S3, the smallest
+    non-abelian group) embeds in O(2), so one layer of this mixer can
+    represent the S3 running product exactly; see
+    ``experiments/SUMMARY.md`` for the mechanism verification
+    (per-block matrices extracted from a trained model satisfy the D3
+    composition table to ~1e-4).
+
+    Angle snapping (``snap``): with ``snap`` set, ``theta_t`` is
+    quantized per block to an exact multiple of ``2*pi/K`` via a
+    straight-through estimator — forward uses the snapped angle,
+    gradient passes through the pre-snap "soft" angle unchanged. ``K``
+    is cycled across blocks from the ``snap`` tuple (block ``j`` uses
+    ``snap[j % len(snap)]``). This manufactures attractors at exact
+    group elements, the same way ``tanh``'s asymptote manufactures an
+    attractor at eigenvalue -1 for ``SignedMinGRU``: without snapping,
+    plain rotation angles have no attractor and drift with sequence
+    length (error compounds with T). The snap grid must contain the
+    group being tracked: choose ``K`` values whose rotations
+    (``2*pi/K``) generate, or coincide with, the target group's
+    rotation subgroup, or the exact automaton is not representable on
+    the grid at all (e.g. tracking Z/5 needs a multiple of 5 in
+    ``snap``). The default ``snap=(2, 3, 4, 6)`` was chosen for the
+    D3/S3 task; other state-tracking targets need their own grid.
+    ``snap=None`` gives continuous (unsnapped) rotations — a
+    legitimate, documented ladder rung, but angles then drift under
+    length generalization since there is no attractor at the task's
+    true transition angle; use only when exact length generalization
+    is not required.
+
+    Depth: validated at L=1 ONLY. Stacking these mixers breaks STE
+    snap training (the straight-through discontinuity compounds across
+    layers) — do not assume depth helps here the way it does for the
+    diagonal mixers.
+
+    Training protocol: the exact automaton is reachable but is NOT a
+    stable attractor of standard training — runs wander in and out of
+    it during optimization. The validated protocol is best-checkpoint
+    selection by validation accuracy at a length LONGER than the
+    training length (e.g. T=128 when training at T=64; not one of the
+    eventual test lengths), evaluated over the full step budget instead
+    of early-stopping, plus a retry-on-flag rule: a best validation
+    score at that checkpoint length below 1.0 flags the run as failed
+    (this perfectly separated good from bad seeds in the recorded
+    evidence). See ``experiments/SUMMARY.md`` for the full protocol,
+    per-seed success rate, and mechanism verification.
+
+    Excludes refuted experiment-loop mechanisms: no full orthogonality
+    constraint (``ortho``), no grid-attraction regularizer (``reg``),
+    no post-hoc projection/ablation masks. All were tried and either
+    hurt length generalization or were redundant with the best-val
+    selection protocol above; see ``experiments/SUMMARY.md`` rounds 5
+    and 8.
+
+    ``h_0`` is an unconditional learnable parameter (no
+    ``learnable_h0`` flag, unlike the module's other two mixers):
+    ``h_0 = 0`` has no orbit under the group action (a fixed point
+    cannot demonstrate state tracking), and a state vector lying on a
+    reflection axis collapses reflections onto rotations. A random
+    nonzero learned vector avoids both failure modes.
+
+    Parameters
+    ----------
+    input_size : int
+        Dimensionality of the inputs ``x_t``.
+    hidden_size : int
+        Dimensionality of the hidden states ``h_t``; must be even
+        (``hidden_size = 2 * n_blocks``).
+    bias : bool, default=True
+        Whether the four linear maps carry bias terms.
+    snap : tuple of int, or None, default=(2, 3, 4, 6)
+        Per-block angle-snap grid orders ``K`` (cycled across blocks);
+        each block's angle snaps to multiples of ``2*pi/K``. ``None``
+        disables snapping (continuous rotations; see above).
+
+    Raises
+    ------
+    ValueError
+        If ``hidden_size`` is odd.
+
+    Notes
+    -----
+    Parameter count is 4 linear heads (z, h, theta, u) vs.
+    ``SignedMinGRU``'s 3 — account for this in parameter-matched
+    comparisons. Same forward/step shapes as the module's other
+    mixers: ``forward`` maps ``x (B, T, input_size)`` with optional
+    ``h_0 (B, 1, hidden_size)`` to ``(B, T, hidden_size)``; ``step``
+    maps ``x_t (B, input_size)`` with optional ``h_prev
+    (B, hidden_size)`` to ``(B, hidden_size)``.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        bias: bool = True,
+        snap: tuple[int, ...] | None = (2, 3, 4, 6),
+    ):
+        super().__init__()
+        if hidden_size % 2 != 0:
+            raise ValueError(
+                f"RotationMinGRU requires an even hidden_size (got {hidden_size}); "
+                "state is n = hidden_size / 2 planar 2D blocks."
+            )
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.n_blocks = hidden_size // 2
+        self.snap = snap
+        self.linear_z = nn.Linear(input_size, hidden_size, bias=bias)
+        self.linear_h = nn.Linear(input_size, hidden_size, bias=bias)
+        self.linear_theta = nn.Linear(input_size, self.n_blocks, bias=bias)
+        self.linear_u = nn.Linear(input_size, self.n_blocks, bias=bias)
+        self.h0 = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.5)
+        if snap is not None:
+            self.register_buffer(
+                "snap_step",
+                torch.tensor(
+                    [2 * math.pi / snap[j % len(snap)] for j in range(self.n_blocks)]
+                ),
+            )
+
+    def _coeffs(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-block transition matrix and injection; shared by forward/step.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Shape ``(..., input_size)`` — ``forward`` passes
+            ``(B, T, input_size)``, ``step`` passes ``(B,
+            input_size)``; both work unchanged since ``nn.Linear`` and
+            the elementwise ops here broadcast uniformly over leading
+            dims, so this single helper serves both call paths and
+            they cannot drift apart.
+
+        Returns
+        -------
+        tuple of torch.Tensor
+            ``M``, shape ``(..., n_blocks, 2, 2)``: the (possibly
+            snapped) transition ``R(theta_t) @ diag(1, tanh(u_t))``.
+            ``b``, shape ``(..., n_blocks, 2)``: the injection
+            ``z_t * Linear_h(x_t)``, reshaped into ``n_blocks``
+            2-vectors.
+        """
+        theta = self.linear_theta(x)
+        if self.snap is not None:
+            snapped = torch.round(theta / self.snap_step) * self.snap_step
+            # STE: forward uses the snapped angle; gradient passes
+            # through the pre-snap angle unchanged.
+            theta = theta + (snapped - theta).detach()
+        cos_t, sin_t = torch.cos(theta), torch.sin(theta)
+        d = torch.tanh(self.linear_u(x))
+        # R(theta) @ diag(1, d) = [[cos, -sin*d], [sin, cos*d]]
+        row0 = torch.stack([cos_t, -sin_t * d], dim=-1)
+        row1 = torch.stack([sin_t, cos_t * d], dim=-1)
+        M = torch.stack([row0, row1], dim=-2)
+
+        z = torch.sigmoid(self.linear_z(x))
+        b = z * self.linear_h(x)
+        b = b.reshape(*b.shape[:-1], self.n_blocks, 2)
+        return M, b
+
+    def forward(self, x: torch.Tensor, h_0: torch.Tensor | None = None) -> torch.Tensor:
+        """Parallel forward over a full sequence.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input sequence, shape ``(B, T, input_size)``.
+        h_0 : torch.Tensor, optional
+            Initial hidden state, shape ``(B, 1, hidden_size)``. Any
+            real values (reshaped into ``n_blocks`` 2-vectors
+            internally). Defaults to the learned initial state.
+
+        Returns
+        -------
+        torch.Tensor
+            All hidden states ``h_1..h_T``, shape
+            ``(B, T, hidden_size)``.
+        """
+        B, T, _ = x.shape
+        if h_0 is None:
+            h_0 = self.h0.expand(B, 1, self.hidden_size)
+        h0_blocks = h_0.reshape(B, self.n_blocks, 2)
+        M, b = self._coeffs(x)
+        A, Bc = matrix_scan(M, b)
+        h = torch.einsum("btnij,bnj->btni", A, h0_blocks) + Bc
+        return h.reshape(B, T, self.hidden_size)
+
+    @torch.no_grad()
+    def step(self, x_t: torch.Tensor, h_prev: torch.Tensor | None = None) -> torch.Tensor:
+        """Single recurrent step; same real-state convention as forward().
+
+        Computed from the same ``_coeffs`` helper ``forward()`` uses
+        (applied per-step instead of over the full sequence), so the
+        two paths cannot drift apart — mirrors how ``SignedMinGRU``
+        shares ``_coeffs`` between its ``forward``/``step``.
+
+        Parameters
+        ----------
+        x_t : torch.Tensor
+            Input at the current timestep, shape ``(B, input_size)``.
+        h_prev : torch.Tensor, optional
+            Previous hidden state, shape ``(B, hidden_size)``. Defaults
+            to the learned initial state.
+
+        Returns
+        -------
+        torch.Tensor
+            New hidden state, shape ``(B, hidden_size)``.
+        """
+        B = x_t.size(0)
+        if h_prev is None:
+            h_prev = self.h0.expand(B, 1, self.hidden_size)[:, 0]
+        h_prev_blocks = h_prev.reshape(B, self.n_blocks, 2)
+        M, b = self._coeffs(x_t)
+        h = torch.einsum("bnij,bnj->bni", M, h_prev_blocks) + b
+        return h.reshape(B, self.hidden_size)
+
+    def extra_repr(self) -> str:
+        return (
+            f"input_size={self.input_size}, hidden_size={self.hidden_size}, "
+            f"snap={self.snap}"
         )
 
 
@@ -860,3 +1159,75 @@ if __name__ == "__main__":
     loss = MinGRUStack(D_in, D_h, 3, signed=True)(x).sum()
     loss.backward()
     print("signed stack gradcheck ok")
+
+    # --- matrix_scan vs brute-force sequential recurrence (signed 2x2 coeffs) ---
+    torch.manual_seed(0)
+    Bm, Tm, Nm = 3, 17, 5
+    Mm = torch.randn(Bm, Tm, Nm, 2, 2) * 0.5  # unconstrained signed entries
+    bm = torch.randn(Bm, Tm, Nm, 2)
+    h0m = torch.randn(Bm, Nm, 2)
+    Am, Bcm = matrix_scan(Mm, bm)
+    h_scan = torch.einsum("btnij,bnj->btni", Am, h0m) + Bcm
+    h = h0m
+    hs = []
+    for t in range(Tm):
+        h = torch.einsum("bnij,bnj->bni", Mm[:, t], h) + bm[:, t]
+        hs.append(h)
+    h_seq = torch.stack(hs, dim=1)
+    err = (h_scan - h_seq).abs().max().item()
+    print(f"matrix_scan vs sequential max abs diff: {err:.3e}")
+    assert err < 1e-4, "matrix_scan does not match sequential recurrence"
+
+    Mm.requires_grad_(True)
+    Am, Bcm = matrix_scan(Mm, bm)
+    Bcm.sum().backward()
+    assert Mm.grad is not None and torch.isfinite(Mm.grad).all()
+    print("matrix_scan gradcheck-lite ok")
+
+    # --- RotationMinGRU: parallel vs sequential, chunked carry ---
+    torch.manual_seed(0)
+    mr = RotationMinGRU(D_in, D_h).eval()
+    with torch.no_grad():
+        h_par = mr(x)
+        h = None
+        hs = [h := mr.step(x[:, t], h) for t in range(T)]
+    err = (h_par - torch.stack(hs, dim=1)).abs().max().item()
+    print(f"rotation parallel vs sequential max abs diff: {err:.3e}")
+    assert err < 1e-4
+
+    with torch.no_grad():
+        h_a = mr(x[:, : T // 2])
+        h_b = mr(x[:, T // 2 :], h_0=h_a[:, -1:])
+    err = (h_par - torch.cat([h_a, h_b], dim=1)).abs().max().item()
+    print(f"rotation chunked vs full max abs diff: {err:.3e}")
+    assert err < 1e-4
+
+    # --- RotationMinGRU: snapped angles land exactly on the grid ---
+    with torch.no_grad():
+        M_used, _ = mr._coeffs(x)
+    theta_used = torch.atan2(M_used[..., 1, 0], M_used[..., 0, 0])
+    ratio = theta_used / mr.snap_step
+    dev = (ratio - torch.round(ratio)).abs().max().item()
+    print(f"rotation snapped angle grid deviation: {dev:.3e}")
+    assert dev < 1e-4, "snapped angles must land exactly on the grid"
+
+    # --- RotationMinGRU: gradients reach all four heads and h0 ---
+    mr_grad = RotationMinGRU(D_in, D_h)
+    mr_grad(x).sum().backward()
+    for name, p in [
+        ("linear_z", mr_grad.linear_z.weight),
+        ("linear_h", mr_grad.linear_h.weight),
+        ("linear_theta", mr_grad.linear_theta.weight),
+        ("linear_u", mr_grad.linear_u.weight),
+        ("h0", mr_grad.h0),
+    ]:
+        assert p.grad is not None and p.grad.abs().sum() > 0, f"{name} received no gradient"
+    print("rotation gradcheck ok: all four heads + h0 receive gradient")
+
+    # --- RotationMinGRU: odd hidden_size raises ---
+    try:
+        RotationMinGRU(D_in, D_h + 1)
+        raise AssertionError("odd hidden_size should have raised ValueError")
+    except ValueError:
+        pass
+    print("rotation odd hidden_size raises: ok")
