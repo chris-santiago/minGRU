@@ -25,13 +25,17 @@ positive — a property of the paper's log-space variant, not of the
 Parameter count: O(2 * d_h * d_x) vs. O(3 * d_h * (d_x + d_h)) for a
 standard GRU.
 
-`MinGRU` is kept atomic (one scan layer). `MinGRUBlock` wraps it in the
-standard pre-norm residual template (LN -> minGRU -> residual, then
-LN -> MLP -> residual), which supplies the inter-layer nonlinear mixing:
-layer l's gates condition on layer l-1's hidden states, and the MLP
-provides cross-channel interaction that the diagonal scan cannot.
-`MinGRUStack` stacks N blocks and supports both parallel training-mode
-forward and O(1)-memory streaming via step().
+`MinGRU`, `SignedMinGRU`, and `RotationMinGRU` are each kept atomic (one
+scan layer, one sequence-mixing mechanism). `MinGRUBlock` wraps any one
+of them, chosen via `mixer="log"|"signed"|"rotation"` (plus
+`mixer_kwargs` for per-mixer config such as `coupled=True` or a custom
+`snap` grid), in the standard pre-norm residual template (LN -> mixer ->
+residual, then LN -> MLP -> residual), which supplies the inter-layer
+nonlinear mixing: layer l's gates condition on layer l-1's hidden
+states, and the MLP provides cross-channel interaction that a diagonal
+scan cannot. `MinGRUStack` stacks N blocks under a single `mixer`
+selection and supports both parallel training-mode forward and
+O(1)-memory streaming via step().
 """
 
 import math
@@ -765,11 +769,27 @@ class MinGRUBlock(nn.Module):
     dropout : float, default=0.0
         Applied after the minGRU output and inside the MLP.
     learnable_h0 : bool, default=False
-        Passed through to the block's ``MinGRU``; see ``MinGRU``.
-    signed : bool, default=False
-        If True, use ``SignedMinGRU`` (signed transitions, linear-space
-        scan) as the sequence mixer instead of ``MinGRU``.
+        Routed to the block's mixer when ``mixer`` is ``"log"`` or
+        ``"signed"`` (see ``MinGRU`` / ``SignedMinGRU``). Not accepted
+        by ``"rotation"``: ``RotationMinGRU``'s ``h_0`` is an intrinsic
+        learned parameter with no ``learnable_h0`` flag, so this
+        argument is silently unused when ``mixer="rotation"``.
+    mixer : {"log", "signed", "rotation"}, default="log"
+        Selects the sequence mixer: ``MinGRU`` (log-space parallel
+        scan), ``SignedMinGRU`` (signed diagonal transitions), or
+        ``RotationMinGRU`` (2x2 block rotations). Any other value
+        raises ``ValueError``.
+    mixer_kwargs : dict, optional
+        Extra constructor kwargs forwarded to the selected mixer class
+        (e.g. ``{"coupled": True}`` for ``"signed"``, or
+        ``{"snap": (2, 3, 5)}`` for ``"rotation"``).
     """
+
+    _MIXER_CLASSES: dict[str, type[nn.Module]] = {
+        "log": MinGRU,
+        "signed": SignedMinGRU,
+        "rotation": RotationMinGRU,
+    }
 
     def __init__(
         self,
@@ -777,12 +797,25 @@ class MinGRUBlock(nn.Module):
         mlp_expansion: int = 4,
         dropout: float = 0.0,
         learnable_h0: bool = False,
-        signed: bool = False,
+        mixer: str = "log",
+        mixer_kwargs: dict | None = None,
     ):
         super().__init__()
+        if mixer not in self._MIXER_CLASSES:
+            raise ValueError(
+                f"unknown mixer {mixer!r}; expected one of "
+                f"{sorted(self._MIXER_CLASSES)}"
+            )
+        mixer_kwargs = dict(mixer_kwargs) if mixer_kwargs else {}
         self.norm1 = nn.LayerNorm(d_model)
-        cls = SignedMinGRU if signed else MinGRU
-        self.mingru = cls(d_model, d_model, learnable_h0=learnable_h0)
+        if mixer == "rotation":
+            # RotationMinGRU's h_0 is intrinsic; it takes no
+            # learnable_h0 kwarg (see class docstring).
+            self.mingru = RotationMinGRU(d_model, d_model, **mixer_kwargs)
+        else:
+            self.mingru = self._MIXER_CLASSES[mixer](
+                d_model, d_model, learnable_h0=learnable_h0, **mixer_kwargs
+            )
         self.drop = nn.Dropout(dropout)
         if mlp_expansion > 0:
             self.norm2 = nn.LayerNorm(d_model)
@@ -869,10 +902,15 @@ class MinGRUStack(nn.Module):
     dropout : float, default=0.0
         Per-block dropout.
     learnable_h0 : bool, default=False
-        Passed through to every block's ``MinGRU``; see ``MinGRU``.
-    signed : bool, default=False
-        If True, blocks use ``SignedMinGRU`` mixers; see
-        ``SignedMinGRU``.
+        Passed through to every block; routed to the block's mixer
+        when ``mixer`` is ``"log"`` or ``"signed"``, unused for
+        ``"rotation"`` (see ``MinGRUBlock``).
+    mixer : {"log", "signed", "rotation"}, default="log"
+        Sequence mixer used by every block; see ``MinGRUBlock``. Any
+        other value raises ``ValueError``.
+    mixer_kwargs : dict, optional
+        Extra constructor kwargs forwarded to every block's mixer; see
+        ``MinGRUBlock``.
 
     Notes
     -----
@@ -890,14 +928,17 @@ class MinGRUStack(nn.Module):
         mlp_expansion: int = 4,
         dropout: float = 0.0,
         learnable_h0: bool = False,
-        signed: bool = False,
+        mixer: str = "log",
+        mixer_kwargs: dict | None = None,
     ):
         super().__init__()
         self.in_proj = (
             nn.Linear(input_size, d_model) if input_size != d_model else nn.Identity()
         )
         self.blocks = nn.ModuleList(
-            MinGRUBlock(d_model, mlp_expansion, dropout, learnable_h0, signed)
+            MinGRUBlock(
+                d_model, mlp_expansion, dropout, learnable_h0, mixer, mixer_kwargs
+            )
             for _ in range(n_layers)
         )
         self.norm_out = nn.LayerNorm(d_model)
@@ -1144,7 +1185,7 @@ if __name__ == "__main__":
     print(f"signed (coupled) construction determinism max abs diff: {err:.3e}")
     assert err == 0.0, "identical seeds must give bit-identical coupled outputs"
 
-    sstack = MinGRUStack(D_in, D_h, 3, signed=True).eval()
+    sstack = MinGRUStack(D_in, D_h, 3, mixer="signed").eval()
     with torch.no_grad():
         y_par = sstack(x)
         state = sstack.init_state()
@@ -1156,7 +1197,7 @@ if __name__ == "__main__":
     print(f"signed stack parallel vs streaming max abs diff: {err:.3e}")
     assert err < 1e-4
 
-    loss = MinGRUStack(D_in, D_h, 3, signed=True)(x).sum()
+    loss = MinGRUStack(D_in, D_h, 3, mixer="signed")(x).sum()
     loss.backward()
     print("signed stack gradcheck ok")
 
@@ -1231,3 +1272,57 @@ if __name__ == "__main__":
     except ValueError:
         pass
     print("rotation odd hidden_size raises: ok")
+
+    # --- MinGRUStack: mixer="rotation" parallel vs streaming equivalence ---
+    torch.manual_seed(0)
+    rstack = MinGRUStack(D_in, D_h, 3, mixer="rotation").eval()
+    with torch.no_grad():
+        y_par_r = rstack(x)
+        state = rstack.init_state()
+        ys = []
+        for t in range(T):
+            y_t, state = rstack.step(x[:, t], state)
+            ys.append(y_t)
+    err = (y_par_r - torch.stack(ys, dim=1)).abs().max().item()
+    print(f"rotation stack parallel vs streaming max abs diff: {err:.3e}")
+    assert err < 1e-4
+
+    # --- MinGRUStack: mixer="rotation" chunked vs full (state carry) ---
+    with torch.no_grad():
+        y_a_r, carry_r = rstack(x[:, : T // 2], return_state=True)
+        y_b_r = rstack(x[:, T // 2 :], state=carry_r)
+        y_chunked_r = torch.cat([y_a_r, y_b_r], dim=1)
+    err = (y_par_r - y_chunked_r).abs().max().item()
+    print(f"rotation stack chunked vs full max abs diff: {err:.3e}")
+    assert err < 1e-4
+
+    loss = MinGRUStack(D_in, D_h, 3, mixer="rotation")(x).sum()
+    loss.backward()
+    print("rotation stack gradcheck ok")
+
+    # --- MinGRUBlock/MinGRUStack: unknown mixer raises ValueError ---
+    try:
+        MinGRUBlock(D_h, mixer="bogus")
+        raise AssertionError("unknown mixer should have raised ValueError")
+    except ValueError:
+        pass
+    try:
+        MinGRUStack(D_in, D_h, 3, mixer="bogus")
+        raise AssertionError("unknown mixer should have raised ValueError")
+    except ValueError:
+        pass
+    print("unknown mixer raises ValueError: ok")
+
+    # --- MinGRUStack: mixer_kwargs={"coupled": True} trains through the stack ---
+    # (regression for the coupled=True path: Task 1 covered SignedMinGRU in
+    # isolation but not coupled=True reached via the stack's mixer selector.)
+    cstack = MinGRUStack(D_in, D_h, 3, mixer="signed", mixer_kwargs={"coupled": True})
+    assert all(block.mingru.coupled for block in cstack.blocks)
+    loss = cstack(x).sum()
+    loss.backward()
+    for i, block in enumerate(cstack.blocks):
+        grad = block.mingru.linear_s.weight.grad
+        assert grad is not None and grad.abs().sum() > 0, (
+            f"block {i} linear_s received no gradient under mixer_kwargs={{'coupled': True}}"
+        )
+    print("stack mixer='signed', mixer_kwargs={'coupled': True} gradcheck ok")
