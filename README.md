@@ -189,13 +189,28 @@ The expressivity ladder, per layer:
 
 `probes.py` tests the ladder empirically on two word problems (seq2seq
 tagging with dense supervision, following Merrill et al.'s setup):
-**parity** (running XOR over {0,1}; in TC⁰, but the one-scan solution
-needs an eigenvalue at −1) and **S3** (running product in the smallest
-non-abelian group; order-sensitive, so commutative scans of any sign
-should fail per layer). Models train at T=64 and are evaluated at T=64
-(in-distribution) and T=256 (length generalization) — the length-gen
-column is what separates "expresses the recurrent solution" from
-"learned a depth-bounded shortcut for the training length."
+
+**parity**: label each prefix with the running XOR of the bits so far.
+The natural one-channel recurrent solution is a sign flip: hold
+`h_t = −h_{t−1}` on input 1, `h_t = +h_{t−1}` on input 0, and read the
+answer off the sign. That is a transition coefficient of −1, exactly
+the eigenvalue `SignedMinGRU` adds and the positive-diagonal `MinGRU`
+(a ∈ (0,1)) cannot represent at any width. Parity is in TC⁰, so a
+failure here is a parameterization limit, not a complexity-class one.
+Chance is 0.5.
+
+**S3**: each token is one of the 6 permutations of three objects
+(picture three cups being swapped and rotated); the label at each step
+is the net permutation so far. Composition order matters:
+swap-then-rotate ≠ rotate-then-swap. But a diagonal scan's per-channel
+state is a running product of scalars, and scalar multiplication
+commutes, so the mechanism is order-blind: diagonal variants of any
+sign should fail per layer. Chance is 1/6 ≈ 0.17.
+
+Models train at T=64 and are evaluated at T=64 (in-distribution) and
+T=256 (length generalization) — the length-gen column is what separates
+"expresses the recurrent solution" from "learned a depth-bounded
+shortcut for the training length."
 
 Results (d_model=64, batch 128, Adam lr 3e−3, budget 1600 steps with
 early stop at 99.9% train-length accuracy; single seed):
@@ -221,8 +236,9 @@ Interpretation:
   |a| < 1 of the `(1−z)·tanh` parameterization (the parity eigenvalue
   can approach −1 but not reach it); depth 4 compensates fully.
 - **S3 separates commutativity.** The signed variant's L=1 plateau
-  (~0.37) is consistent with capturing the sign-of-permutation quotient
-  (Z₂) while non-abelian structure stays out of reach. At L=4 it grinds
+  (~0.37) is consistent with capturing only the sign of the permutation
+  (even vs. odd — a parity-like Z₂ summary that ignores order) while
+  non-abelian structure stays out of reach. At L=4 it grinds
   to 0.993 at training length but only 0.655 at 4× — depth substituting
   for recurrence, i.e., a length-bounded shortcut, exactly the pattern
   Merrill et al. report for Mamba/S4/transformers. The one-layer GRU is
