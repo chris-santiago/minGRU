@@ -355,3 +355,56 @@ among those, @1024 mean 0.961, min 0.886).
 Loop closed at 9 experimental rounds. Deliverable and design laws
 in the Final synthesis section above; the success-rate numbers in
 this round supersede the 3-seed numbers quoted there.
+
+## Post-loop verification (external review recs 2-3)
+
+### Mechanism probes (`mechanism_probes.py`, `mechanism_results.json`)
+
+**Homomorphism test** — extract per-token 2x2 transitions M(g) from
+trained rotation-snap models, check M(g)M(h) vs M(g o h) over all 36
+pairs against the S3 composition table:
+
+| seed | acc@1024 | best-block hom err | faithful | \|det\| |
+|---|---|---|---|---|
+| s0 | 1.0 | 0.00014 (3 blocks < 1e-3) | yes | 0.99992 |
+| s1 | 1.0 | 0.0004 | yes | 0.99976 |
+| s2 | 0.726 | 0.0020 | yes | 0.99870 |
+| s6 | 0.616 | 0.0007 | yes | 0.99967 |
+
+Winning seeds learned genuine faithful D3 representations (compose
+to ~1e-4): the headline is demonstrated, not inferred. Refinement:
+failed seeds have representations too, just 5-15x less exact —
+"insufficiently exact solution," not "no solution." Caveats: (a)
+automaton-block injection gates are NOT ~0 (s1: z=0.70 with perfect
+acc) — the injection-noise account is incomplete; probe measured z,
+not ||b||; (b) s6's best block is more exact than s2's despite worse
+accuracy — downstream readout structure also matters.
+
+**Eigenvalue test** (parity, signed-tanh): both probed seeds have 3
+channels at (a(hold), a(flip)) = (+0.99999, -0.99999) — the automaton
+channels, saturated deep enough that a^1024 ~ 0.99. Mechanism
+confirmed. Does not explain s2's small @1024 gap (its flip channels
+are equally deep; leak is elsewhere).
+
+### Baselines re-grounded (current env, 3 seeds, early-stop protocol)
+
+| row | mean (seeds 0/1/2) | README | verdict |
+|---|---|---|---|
+| parity coupled L=1 @256 | 0.894 | 0.859 | consistent |
+| parity coupled L=1 @1024 | 0.610 | — | new |
+| S3 coupled L=1 @64 | 0.41 | 0.372 | consistent |
+| S3 coupled L=4 @256 | 0.54 (0.47/0.50/0.66) | 0.655 | **within seed variance** — a lucky seed, not env drift; fair quote is 0.54 |
+| GRU L=1, both tasks, @256-1024 | 1.0 all seeds | only @64/256 | ceiling confirmed at claimed lengths |
+
+Comparative claims in the synthesis should be read against these
+means; README-sourced numbers are struck from comparisons. Corrected
+headline comparisons (all current-env):
+
+- parity @1024: coupled 0.61 -> signed-tanh 0.996 (n=6); GRU 1.0.
+- S3 @256: coupled L=4 0.54 -> rotation-snap 0.987 (n=8); GRU 1.0.
+- S3 @1024: coupled L=4 0.33 -> rotation-snap 0.889 (n=8); GRU 1.0.
+
+Not run (scoped out, review rec 1): Grazzi-parameterized incumbent,
+DeltaNet. Signed-tanh should be presented as the Grazzi negative-
+eigenvalue mechanism instantiated in minGRU until that comparison
+runs — a repo improvement, not a novelty claim.

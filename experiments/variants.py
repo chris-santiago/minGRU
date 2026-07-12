@@ -28,7 +28,16 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from min_gru import linear_scan
-from probes import BATCH, D_MODEL, EVAL_EVERY, LR, T_TRAIN, TASKS, accuracy
+from probes import (
+    BATCH,
+    D_MODEL,
+    EVAL_EVERY,
+    LR,
+    T_TRAIN,
+    TASKS,
+    GRUTagger,
+    accuracy,
+)
 
 MAX_STEPS = int(os.environ.get("MAX_STEPS", 1600))
 GEN_LENGTHS = (256, 512, 1024)
@@ -317,17 +326,22 @@ def selftest():
 
 
 # ---------------------------------------------------------------- driver
-def run_cell(task, variant, n_layers=1, seed=0, max_steps=None):
+def run_cell(task, variant, n_layers=1, seed=0, max_steps=None, return_model=False):
     """One (task, variant, layers, seed) cell under the probes.py protocol,
     with extra generalization lengths. Appends a JSON line to RESULTS.
     seed=0 matches probes.py exactly; other seeds vary init and data
-    order (eval seeds stay fixed for comparability)."""
+    order (eval seeds stay fixed for comparability). variant="gru" runs
+    the probes.py GRU baseline through this harness (same protocol,
+    extended eval lengths)."""
     if max_steps is None:
         max_steps = MAX_STEPS
     make, vocab, n_cls = TASKS[task]
     torch.manual_seed(seed)
     gen = torch.Generator().manual_seed(1 + seed)
-    model = VariantTagger(vocab, n_cls, VARIANTS[variant], n_layers)
+    if variant == "gru":
+        model = GRUTagger(vocab, n_cls, n_layers)
+    else:
+        model = VariantTagger(vocab, n_cls, VARIANTS[variant], n_layers)
     opt = torch.optim.Adam(model.parameters(), lr=LR)
     t0, steps_used = time.time(), max_steps
     # H15 (EXP_CKPT=1): the exact solution is reachable but not a stable
@@ -379,21 +393,30 @@ def run_cell(task, variant, n_layers=1, seed=0, max_steps=None):
     print(json.dumps(rec), flush=True)
     with open(RESULTS, "a") as f:
         f.write(json.dumps(rec) + "\n")
+    if return_model:
+        return rec, model
     return rec
 
 
 # Current round's screening cells; edited per round (see EXPERIMENTS.md).
-# Round 9: success-rate quantification — plain winners + standard
-# val@128 selection on fresh seeds (poolable with Round 7's 0-2).
+# Post-loop verification (Rec 3): every baseline row quoted in the
+# synthesis re-run in the current environment, 3 seeds, original
+# early-stop protocol (no EXP_CKPT). Seed-0 rows already in
+# lab_results.jsonl from Rounds 1-2 are not repeated.
 SCREEN = [
-    ("S3", "rotation-snap", 1, 3),
-    ("S3", "rotation-snap", 1, 4),
-    ("S3", "rotation-snap", 1, 5),
-    ("S3", "rotation-snap", 1, 6),
-    ("S3", "rotation-snap", 1, 7),
-    ("parity", "signed-tanh", 1, 3),
-    ("parity", "signed-tanh", 1, 4),
-    ("parity", "signed-tanh", 1, 5),
+    ("parity", "signed-coupled", 1, 1),
+    ("parity", "signed-coupled", 1, 2),
+    ("S3", "signed-coupled", 1, 0),
+    ("S3", "signed-coupled", 1, 1),
+    ("S3", "signed-coupled", 1, 2),
+    ("S3", "signed-coupled", 4, 1),
+    ("S3", "signed-coupled", 4, 2),
+    ("parity", "gru", 1, 0),
+    ("parity", "gru", 1, 1),
+    ("parity", "gru", 1, 2),
+    ("S3", "gru", 1, 0),
+    ("S3", "gru", 1, 1),
+    ("S3", "gru", 1, 2),
 ]
 
 
