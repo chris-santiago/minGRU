@@ -36,8 +36,8 @@ decay horizon (~ε·T).
   (parity = running XOR; S3 = running product in the smallest
   non-abelian group; seq2seq tagging, dense supervision, d=64,
   batch 128, Adam 3e-3, budget 1600 steps).
-- Environment: conda env `deep-ai`, torch 2.5.1, CPU. All numbers
-  in this directory are from this environment. README-sourced
+- Environment: torch 2.5.1, CPU (run via `uv run --with torch`).
+  All numbers in this directory are from this torch version. README-sourced
   numbers are NOT comparable (S3 coupled L=4 @256: README 0.655 is
   a lucky seed; current-env 3-seed mean is 0.54).
 - Harness: `variants.py`. Same seeds/protocol as `probes.py`
@@ -181,11 +181,16 @@ Implications:
 ## How to run
 
 ```bash
-conda run -n deep-ai python experiments/variants.py selftest   # scan checks
-conda run -n deep-ai python experiments/variants.py TASK VARIANT [L]
-EXP_ROUND=x EXP_CKPT=1 conda run -n deep-ai python experiments/variants.py screen
-conda run -n deep-ai python experiments/mechanism_probes.py
+uv run --with torch python experiments/variants.py selftest   # scan checks
+uv run --with torch python experiments/variants.py TASK VARIANT [L]
+EXP_ROUND=x EXP_CKPT=1 uv run --with torch python experiments/variants.py screen
+uv run --with torch python experiments/mechanism_probes.py
 ```
+
+Provenance: the recorded numbers in `lab_results.jsonl` were produced
+under torch 2.5.1. Environment matters here (the S3 coupled-L=4 cell
+is seed- and env-sensitive); re-run baselines before comparing
+against results from a different torch version.
 
 - `SCREEN` list in `variants.py` holds the current batch of cells;
   edit per round. Registry: signed-{coupled,tanh,hardtanh,ste},
