@@ -139,20 +139,23 @@ def accuracy(model, make, T, seed, n_batches=4):
     return correct / total
 
 
-def run_one(task, name, n_layers=1, max_steps=MAX_STEPS):
+def run_one(task, name, n_layers=1, max_steps=MAX_STEPS, ckpt=None):
     make, vocab, n_cls = TASKS[task]
     torch.manual_seed(0)
     gen = torch.Generator().manual_seed(1)
     model = build(name, vocab, n_cls, n_layers)
     opt = torch.optim.Adam(model.parameters(), lr=LR)
     t0, steps_used = time.time(), max_steps
-    # CKPT=1 (spec §4): rotation-snap's exact solution is reachable but not
-    # a stable attractor of training (runs wander in and out of it), so
+    # Checkpoint selection: rotation-snap's exact solution is reachable but
+    # not a stable attractor of training (runs wander in and out of it), so
     # best-val@128 selection replaces early stop, evaluated over the full
-    # step budget. Off by default: legacy rows keep the early-stop protocol
-    # they were recorded under. Ported from experiments/variants.py
-    # run_cell's ckpt_select branch.
-    ckpt_select = os.environ.get("CKPT", "") not in ("", "0")
+    # step budget. ckpt=None defers to the CKPT env var (off by default:
+    # legacy rows keep the early-stop protocol they were recorded under);
+    # GRID rows pin their own protocol per row. Ported from
+    # experiments/variants.py run_cell's ckpt_select branch.
+    if ckpt is None:
+        ckpt = os.environ.get("CKPT", "") not in ("", "0")
+    ckpt_select = ckpt
     best_val, best_state, best_step = -1.0, None, 0
     for step in range(1, max_steps + 1):
         x, y = make(BATCH, T_TRAIN, gen)
@@ -192,32 +195,41 @@ def run_one(task, name, n_layers=1, max_steps=MAX_STEPS):
 
 
 GRID = [
-    # (task, model, n_layers, max_steps)
-    ("parity", "GRU", 1, 1500),
-    ("parity", "minGRU", 1, 1500),
-    ("parity", "minGRU-signed", 1, 1500),
-    ("S3", "GRU", 1, 1500),
-    ("S3", "minGRU", 1, 1500),
-    ("S3", "minGRU-signed", 1, 1500),
-    ("parity", "minGRU", 4, 1600),
-    ("parity", "minGRU-signed", 4, 1600),
-    ("S3", "minGRU", 4, 1600),
-    ("S3", "minGRU-signed", 4, 1600),
-    ("parity", "minGRU-signed-tanh", 1, 1500),
-    ("S3", "minGRU-signed-tanh", 1, 1500),
-    ("parity", "minGRU-signed-tanh", 4, 1600),
-    ("S3", "minGRU-signed-tanh", 4, 1600),
-    ("parity", "minGRU-rotsnap", 1, 1500),
-    ("S3", "minGRU-rotsnap", 1, 1500),
+    # (task, model, n_layers, max_steps, ckpt) — ckpt=True rows run the
+    # best-val@128 checkpoint-selection protocol their README results are
+    # recorded under (required for minGRU-rotsnap; see RotationMinGRU docs).
+    ("parity", "GRU", 1, 1500, False),
+    ("parity", "minGRU", 1, 1500, False),
+    ("parity", "minGRU-signed", 1, 1500, False),
+    ("S3", "GRU", 1, 1500, False),
+    ("S3", "minGRU", 1, 1500, False),
+    ("S3", "minGRU-signed", 1, 1500, False),
+    ("parity", "minGRU", 4, 1600, False),
+    ("parity", "minGRU-signed", 4, 1600, False),
+    ("S3", "minGRU", 4, 1600, False),
+    ("S3", "minGRU-signed", 4, 1600, False),
+    ("parity", "minGRU-signed-tanh", 1, 1500, False),
+    ("S3", "minGRU-signed-tanh", 1, 1500, False),
+    ("parity", "minGRU-signed-tanh", 4, 1600, False),
+    ("S3", "minGRU-signed-tanh", 4, 1600, False),
+    ("parity", "minGRU-rotsnap", 1, 1600, True),
+    ("S3", "minGRU-rotsnap", 1, 1600, True),
 ]
 
 
 def run_grid():
-    # MAX_STEPS env var, when set, overrides the per-entry grid budgets
-    # (docstring contract); otherwise each entry uses its own budget.
-    env_override = "MAX_STEPS" in os.environ
-    for task, name, n_layers, max_steps in GRID:
-        run_one(task, name, n_layers, MAX_STEPS if env_override else max_steps)
+    # MAX_STEPS / CKPT env vars, when set, override the per-entry grid
+    # values (docstring contract); otherwise each entry uses its own.
+    env_steps = "MAX_STEPS" in os.environ
+    env_ckpt = "CKPT" in os.environ
+    for task, name, n_layers, max_steps, ckpt in GRID:
+        run_one(
+            task,
+            name,
+            n_layers,
+            MAX_STEPS if env_steps else max_steps,
+            None if env_ckpt else ckpt,
+        )
 
 
 if __name__ == "__main__":

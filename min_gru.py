@@ -294,9 +294,10 @@ def linear_scan(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.T
     Hillis-Steele is work-inefficient (O(T log T) vs O(T) for a
     work-efficient Blelloch scan) and retains O(log T) full ``(B, T, D)``
     tensors for autograd. That is a deliberate simplicity-over-efficiency
-    choice: the overhead is negligible at the sequence lengths this repo
-    targets (T <= 256), and no stable ``torch.associative_scan`` primitive
-    exists to lean on. Revisit if sequences grow large.
+    choice: the overhead is negligible at the short training lengths
+    this repo targets (probes train at T=64), and no stable
+    ``torch.associative_scan`` primitive exists to lean on. Revisit for
+    long-sequence training.
     """
     T = a.size(1)
     A, Bc = a, b
@@ -350,8 +351,8 @@ def matrix_scan(M: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.T
     Same simplicity-over-efficiency tradeoff as ``linear_scan``:
     Hillis-Steele is work-inefficient (O(T log T) vs O(T)) and retains
     O(log T) full ``(B, T, n, 2, 2)`` tensors for autograd. Fine at
-    this repo's target sequence lengths (T <= 256); revisit if
-    sequences grow large.
+    the short training lengths this repo targets (probes train at
+    T=64); revisit for long-sequence training.
     """
     B_, T, n = M.shape[:3]
     eye = torch.eye(2, dtype=M.dtype, device=M.device)
@@ -629,6 +630,12 @@ class RotationMinGRU(nn.Module):
             raise ValueError(
                 f"RotationMinGRU requires an even hidden_size (got {hidden_size}); "
                 "state is n = hidden_size / 2 planar 2D blocks."
+            )
+        if snap is not None and (
+            len(snap) == 0 or any(k < 1 for k in snap)
+        ):
+            raise ValueError(
+                f"snap must be None or a non-empty tuple of positive ints (got {snap!r})"
             )
         self.input_size = input_size
         self.hidden_size = hidden_size
