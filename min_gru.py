@@ -792,10 +792,12 @@ class MinGRUBlock(nn.Module):
         ``{"snap": (2, 3, 5)}`` for ``"rotation"``).
     """
 
-    _MIXER_CLASSES: dict[str, type[nn.Module]] = {
-        "log": MinGRU,
-        "signed": SignedMinGRU,
-        "rotation": RotationMinGRU,
+    # name -> (class, accepts_learnable_h0). RotationMinGRU's h_0 is
+    # intrinsic (see class docstring), so the flag is not forwarded to it.
+    _MIXER_CLASSES: dict[str, tuple[type[nn.Module], bool]] = {
+        "log": (MinGRU, True),
+        "signed": (SignedMinGRU, True),
+        "rotation": (RotationMinGRU, False),
     }
 
     def __init__(
@@ -815,14 +817,10 @@ class MinGRUBlock(nn.Module):
             )
         mixer_kwargs = dict(mixer_kwargs) if mixer_kwargs else {}
         self.norm1 = nn.LayerNorm(d_model)
-        if mixer == "rotation":
-            # RotationMinGRU's h_0 is intrinsic; it takes no
-            # learnable_h0 kwarg (see class docstring).
-            self.mingru = RotationMinGRU(d_model, d_model, **mixer_kwargs)
-        else:
-            self.mingru = self._MIXER_CLASSES[mixer](
-                d_model, d_model, learnable_h0=learnable_h0, **mixer_kwargs
-            )
+        mixer_cls, accepts_h0 = self._MIXER_CLASSES[mixer]
+        if accepts_h0:
+            mixer_kwargs["learnable_h0"] = learnable_h0
+        self.mingru = mixer_cls(d_model, d_model, **mixer_kwargs)
         self.drop = nn.Dropout(dropout)
         if mlp_expansion > 0:
             self.norm2 = nn.LayerNorm(d_model)

@@ -1,4 +1,4 @@
-"""Expressivity probes: GRU vs minGRU vs SignedMinGRU.
+"""Expressivity probes: GRU vs minGRU vs SignedMinGRU vs RotationMinGRU.
 
 Tasks (seq2seq tagging, dense supervision as in Merrill et al. 2024):
   parity : running XOR over {0,1}. In TC0; the natural one-scan solution
