@@ -154,8 +154,11 @@ GRID = [
 
 
 def run_grid():
+    # MAX_STEPS env var, when set, overrides the per-entry grid budgets
+    # (docstring contract); otherwise each entry uses its own budget.
+    env_override = "MAX_STEPS" in os.environ
     for task, name, n_layers, max_steps in GRID:
-        run_one(task, name, n_layers, max_steps)
+        run_one(task, name, n_layers, MAX_STEPS if env_override else max_steps)
 
 
 if __name__ == "__main__":
