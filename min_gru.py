@@ -259,6 +259,166 @@ class MinGRU(nn.Module):
         return f"input_size={self.input_size}, hidden_size={self.hidden_size}"
 
 
+def linear_scan(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Linear-space associative scan for ``h_t = a_t * h_{t-1} + b_t``.
+
+    Hillis-Steele doubling over the segment-composition monoid
+    ``(A1, B1) o (A2, B2) = (A2*A1, A2*B1 + B2)``: O(T log T) work,
+    O(log T) depth, pure torch ops, differentiable. Unlike
+    ``parallel_scan_log``, coefficients may be NEGATIVE — this is what
+    enables signed transition eigenvalues (see ``SignedMinGRU``).
+
+    Parameters
+    ----------
+    a : torch.Tensor
+        Shape ``(B, T, D)``. Transition coefficients ``a_t``; stability
+        expects ``|a_t| <= 1`` but is not enforced.
+    b : torch.Tensor
+        Shape ``(B, T, D)``. Additive inputs ``b_t``.
+
+    Returns
+    -------
+    tuple of torch.Tensor
+        ``(A, Bc)``, each ``(B, T, D)``, where
+        ``h_t = A_t * h_0 + Bc_t`` with ``A_t`` the running product of
+        ``a`` and ``Bc_t`` the ``h_0 = 0`` solution of the recurrence.
+
+    Notes
+    -----
+    Hillis-Steele is work-inefficient (O(T log T) vs O(T) for a
+    work-efficient Blelloch scan) and retains O(log T) full ``(B, T, D)``
+    tensors for autograd. That is a deliberate simplicity-over-efficiency
+    choice: the overhead is negligible at the sequence lengths this repo
+    targets (T <= 256), and no stable ``torch.associative_scan`` primitive
+    exists to lean on. Revisit if sequences grow large.
+    """
+    T = a.size(1)
+    A, Bc = a, b
+    offset = 1
+    while offset < T:
+        A_prev = F.pad(A, (0, 0, offset, 0), value=1.0)[:, :T]
+        B_prev = F.pad(Bc, (0, 0, offset, 0), value=0.0)[:, :T]
+        Bc = A * B_prev + Bc
+        A = A * A_prev
+        offset *= 2
+    return A, Bc
+
+
+class SignedMinGRU(nn.Module):
+    """minGRU variant with signed diagonal transitions (linear-space scan).
+
+    The recurrence is ``h_t = a_t * h_{t-1} + z_t * h~_t`` with
+    ``a_t = (1 - z_t) * tanh(Linear_s(x_t))`` so ``a_t`` ranges over
+    ``(-1, 1)`` instead of ``(0, 1)``. When the sign head saturates
+    positive this reduces to the vanilla (Appendix A) minGRU. Motivated
+    by Merrill, Petty & Sabharwal (2024): still diagonal, hence
+    commutative and TC0, but negative eigenvalues restore per-layer
+    parity / sign-alternation dynamics (cf. Grazzi et al., 2025).
+
+    States are unconstrained reals: no ``g``, no positivity checks, no
+    underflow handling. Same forward/step API and shapes as ``MinGRU``;
+    ``h_0`` is any real state.
+
+    Parameters
+    ----------
+    input_size : int
+        Dimensionality of the inputs ``x_t``.
+    hidden_size : int
+        Dimensionality of the hidden states ``h_t``.
+    bias : bool, default=True
+        Whether the three linear maps carry bias terms.
+    learnable_h0 : bool, default=False
+        If True, the module owns a learned initial state (an
+        unconstrained parameter used directly — no ``g``). Zero-init
+        matches the fixed default ``h_0 = 0``.
+
+    Notes
+    -----
+    Parameter count is 3 linear heads vs. MinGRU's 2 (the extra sign
+    head) — account for this in parameter-matched comparisons.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        bias: bool = True,
+        learnable_h0: bool = False,
+    ):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.linear_z = nn.Linear(input_size, hidden_size, bias=bias)
+        self.linear_h = nn.Linear(input_size, hidden_size, bias=bias)
+        self.linear_s = nn.Linear(input_size, hidden_size, bias=bias)
+        self.h0: nn.Parameter | None = (
+            nn.Parameter(torch.zeros(1, 1, hidden_size)) if learnable_h0 else None
+        )
+
+    def _coeffs(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        z = torch.sigmoid(self.linear_z(x))
+        a = (1 - z) * torch.tanh(self.linear_s(x))
+        b = z * self.linear_h(x)
+        return a, b
+
+    def forward(self, x: torch.Tensor, h_0: torch.Tensor | None = None) -> torch.Tensor:
+        """Parallel forward over a full sequence.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input sequence, shape ``(B, T, input_size)``.
+        h_0 : torch.Tensor, optional
+            Initial hidden state, shape ``(B, 1, hidden_size)``. Any
+            real values. Defaults to zeros (or the learned initial
+            state if ``learnable_h0``).
+
+        Returns
+        -------
+        torch.Tensor
+            All hidden states ``h_1..h_T``, shape
+            ``(B, T, hidden_size)``.
+        """
+        if h_0 is None:
+            h_0 = (
+                self.h0.expand(x.size(0), 1, self.hidden_size)
+                if self.h0 is not None
+                else x.new_zeros(x.size(0), 1, self.hidden_size)
+            )
+        a, b = self._coeffs(x)
+        A, Bc = linear_scan(a, b)
+        return A * h_0 + Bc
+
+    @torch.no_grad()
+    def step(self, x_t: torch.Tensor, h_prev: torch.Tensor | None = None) -> torch.Tensor:
+        """Single recurrent step; same real-state convention as forward().
+
+        Parameters
+        ----------
+        x_t : torch.Tensor
+            Input at the current timestep, shape ``(B, input_size)``.
+        h_prev : torch.Tensor, optional
+            Previous hidden state, shape ``(B, hidden_size)``. Defaults
+            to zeros (or the learned initial state).
+
+        Returns
+        -------
+        torch.Tensor
+            New hidden state, shape ``(B, hidden_size)``.
+        """
+        if h_prev is None:
+            h_prev = (
+                self.h0[:, 0].expand(x_t.size(0), self.hidden_size)
+                if self.h0 is not None
+                else x_t.new_zeros(x_t.size(0), self.hidden_size)
+            )
+        a, b = self._coeffs(x_t)
+        return a * h_prev + b
+
+    def extra_repr(self) -> str:
+        return f"input_size={self.input_size}, hidden_size={self.hidden_size}"
+
+
 class MinGRUBlock(nn.Module):
     """Pre-norm residual block: LN -> minGRU -> +x, then LN -> MLP -> +x.
 
@@ -278,6 +438,9 @@ class MinGRUBlock(nn.Module):
         Applied after the minGRU output and inside the MLP.
     learnable_h0 : bool, default=False
         Passed through to the block's ``MinGRU``; see ``MinGRU``.
+    signed : bool, default=False
+        If True, use ``SignedMinGRU`` (signed transitions, linear-space
+        scan) as the sequence mixer instead of ``MinGRU``.
     """
 
     def __init__(
@@ -286,10 +449,12 @@ class MinGRUBlock(nn.Module):
         mlp_expansion: int = 4,
         dropout: float = 0.0,
         learnable_h0: bool = False,
+        signed: bool = False,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
-        self.mingru = MinGRU(d_model, d_model, learnable_h0=learnable_h0)
+        cls = SignedMinGRU if signed else MinGRU
+        self.mingru = cls(d_model, d_model, learnable_h0=learnable_h0)
         self.drop = nn.Dropout(dropout)
         if mlp_expansion > 0:
             self.norm2 = nn.LayerNorm(d_model)
@@ -377,6 +542,9 @@ class MinGRUStack(nn.Module):
         Per-block dropout.
     learnable_h0 : bool, default=False
         Passed through to every block's ``MinGRU``; see ``MinGRU``.
+    signed : bool, default=False
+        If True, blocks use ``SignedMinGRU`` mixers; see
+        ``SignedMinGRU``.
 
     Notes
     -----
@@ -394,13 +562,14 @@ class MinGRUStack(nn.Module):
         mlp_expansion: int = 4,
         dropout: float = 0.0,
         learnable_h0: bool = False,
+        signed: bool = False,
     ):
         super().__init__()
         self.in_proj = (
             nn.Linear(input_size, d_model) if input_size != d_model else nn.Identity()
         )
         self.blocks = nn.ModuleList(
-            MinGRUBlock(d_model, mlp_expansion, dropout, learnable_h0)
+            MinGRUBlock(d_model, mlp_expansion, dropout, learnable_h0, signed)
             for _ in range(n_layers)
         )
         self.norm_out = nn.LayerNorm(d_model)
@@ -593,3 +762,37 @@ if __name__ == "__main__":
         except RuntimeError:
             pass
     print("h_0 validation: zeros clamped, negatives raise: ok")
+
+    # --- SignedMinGRU: parallel vs sequential, chunked carry, stack ---
+    ms = SignedMinGRU(D_in, D_h).eval()
+    with torch.no_grad():
+        h_par = ms(x)
+        h = None
+        hs = [h := ms.step(x[:, t], h) for t in range(T)]
+    err = (h_par - torch.stack(hs, dim=1)).abs().max().item()
+    print(f"signed parallel vs sequential max abs diff: {err:.3e}")
+    assert err < 1e-4
+
+    with torch.no_grad():
+        h_a = ms(x[:, : T // 2])
+        h_b = ms(x[:, T // 2 :], h_0=h_a[:, -1:])  # negative states are legal here
+        assert (h_a[:, -1:] < 0).any(), "expected some negative signed states"
+    err = (h_par - torch.cat([h_a, h_b], dim=1)).abs().max().item()
+    print(f"signed chunked vs full max abs diff: {err:.3e}")
+    assert err < 1e-4
+
+    sstack = MinGRUStack(D_in, D_h, 3, signed=True).eval()
+    with torch.no_grad():
+        y_par = sstack(x)
+        state = sstack.init_state()
+        ys = []
+        for t in range(T):
+            y_t, state = sstack.step(x[:, t], state)
+            ys.append(y_t)
+    err = (y_par - torch.stack(ys, dim=1)).abs().max().item()
+    print(f"signed stack parallel vs streaming max abs diff: {err:.3e}")
+    assert err < 1e-4
+
+    loss = MinGRUStack(D_in, D_h, 3, signed=True)(x).sum()
+    loss.backward()
+    print("signed stack gradcheck ok")

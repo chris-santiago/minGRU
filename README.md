@@ -32,11 +32,13 @@ the "vanilla" minGRU in the paper's Appendix A.
 
 ## Components
 
-| class | role |
+| class / fn | role |
 |---|---|
-| `MinGRU` | one scan layer; parallel `forward`, recurrent `step` |
-| `MinGRUBlock` | pre-norm residual block: LN → minGRU → +x, LN → MLP → +x |
-| `MinGRUStack` | input projection → N blocks → final LN; full state threading |
+| `MinGRU` | one scan layer (log-space, positive states); parallel `forward`, recurrent `step` |
+| `SignedMinGRU` | signed-transition variant (linear-space scan, unconstrained states); same API |
+| `linear_scan` | Hillis–Steele associative scan for `h_t = a_t·h_{t−1} + b_t` with signed coefficients |
+| `MinGRUBlock` | pre-norm residual block: LN → mixer → +x, LN → MLP → +x (`signed=True` selects the mixer) |
+| `MinGRUStack` | input projection → N blocks → final LN; full state threading; `signed=True` throughout |
 
 `MinGRU` is deliberately atomic. A single layer's gates cannot condition on
 accumulated state (that is the parallelism trade); stacking recovers
@@ -59,7 +61,7 @@ Streaming inference (O(1) memory; state is `n_layers × d_model` per sample):
 
 ```python
 state = stack.init_state()
-for x_t in transaction_stream:        # x_t: (B, input_size)
+for x_t in event_stream:              # x_t: (B, input_size)
     y_t, state = stack.step(x_t, state)
 ```
 
@@ -127,10 +129,11 @@ All exposed state is **real hidden state** — an output of `forward()` or
 
 ## Caveats for sequence modeling
 
-- **Positive states.** Each block's scan output lives in `(0, ∞)` (the
-  residual stream itself is signed). If hidden-state magnitude carries
-  task signal, the halved per-dimension range is worth checking in a
-  proxy run rather than assuming parity with a standard GRU.
+- **Positive states (log-space variant).** Each `MinGRU` block's scan
+  output lives in `(0, ∞)` (the residual stream itself is signed). If
+  hidden-state magnitude carries task signal, the halved per-dimension
+  range is worth checking in a proxy run rather than assuming parity
+  with a standard GRU. `SignedMinGRU` removes this constraint.
 - **Expressivity class.** Input-dependent, state-independent transitions
   put minGRU in the same class as Mamba/S6 and GLA: fixed-depth stacks
   are TC⁰ (Merrill et al., *The Illusion of State in State-Space
@@ -139,17 +142,149 @@ All exposed state is **real hidden state** — an output of `forward()` or
   interaction with history, not sequential computation. Depth-matched
   comparisons against a standard GRU confound layer count with
   mechanism; include a deeper minGRU variant in any comparison grid.
+  The probes below make both points measurable.
+
+## Signed variant (`SignedMinGRU`)
+
+The log-space scan requires positive transition coefficients (log of
+1−z), which hard-codes two limitations at once: hidden states confined
+to (0, ∞) via `g`, and transition eigenvalues confined to (0, 1) —
+monotone EWMA-style memory only. `SignedMinGRU` lifts both by switching
+to a linear-space associative scan (`linear_scan`) and computing
+
+```
+a_t = (1 − z_t) ⊙ tanh(Linear_s(x_t))      # eigenvalues in (−1, 1)
+h_t = a_t ⊙ h_{t−1} + z_t ⊙ Linear_h(x_t)  # no g, states unconstrained
+```
+
+When the sign head saturates positive this reduces to the vanilla
+(Appendix A) minGRU. Motivation comes from Merrill, Petty & Sabharwal,
+*The Illusion of State in State-Space Models* (ICML 2024,
+arXiv:2404.08819) and Grazzi et al., *Unlocking State-Tracking in
+Linear RNNs Through Negative Eigenvalues* (ICLR 2025): negative
+eigenvalues restore per-layer parity / sign-alternation dynamics.
+What it does **not** restore: diagonal transitions commute, so
+non-abelian state tracking (permutation composition and everything
+NC¹-complete) remains out of reach at any width — that requires
+non-diagonal transitions or state-dependent gates (i.e., a GRU). All
+diagonal variants, signed or not, remain in TC⁰ per Merrill et al.'s
+iterated-scalar-product argument.
+
+Practical differences from `MinGRU`: any real `h_0` is legal (no
+positivity check, no underflow clamp), parallel/sequential agreement is
+~1e−7 rather than ~1e−5 (no exp/log round-trip), and there are 3 linear
+heads instead of 2 (mind parameter-matched comparisons). The scan is
+O(T log T) work / O(log T) depth in pure torch ops.
+
+The expressivity ladder, per layer:
+
+| variant | scan | per-layer capability |
+|---|---|---|
+| `MinGRU` (a ∈ (0,1)) | log-space | monotone EWMA memory |
+| `SignedMinGRU` (a ∈ (−1,1)) | linear-space | + parity, abelian tracking |
+| non-diagonal (not implemented) | matrix-combine | + non-commutative, toward S₅ |
+| state-dependent gates | none (sequential) | = a standard GRU |
+
+## Expressivity probes
+
+`probes.py` tests the ladder empirically on two word problems (seq2seq
+tagging with dense supervision, following Merrill et al.'s setup):
+**parity** (running XOR over {0,1}; in TC⁰, but the one-scan solution
+needs an eigenvalue at −1) and **S3** (running product in the smallest
+non-abelian group; order-sensitive, so commutative scans of any sign
+should fail per layer). Models train at T=64 and are evaluated at T=64
+(in-distribution) and T=256 (length generalization) — the length-gen
+column is what separates "expresses the recurrent solution" from
+"learned a depth-bounded shortcut for the training length."
+
+Results (d_model=64, batch 128, Adam lr 3e−3, budget 1600 steps with
+early stop at 99.9% train-length accuracy; single seed):
+
+| task | model | layers | acc@64 | acc@256 | outcome |
+|---|---|---|---|---|---|
+| parity | GRU | 1 | 1.000 | 1.000 | solved, step 100 |
+| parity | minGRU | 1 | 0.525 | 0.507 | chance |
+| parity | minGRU | 4 | 0.516 | 0.504 | chance |
+| parity | minGRU-signed | 1 | 1.000 | 0.859 | solved; decays at 4× length |
+| parity | minGRU-signed | 4 | 1.000 | 1.000 | solved, step 250 |
+| S3 | GRU | 1 | 1.000 | 1.000 | solved, step 300 |
+| S3 | minGRU | 1 | 0.243 | 0.188 | near chance |
+| S3 | minGRU | 4 | 0.266 | 0.193 | near chance; loss ~1.5 |
+| S3 | minGRU-signed | 1 | 0.372 | 0.334 | abelian quotient only |
+| S3 | minGRU-signed | 4 | 0.993 | 0.655 | passes @64, fails @256 |
+
+Interpretation:
+
+- **Parity separates the sign.** Positive-diagonal minGRU sits at
+  chance even at depth 4; the signed variant solves it in a few hundred
+  steps. The signed L=1 decay at 4× length reflects the strict
+  |a| < 1 of the `(1−z)·tanh` parameterization (the parity eigenvalue
+  can approach −1 but not reach it); depth 4 compensates fully.
+- **S3 separates commutativity.** The signed variant's L=1 plateau
+  (~0.37) is consistent with capturing the sign-of-permutation quotient
+  (Z₂) while non-abelian structure stays out of reach. At L=4 it grinds
+  to 0.993 at training length but only 0.655 at 4× — depth substituting
+  for recurrence, i.e., a length-bounded shortcut, exactly the pattern
+  Merrill et al. report for Mamba/S4/transformers. The one-layer GRU is
+  1.000/1.000 on both tasks: the automaton construction.
+- **The positive variant's failure is optimization, not just
+  expressivity.** Four layers of MLPs should make parity@64
+  expressible, and depth demonstrably suffices for the otherwise
+  identical signed sibling — yet the positive variant stays at chance
+  on both tasks with loss barely moving. Within this budget, the
+  positive parameterization is not just one rung down the ladder but
+  hostile to gradient descent on order-sensitive structure.
+
+Caveats: single seed per cell, one learning rate, and null results are
+budget-relative ("didn't learn in 1600 steps" ≠ "cannot learn"). The
+minGRU wrappers include a block MLP the GRU baseline lacks, which
+favors the minGRU variants — strengthening their negative results,
+mildly weakening attribution of their positive ones.
+
+### Reproducing
+
+```
+python probes.py TASK MODEL [N_LAYERS]
+# TASK   ∈ {parity, S3}
+# MODEL  ∈ {GRU, minGRU, minGRU-signed}
+# N_LAYERS defaults to 1; MAX_STEPS env overrides the budget (1600)
+```
+
+The full grid above is ten invocations:
+
+```
+for t in parity S3; do
+  python probes.py $t GRU
+  for m in minGRU minGRU-signed; do
+    python probes.py $t $m 1
+    python probes.py $t $m 4
+  done
+done
+```
+
+CPU-only is sufficient (each cell runs seconds to ~15 minutes,
+1-layer cells fastest). The original runs used a fixed seed; expect
+small numeric differences across torch versions but the same
+qualitative pattern.
 
 ## Tests
 
 `python min_gru.py` runs the built-in suite: parallel-vs-sequential
-equivalence (single layer, stack, and with `learnable_h0` off its
-default), chunked-vs-full equivalence for both `MinGRU` and
-`MinGRUStack`, gradient flow through the scan and into `h0_pre` **from
-zero-init** (guards the `log_g` fix), `log_g` gradient at 0 equal to 2,
-and `h_0` validation (underflowed zeros accepted, negatives raise).
+equivalence (single layer, stack, `learnable_h0` off its default, and
+`SignedMinGRU` plus a signed stack), chunked-vs-full equivalence for
+`MinGRU`, `MinGRUStack`, and `SignedMinGRU` (including a carry with
+negative states), gradient flow through both scans and into `h0_pre`
+**from zero-init** (guards the `log_g` fix), `log_g` gradient at 0
+equal to 2, and `h_0` validation for the log-space variant
+(underflowed zeros accepted, negatives raise).
 
-## Reference
+## References
 
 Feng, L., Tung, F., Ahmed, M. O., Bengio, Y., & Hajimirsadeghi, H.
 (2024). *Were RNNs All We Needed?* arXiv:2410.01201.
+
+Merrill, W., Petty, J., & Sabharwal, A. (2024). *The Illusion of State
+in State-Space Models.* ICML 2024. arXiv:2404.08819.
+
+Grazzi, R., et al. (2025). *Unlocking State-Tracking in Linear RNNs
+Through Negative Eigenvalues.* ICLR 2025.
