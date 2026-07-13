@@ -10,8 +10,11 @@ This repo ships the base minGRU plus two variants that each fix a specific
 gap in it: **`SignedMinGRU`** (state can flip sign, not just decay toward
 zero) and **`RotationMinGRU`** (state can track operations that don't
 commute, like composing permutations). All three share one `mixer=`
-interface on `MinGRUBlock`/`MinGRUStack`. What each variant actually buys
-you, in measured accuracy, is below.
+interface on `MinGRUBlock`/`MinGRUStack`, and all three optionally accept
+a time-aware decay term for irregularly-spaced sequences — a real-world
+gap between events, not just a token count (see "Time-aware decay,"
+below). What each variant actually buys you, in measured accuracy, is
+below.
 
 ## What this shows
 
@@ -250,18 +253,17 @@ input-controlled blend — genuinely useful (it is most of what
 "context" means in practice), but it can *only* fade. Ask it whether
 it has seen an even or odd number of 1s and it's stuck: an average of
 what you saw carries no trace of even-versus-odd. Measured: chance on
-parity at any depth.
+parity at any depth. ("Time-aware decay," below, is a different axis
+entirely: it makes this fading time-continuous — gated by the
+real-world gap between events rather than by token count — and it
+composes with every rung above, scaling how fast existing memory fades
+between events without adding a new capability of its own.)
 
 **Rung 2 — memory that flips (`SignedMinGRU`).** Let the keep-fraction
 go negative: multiply the memory by −1 and it flips sign.
 Even-versus-odd is now trivial — flip on every 1, hold on every 0,
 read the sign at the end. The new capability is alternation: state
-that oscillates and cancels instead of only decaying. ("Time-aware
-decay," below, is a different axis entirely: it makes the fading of
-rung 1 time-continuous — gated by the real-world gap between events
-rather than by token count — and it composes with every rung above,
-scaling how fast existing memory fades between events without adding
-a new capability of its own.) The subtlety the
+that oscillates and cancels instead of only decaying. The subtlety the
 experiments surfaced is that *reachable in principle* isn't enough —
 the −1 has to be a place training naturally settles. That is why the
 default parameterization matters: `tanh` saturates at exactly −1,
@@ -515,6 +517,14 @@ how it injects new information. Available on `MinGRU`, `SignedMinGRU`,
 and `RotationMinGRU` alike, and threaded through `MinGRUBlock` /
 `MinGRUStack`.
 
+What follows works mechanism-first: the transition math and the
+`delta_t` contract below, then two experiments — a channel ablation
+showing what the mechanism adds beyond just handing a model the raw
+time gaps as an input feature ("Does the decay mechanism add anything
+beyond a `delta_t` feature?"), and a recovery check showing what an
+unhelpful decay rate costs ("Recovery check"). Skip ahead to either if
+you want the evidence before the mechanism.
+
 **Mechanism.** Each step's transition coefficient is scaled by
 `gamma = exp(-lambda * f(delta_t))`, where `lambda >= 0` is a per-
 channel (per-block, for `RotationMinGRU`) decay rate and `f` is
@@ -571,7 +581,7 @@ construction.
 blocks whose mixer has decay enabled; if no block in the stack decays,
 passing `delta_t` raises `ValueError`.
 
-**Design notes** — three choices worth knowing about, since other
+**Design notes** — two choices worth knowing about, since other
 time-decayed RNNs commonly make them differently:
 
 1. **`softplus` on the rate parameter itself, not a learned projection
@@ -584,13 +594,12 @@ time-decayed RNNs commonly make them differently:
    gamma = 1` contract. Resolution: `softplus` on a plain learnable
    rate (`lambda = softplus(rho)`), not on any function of `delta_t`.
 2. **No `t = 0` exemption.** Some implementations exempt the first
-   event from decay as a special case; this module doesn't need to —
-   the `delta_t[:, 0] = 0` convention already gives `gamma = 1` there
-   for a true sequence start, and *not* special-casing position 0 is
-   what keeps chunked-vs-full equivalence exact (an absolute-position
-   exemption would have to know which chunk is the first one).
-3. **`decay_layers` defaults to `"all"`,** decaying every block
-   uniformly; `"last"` gives last-layer-only decay when wanted.
+   event from decay as a special case; this module doesn't need one —
+   the `delta_t[:, 0] = 0` convention (above) already gives `gamma = 1`
+   there for a true sequence start. Not special-casing position 0 is
+   also what keeps chunked-vs-full equivalence exact: an
+   absolute-position exemption would have to know which chunk is the
+   first one.
 
 ```python
 from min_gru import MinGRUStack
@@ -737,22 +746,27 @@ shortcut for the training length."
 
 ```
 python probes.py TASK MODEL [N_LAYERS]
-# TASK      in {parity, S3, session-parity, parity-timestamped}
-#           (the last two supply delta_t -- see "Time-aware decay"; GRU has no
-#            delta_t input path and raises ValueError on them)
-# MODEL     in {GRU, minGRU, minGRU-signed, minGRU-signed-tanh,
-#            minGRU-signed-tanh-tdecay, minGRU-signed-tanh-tdecay-mech, minGRU-rotsnap}
-#           (minGRU-signed is pinned to coupled=True: the legacy parameterization,
-#            kept under its historical name so recorded rows keep their meaning;
-#            the two -tdecay rows are decay="learnable" at decay_rate=0.05,
-#            log1p_delta=True -- -mech skips the delta_t feature concat, see
-#            "Time-aware decay")
-# N_LAYERS  defaults to 1; RotationMinGRU (minGRU-rotsnap) is validated at L=1 only
-# MAX_STEPS env var overrides the training budget (default 1600)
-# CKPT=1    env var replaces early-stop with best-val@128 checkpoint selection --
-#           required for minGRU-rotsnap's validated protocol; off by default so
-#           legacy early-stop rows stay reproducible
 ```
+
+- **`TASK`** — one of `parity`, `S3`, `session-parity`,
+  `parity-timestamped`. The last two supply `delta_t` (see "Time-aware
+  decay"); `GRU` has no `delta_t` input path and raises `ValueError` on
+  them.
+- **`MODEL`** — one of `GRU`, `minGRU`, `minGRU-signed`,
+  `minGRU-signed-tanh`, `minGRU-signed-tanh-tdecay`,
+  `minGRU-signed-tanh-tdecay-mech`, `minGRU-rotsnap`. `minGRU-signed` is
+  pinned to `coupled=True`: the legacy parameterization, kept under its
+  historical name so recorded rows keep their meaning. The two
+  `-tdecay` rows are `decay="learnable"` at `decay_rate=0.05`,
+  `log1p_delta=True`; `-mech` skips the `delta_t` feature concat (see
+  "Time-aware decay").
+- **`N_LAYERS`** — defaults to `1`; `RotationMinGRU` (`minGRU-rotsnap`)
+  is validated at `L=1` only.
+- **`MAX_STEPS`** (env var) — overrides the training budget (default
+  1600).
+- **`CKPT=1`** (env var) — replaces early-stop with best-val@128
+  checkpoint selection; required for `minGRU-rotsnap`'s validated
+  protocol, off by default so legacy early-stop rows stay reproducible.
 
 Single-cell examples:
 
