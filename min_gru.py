@@ -145,6 +145,12 @@ def parallel_scan_log(log_coeffs: torch.Tensor, log_values: torch.Tensor) -> tor
 # self-test suite exercises.
 _DELTA_T_POSINF_CAP = 1e10
 
+# Constructor kwarg names that configure a mixer's decay behavior (see
+# _init_decay). MinGRUStack's decay_layers="last" strips exactly these
+# keys from mixer_kwargs for every block but the final one, reproducing
+# the reference TimeAwareGRU's last-layer-only decay default.
+_DECAY_MIXER_KWARGS = ("decay", "decay_rate", "log1p_delta")
+
 
 def normalize_delta_t(
     delta_t: torch.Tensor, canonical_ndim: int, log1p_delta: bool = False
@@ -1321,7 +1327,18 @@ class MinGRUBlock(nn.Module):
     mixer_kwargs : dict, optional
         Extra constructor kwargs forwarded to the selected mixer class
         (e.g. ``{"coupled": True}`` for ``"signed"``, or
-        ``{"snap": (2, 3, 5)}`` for ``"rotation"``).
+        ``{"snap": (2, 3, 5)}`` for ``"rotation"``); pass ``decay``,
+        ``decay_rate``, ``log1p_delta`` here to enable time decay (see
+        ``MinGRU``/``SignedMinGRU``/``RotationMinGRU``).
+
+    Notes
+    -----
+    ``delta_t`` threads through ``forward``/``step`` straight to the
+    mixer, unchanged; the block performs no decay-mode validation of
+    its own. The mixer's own decay/``delta_t`` pairing contract
+    (``ValueError`` both directions, see ``_validate_delta_t_pairing``)
+    is what fires whether the block is used standalone or inside a
+    ``MinGRUStack``.
     """
 
     # name -> (class, accepts_learnable_h0). RotationMinGRU's h_0 is
@@ -1367,7 +1384,10 @@ class MinGRUBlock(nn.Module):
             self.mlp = None
 
     def forward(
-        self, x: torch.Tensor, h_0: torch.Tensor | None = None
+        self,
+        x: torch.Tensor,
+        h_0: torch.Tensor | None = None,
+        delta_t: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Parallel forward over a full sequence.
 
@@ -1381,14 +1401,27 @@ class MinGRUBlock(nn.Module):
         h_0 : torch.Tensor, optional
             This block's real minGRU state carried from a previous
             chunk, shape ``(B, 1, d_model)``; see ``MinGRU.forward``.
+        delta_t : torch.Tensor, optional
+            Time gaps preceding each event, shape ``(B, T)`` or
+            ``(B, T, 1)``; forwarded to this block's mixer unchanged.
+            Required iff the mixer's ``decay`` is enabled — the mixer's
+            own pairing contract raises ``ValueError`` otherwise (see
+            ``_validate_delta_t_pairing``); this method adds no
+            validation of its own.
 
         Returns
         -------
         tuple of torch.Tensor
             The output ``(B, T, d_model)`` and the block's final minGRU
             state ``(B, 1, d_model)`` for the next chunk.
+
+        Raises
+        ------
+        ValueError
+            If the mixer's ``decay`` is enabled without ``delta_t``, or
+            ``delta_t`` is given without decay enabled.
         """
-        h_seq = self.mingru(self.norm1(x), h_0)
+        h_seq = self.mingru(self.norm1(x), h_0, delta_t)
         x = x + self.drop(h_seq)
         if self.mlp is not None:
             x = x + self.mlp(self.norm2(x))
@@ -1396,7 +1429,10 @@ class MinGRUBlock(nn.Module):
 
     @torch.no_grad()
     def step(
-        self, x_t: torch.Tensor, h_prev: torch.Tensor | None
+        self,
+        x_t: torch.Tensor,
+        h_prev: torch.Tensor | None,
+        delta_t: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Single streaming step.
 
@@ -1407,14 +1443,24 @@ class MinGRUBlock(nn.Module):
         h_prev : torch.Tensor or None
             This block's minGRU state from ``t-1``, shape
             ``(B, d_model)``; None at the first step.
+        delta_t : torch.Tensor, optional
+            Time gap preceding this event, shape ``(B,)`` or ``(B, 1)``;
+            forwarded to this block's mixer unchanged. Same
+            required-iff-decay-enabled contract as ``forward``.
 
         Returns
         -------
         tuple of torch.Tensor
             The block output and the new minGRU state, each
             ``(B, d_model)``.
+
+        Raises
+        ------
+        ValueError
+            If the mixer's ``decay`` is enabled without ``delta_t``, or
+            ``delta_t`` is given without decay enabled.
         """
-        h = self.mingru.step(self.norm1(x_t), h_prev)
+        h = self.mingru.step(self.norm1(x_t), h_prev, delta_t)
         x_t = x_t + h
         if self.mlp is not None:
             x_t = x_t + self.mlp(self.norm2(x_t))
@@ -1445,14 +1491,35 @@ class MinGRUStack(nn.Module):
         other value raises ``ValueError``.
     mixer_kwargs : dict, optional
         Extra constructor kwargs forwarded to every block's mixer; see
-        ``MinGRUBlock``.
+        ``MinGRUBlock``. Include ``decay``/``decay_rate``/
+        ``log1p_delta`` here to enable time decay (see
+        ``decay_layers`` for which blocks receive them).
+    decay_layers : {"all", "last"}, default="all"
+        Which blocks receive the decay-related keys
+        (``decay``, ``decay_rate``, ``log1p_delta``) from
+        ``mixer_kwargs``. ``"all"`` (default, uniform decay) applies
+        them to every block unchanged. ``"last"`` strips those three
+        keys from ``mixer_kwargs`` for every block except the final
+        one, so only the last block decays — reproducing the
+        reference ``TimeAwareGRU``'s last-layer-only default. Any
+        other value raises ``ValueError`` at construction. If
+        ``mixer_kwargs`` carries no decay keys, ``"last"`` is a
+        harmless no-op (nothing to strip).
 
     Notes
     -----
     Shapes: ``forward`` maps ``(B, T, input_size)`` to
     ``(B, T, d_model)``; ``step`` maps ``(B, input_size)`` and a state
     (a list of ``n_layers`` tensors of shape ``(B, d_model)``) to the
-    output ``(B, d_model)`` and the updated state.
+    output ``(B, d_model)`` and the updated state. Both also accept an
+    optional ``delta_t`` (same shapes as the mixers' ``delta_t``): it
+    is routed to a given block only if that block's mixer has decay
+    enabled (checked via the mixer's own ``decay`` attribute), so a
+    ``decay_layers="last"`` stack silently gives ``delta_t`` only to
+    its final block. If NO block in the stack has decay enabled,
+    passing ``delta_t`` raises ``ValueError`` (the mode-error rule);
+    if at least one block decays, that block's own pairing contract
+    raises if ``delta_t`` was left out.
     """
 
     def __init__(
@@ -1465,23 +1532,68 @@ class MinGRUStack(nn.Module):
         learnable_h0: bool = False,
         mixer: str = "log",
         mixer_kwargs: dict | None = None,
+        decay_layers: str = "all",
     ):
         super().__init__()
+        if decay_layers not in ("all", "last"):
+            raise ValueError(
+                f"decay_layers must be 'all' or 'last' (got {decay_layers!r})"
+            )
+        self.decay_layers = decay_layers
         self.in_proj = (
             nn.Linear(input_size, d_model) if input_size != d_model else nn.Identity()
         )
-        self.blocks = nn.ModuleList(
-            MinGRUBlock(
-                d_model, mlp_expansion, dropout, learnable_h0, mixer, mixer_kwargs
-            )
-            for _ in range(n_layers)
+        # "last": non-final blocks get mixer_kwargs with decay keys
+        # stripped; the final block keeps the original mixer_kwargs
+        # unchanged. "all" (default) passes the same mixer_kwargs to
+        # every block, exactly matching pre-decay_layers construction
+        # order/values for non-decay configs.
+        stripped_kwargs = (
+            {k: v for k, v in mixer_kwargs.items() if k not in _DECAY_MIXER_KWARGS}
+            if decay_layers == "last" and mixer_kwargs
+            else mixer_kwargs
         )
+        blocks = []
+        for i in range(n_layers):
+            is_last_block = i == n_layers - 1
+            block_kwargs = mixer_kwargs if is_last_block else stripped_kwargs
+            blocks.append(
+                MinGRUBlock(
+                    d_model, mlp_expansion, dropout, learnable_h0, mixer, block_kwargs
+                )
+            )
+        self.blocks = nn.ModuleList(blocks)
         self.norm_out = nn.LayerNorm(d_model)
+
+    def _check_delta_t_has_decay(self, delta_t: torch.Tensor | None) -> None:
+        """Raise the mode-error ``ValueError`` if no block in this stack decays.
+
+        Shared by ``forward``/``step``. When at least one block's mixer
+        has decay enabled, that block's own pairing contract (via
+        ``_validate_delta_t_pairing`` inside its mixer) is what raises
+        for a missing ``delta_t`` — this check only covers the case
+        where no mixer in the stack would ever see ``delta_t`` to
+        validate it against.
+
+        Parameters
+        ----------
+        delta_t : torch.Tensor or None
+            The ``delta_t`` argument passed to ``forward``/``step``.
+
+        Raises
+        ------
+        ValueError
+            If ``delta_t`` is not None but no block's mixer has decay
+            enabled.
+        """
+        if not any(block.mingru.decay is not None for block in self.blocks):
+            _validate_delta_t_pairing(None, delta_t)
 
     def forward(
         self,
         x: torch.Tensor,
         state: list[torch.Tensor | None] | None = None,
+        delta_t: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Parallel training-mode forward.
 
@@ -1498,19 +1610,33 @@ class MinGRUStack(nn.Module):
             unsqueezing each entry to ``(B, 1, d_model)``. For TBPTT,
             detach the returned state before feeding it to the next
             chunk.
+        delta_t : torch.Tensor, optional
+            Time gaps preceding each event, shape ``(B, T)`` or
+            ``(B, T, 1)``. Routed only to blocks whose mixer has decay
+            enabled (see class Notes); required iff at least one block
+            decays, and rejected with ``ValueError`` if no block decays.
 
         Returns
         -------
         tuple
             The output ``(B, T, d_model)`` and a list of ``n_layers``
             per-block final states, each ``(B, 1, d_model)``.
+
+        Raises
+        ------
+        ValueError
+            If ``delta_t`` is given but no block's mixer has decay
+            enabled, or a decayed block's mixer requires ``delta_t``
+            and it was omitted.
         """
         if state is None:
             state = self.init_state()
+        self._check_delta_t_has_decay(delta_t)
         x = self.in_proj(x)
         new_state = []
         for block, h_0 in zip(self.blocks, state):
-            x, h_last = block(x, h_0)
+            block_dt = delta_t if block.mingru.decay is not None else None
+            x, h_last = block(x, h_0, block_dt)
             new_state.append(h_last)
         return self.norm_out(x), new_state
 
@@ -1527,7 +1653,10 @@ class MinGRUStack(nn.Module):
 
     @torch.no_grad()
     def step(
-        self, x_t: torch.Tensor, state: list[torch.Tensor | None]
+        self,
+        x_t: torch.Tensor,
+        state: list[torch.Tensor | None],
+        delta_t: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Streaming step.
 
@@ -1539,17 +1668,30 @@ class MinGRUStack(nn.Module):
             Input at the current timestep, shape ``(B, input_size)``.
         state : list of (torch.Tensor or None)
             From ``init_state()`` or a previous ``step()``.
+        delta_t : torch.Tensor, optional
+            Time gap preceding this event, shape ``(B,)`` or ``(B, 1)``.
+            Same per-block routing and ``ValueError`` contract as
+            ``forward``.
 
         Returns
         -------
         tuple
             The output, shape ``(B, d_model)``, and the updated state
             (a list of ``n_layers`` tensors, each ``(B, d_model)``).
+
+        Raises
+        ------
+        ValueError
+            If ``delta_t`` is given but no block's mixer has decay
+            enabled, or a decayed block's mixer requires ``delta_t``
+            and it was omitted.
         """
+        self._check_delta_t_has_decay(delta_t)
         x_t = self.in_proj(x_t)
         new_state = []
         for block, h_prev in zip(self.blocks, state):
-            x_t, h = block.step(x_t, h_prev)
+            block_dt = delta_t if block.mingru.decay is not None else None
+            x_t, h = block.step(x_t, h_prev, block_dt)
             new_state.append(h)
         return self.norm_out(x_t), new_state
 
@@ -1937,6 +2079,22 @@ if __name__ == "__main__":
         )
         _check_bit_identical_vs_pre_extension("RotationMinGRU", {}, D_in, D_h, seed=104, x=x)
 
+        # Task 2: MinGRUStack's new delta_t/decay_layers plumbing must not
+        # perturb construction RNG order or output for a decay-off,
+        # decay_layers="all" (default) stack — the pre-extension
+        # MinGRUStack lacks both parameters entirely.
+        torch.manual_seed(105)
+        stack_old = _pre.MinGRUStack(D_in, D_h, 3, mixer="signed")
+        torch.manual_seed(105)
+        stack_new = MinGRUStack(D_in, D_h, 3, mixer="signed")
+        with torch.no_grad():
+            err = (stack_old(x)[0] - stack_new(x)[0]).abs().max().item()
+        assert err == 0.0, (
+            "MinGRUStack decay-off, decay_layers='all' must be bit-identical "
+            f"to the pre-extension module (diff {err})"
+        )
+        print("MinGRUStack decay-off decay_layers='all' bit-identical to pre-extension: ok")
+
     def _check_decay_suite(
         cls_name: str, ctor_kwargs: dict, D_in: int, D_h: int, B: int, T: int, seed: int
     ) -> nn.Module:
@@ -2217,3 +2375,162 @@ if __name__ == "__main__":
     _check_nan_inf_delta_t("MinGRU", {}, D_in, D_h)
     _check_nan_inf_delta_t("SignedMinGRU", {}, D_in, D_h)
     _check_nan_inf_delta_t("RotationMinGRU", {}, D_in, D_h)
+
+    # =====================================================================
+    # Task 2 (time-aware decay): Block/Stack delta_t threading + decay_layers
+    # (spec section 9.2)
+    # =====================================================================
+
+    # --- decayed stack (signed, learnable): parallel vs streaming, random delta_t ---
+    torch.manual_seed(401)
+    decayed_stack = MinGRUStack(
+        D_in, D_h, 3, mixer="signed",
+        mixer_kwargs={"decay": "learnable", "decay_rate": 1.0},
+    ).eval()
+    dt_stack = torch.rand(B, T) * 2.0 + 1e-2
+    with torch.no_grad():
+        y_par, _ = decayed_stack(x, delta_t=dt_stack)
+        state = decayed_stack.init_state()
+        ys = []
+        for t in range(T):
+            y_t, state = decayed_stack.step(x[:, t], state, delta_t=dt_stack[:, t])
+            ys.append(y_t)
+        y_seq = torch.stack(ys, dim=1)
+    err = (y_par - y_seq).abs().max().item()
+    print(f"decayed stack (signed, learnable) parallel vs streaming max abs diff: {err:.3e}")
+    assert err < 1e-4
+
+    # --- decayed stack: chunked vs full, nonzero boundary gap ---
+    Th = T // 2
+    assert dt_stack[:, Th].min().item() > 0, "test setup: boundary gap must be nonzero"
+    with torch.no_grad():
+        y_a, carry = decayed_stack(x[:, :Th], delta_t=dt_stack[:, :Th])
+        y_b, _ = decayed_stack(x[:, Th:], state=carry, delta_t=dt_stack[:, Th:])
+        y_chunked = torch.cat([y_a, y_b], dim=1)
+    err = (y_par - y_chunked).abs().max().item()
+    print(f"decayed stack chunked vs full (nonzero boundary gap) max abs diff: {err:.3e}")
+    assert err < 1e-4
+
+    # --- decay_layers="last": rho present/grad in EXACTLY the final block ---
+    torch.manual_seed(402)
+    last_stack = MinGRUStack(
+        D_in, D_h, 3, mixer="signed",
+        mixer_kwargs={"decay": "learnable", "decay_rate": 1.0},
+        decay_layers="last",
+    )
+    assert all(block.mingru.decay is None for block in last_stack.blocks[:-1]), (
+        "decay_layers='last' must strip decay from every block but the final one"
+    )
+    assert last_stack.blocks[-1].mingru.decay == "learnable", (
+        "decay_layers='last' must keep decay on the final block"
+    )
+    for i, block in enumerate(last_stack.blocks[:-1]):
+        assert not hasattr(block.mingru, "rho"), (
+            f"block {i} must have no decay params under decay_layers='last'"
+        )
+    dt_last = torch.rand(B, T) * 2.0 + 1e-2
+    loss = last_stack(x, delta_t=dt_last)[0].sum()
+    loss.backward()
+    final_rho_grad = last_stack.blocks[-1].mingru.rho.grad
+    assert final_rho_grad is not None and final_rho_grad.abs().sum() > 0, (
+        "final block's rho must receive gradient under decay_layers='last'"
+    )
+    print("decay_layers='last': rho present/grad in exactly the final block: ok")
+
+    # --- decay_layers="last": streaming step() matches parallel forward ---
+    # (mixed per-block routing: earlier blocks get no delta_t, final block
+    # gets the real per-step gap — the one routing shape forward-only
+    # tests cannot see.)
+    last_eval = last_stack.eval()
+    with torch.no_grad():
+        y_par_last, _ = last_eval(x, delta_t=dt_last)
+        state = last_eval.init_state()
+        ys = []
+        for t in range(T):
+            y_t, state = last_eval.step(x[:, t], state, delta_t=dt_last[:, t])
+            ys.append(y_t)
+    err = (y_par_last - torch.stack(ys, dim=1)).abs().max().item()
+    print(f"decay_layers='last' parallel vs streaming max abs diff: {err:.3e}")
+    assert err < 1e-4
+
+    # --- decay_layers="last" with NO decay keys: harmless no-op ---
+    noop_stack = MinGRUStack(D_in, D_h, 2, mixer="signed", decay_layers="last")
+    assert all(block.mingru.decay is None for block in noop_stack.blocks)
+    with torch.no_grad():
+        _ = noop_stack(x)
+    print("decay_layers='last' with no decay keys: harmless no-op: ok")
+
+    # --- decay_layers="last" with n_layers=1: sole block is the final block ---
+    single_last = MinGRUStack(
+        D_in, D_h, 1, mixer="signed",
+        mixer_kwargs={"decay": "fixed", "decay_rate": 1.0},
+        decay_layers="last",
+    )
+    assert single_last.blocks[0].mingru.decay == "fixed", (
+        "n_layers=1 under decay_layers='last' must keep decay on the sole block"
+    )
+    print("decay_layers='last' with n_layers=1: decay kept on sole block: ok")
+
+    # --- decay_layers="all": rho grads reach every block ---
+    torch.manual_seed(403)
+    all_stack = MinGRUStack(
+        D_in, D_h, 3, mixer="signed",
+        mixer_kwargs={"decay": "learnable", "decay_rate": 1.0},
+        decay_layers="all",
+    )
+    assert all(block.mingru.decay == "learnable" for block in all_stack.blocks)
+    dt_all = torch.rand(B, T) * 2.0 + 1e-2
+    loss = all_stack(x, delta_t=dt_all)[0].sum()
+    loss.backward()
+    for i, block in enumerate(all_stack.blocks):
+        grad = block.mingru.rho.grad
+        assert grad is not None and grad.abs().sum() > 0, (
+            f"block {i} rho received no gradient under decay_layers='all'"
+        )
+    print("decay_layers='all': rho grads reach every block: ok")
+
+    # --- delta_t rejection when no block in the stack has decay ---
+    plain_stack = MinGRUStack(D_in, D_h, 3, mixer="signed")
+    try:
+        plain_stack(x, delta_t=torch.rand(B, T))
+        raise AssertionError(
+            "stack with no decayed blocks should reject delta_t with ValueError"
+        )
+    except ValueError:
+        pass
+    state0 = plain_stack.init_state()
+    try:
+        plain_stack.step(x[:, 0], state0, delta_t=torch.rand(B))
+        raise AssertionError(
+            "stack.step with no decayed blocks should reject delta_t with ValueError"
+        )
+    except ValueError:
+        pass
+    print("stack delta_t rejection when no block has decay: ok")
+
+    # --- invalid decay_layers string raises ValueError at construction ---
+    try:
+        MinGRUStack(D_in, D_h, 3, decay_layers="bogus")
+        raise AssertionError("invalid decay_layers should have raised ValueError")
+    except ValueError:
+        pass
+    print("invalid decay_layers string raises ValueError: ok")
+
+    # --- rotation-mixer decayed stack: parallel vs streaming ---
+    torch.manual_seed(404)
+    rot_decayed_stack = MinGRUStack(
+        D_in, D_h, 3, mixer="rotation",
+        mixer_kwargs={"decay": "learnable", "decay_rate": 1.0},
+    ).eval()
+    dt_rot_stack = torch.rand(B, T) * 2.0 + 1e-2
+    with torch.no_grad():
+        y_par_rd, _ = rot_decayed_stack(x, delta_t=dt_rot_stack)
+        state = rot_decayed_stack.init_state()
+        ys = []
+        for t in range(T):
+            y_t, state = rot_decayed_stack.step(x[:, t], state, delta_t=dt_rot_stack[:, t])
+            ys.append(y_t)
+        y_seq_rd = torch.stack(ys, dim=1)
+    err = (y_par_rd - y_seq_rd).abs().max().item()
+    print(f"decayed stack (rotation, learnable) parallel vs streaming max abs diff: {err:.3e}")
+    assert err < 1e-4
