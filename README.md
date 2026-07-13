@@ -87,10 +87,13 @@ decoupled `signed-tanh` fits S3 in-distribution (0.999 @64) through a
 bounded-depth shortcut and decays steadily with length — 0.732 @1024 at
 L=1, and depth doesn't rescue it (0.574 @1024 at L=4) — while the
 rotation row holds near the exact automaton (0.958 @1024). The coupled
-legacy form fails to fit S3 at L=1 even under checkpoint selection. So
-the diagonal/rotation separation lives at length generalization, not
-training fit — exactly where the representability argument
-("Expressivity limits," below) predicts it.
+legacy form fails to fit S3 at L=1 even under checkpoint selection —
+the one knob separating it from the `signed-tanh` row is the
+`|a_t| ≤ 1 − z_t` ceiling ("Signed variant," below), which makes every
+strong eigenvalue cost a second saturation. So the diagonal/rotation
+separation lives at length generalization, not training fit — exactly
+where the representability argument ("Expressivity limits," below)
+predicts it.
 
 The deeper S3 diagonal cells carry high seed-to-seed variance (per-seed
 acc@256 spans 0.66-0.76 for `coupled=True` L=4 and 0.83-0.95 for
