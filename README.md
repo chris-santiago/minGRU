@@ -462,6 +462,19 @@ track exactly, include a `K` that is a multiple of `n`. The default
 is a 3-cycle, covered by the `3` and `6` in the grid; other
 state-tracking targets need their own grid.
 
+How do you find your task's periods? Ask, for each repeatable
+operation in your data: *if this operation happens over and over,
+after how many repeats is the tracked state back where it started?*
+That count is a period the grid must cover. A toggle (on/off, sign
+flip) has period 2. A three-way cyclic swap has period 3. A running
+counter mod 7 — day of week, for example — has period 7. If several
+operations coexist, collect each one's period and cover them all (one
+`K` per period, or a single `K` equal to their least common multiple).
+And if nothing in your task ever cycles back exactly — states just
+grow, drift, or fade — then there's no period to snap to, and the
+rotation grid isn't the right tool for that part of the problem:
+that's what the fading (decay) and flipping (signed) rungs are for.
+
 **Validated at L=1 only.** Stacking `RotationMinGRU` mixers is not
 supported: the straight-through discontinuity compounds across layers
 and breaks snap training. Treat depth as an open question for this
