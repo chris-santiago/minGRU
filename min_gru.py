@@ -1093,10 +1093,12 @@ class RotationMinGRU(DecayMixin, nn.Module):
     true transition angle; use only when exact length generalization
     is not required.
 
-    Depth: validated at L=1 ONLY. Stacking these mixers breaks STE
-    snap training (the straight-through discontinuity compounds across
-    layers) — do not assume depth helps here the way it does for the
-    diagonal mixers.
+    Depth: single-layer use is the recorded baseline; stacks holding
+    rotation blocks (with or without other mixer types) are validated
+    at L=2 on the S3 probe under the best-val@128 protocol, deeper is
+    untested. The straight-through discontinuity can compound across
+    rotation layers, so multi-rotation stacks warn at construction —
+    see ``MinGRUStack`` and the README's Rotation variant section.
 
     Training protocol: the exact automaton is reachable but is NOT a
     stable attractor of standard training — runs wander in and out of
@@ -1735,10 +1737,11 @@ class MinGRUStack(nn.Module):
 
     More than one ``"rotation"`` block in ``mixer`` triggers exactly
     one ``UserWarning`` per construction: the straight-through snap
-    discontinuity is known to compound across rotation layers and
-    break snap training (see the README's Rotation variant section,
-    "Validated at L=1 only"); construction proceeds regardless. A
-    single ``"rotation"`` block in a mixed stack does not warn.
+    discontinuity can compound across rotation layers, and multi-
+    rotation stacks are validated only at L=2 on the S3 probe (deeper
+    is untested — see the README's Rotation variant section, "Depth:
+    L=2 is validated"); construction proceeds regardless. A single
+    ``"rotation"`` block in a mixed stack does not warn.
     """
 
     def __init__(
@@ -1791,9 +1794,10 @@ class MinGRUStack(nn.Module):
             warnings.warn(
                 "stack contains more than one 'rotation' block "
                 f"({n_rotation_blocks} of {n_layers}): the straight-through "
-                "snap discontinuity is known to compound across rotation "
-                "layers and break snap training (see the README's Rotation "
-                "variant section, 'Validated at L=1 only'); proceeding "
+                "snap discontinuity can compound across rotation layers; "
+                "multi-rotation stacks are validated only at L=2 on the S3 "
+                "probe, deeper is untested (see the README's Rotation "
+                "variant section, 'Depth: L=2 is validated'); proceeding "
                 "anyway.",
                 stacklevel=2,
             )

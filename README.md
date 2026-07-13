@@ -37,7 +37,7 @@ below and in `probes.py`) don't match 1:1 — here's the bridge:
 | `MinGRU` (`mixer="log"`, default) | `minGRU` | log-space, positive states; chance-level on both tasks at any depth |
 | `SignedMinGRU`, `coupled=False` (default) | `minGRU-signed-tanh` | decoupled eigenvalue; recommended for parity-like tasks |
 | `SignedMinGRU`, `coupled=True` (legacy) | `minGRU-signed` | pinned to `coupled=True` in `probes.py`; kept under its historical name |
-| `RotationMinGRU` (`mixer="rotation"`) | `minGRU-rotsnap` | L=1 only; needs the `CKPT=1` best-val@128 protocol below |
+| `RotationMinGRU` (`mixer="rotation"`) | `minGRU-rotsnap` | runs at L=1; depth via the list-mixer rows (`minGRU-hetero-*`, `minGRU-rotation2`); needs the `CKPT=1` best-val@128 protocol below |
 | `torch.nn.GRU` (reference baseline) | `GRU` | state-dependent gating; the ceiling both tasks are measured against |
 
 **Recommended:** for parity-like problems (state must flip sign based on a
@@ -505,8 +505,7 @@ rotation→signed reaches 0.9663 mean acc@1024, rotation×2 (two rotation
 blocks — still emits the multi-rotation warning below) reaches 0.9413,
 and signed→rotation reaches 0.8626 — all close to the recorded L=1
 row's 0.958 @1024 (n=8, above). Deeper homogeneous rotation stacks
-(L=4) are untested under this protocol and remain open. (Run history
-for the earlier stacking-failure observation:
+(L=4) are untested under this protocol and remain open. (Run history:
 `experiments/EXPERIMENTS.md`.)
 
 **Depth vs. hierarchy: a tradeoff, not a ranking.** A second probe
