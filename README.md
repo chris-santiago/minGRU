@@ -119,11 +119,11 @@ the "vanilla" minGRU in the paper's Appendix A.
 |---|---|
 | `MinGRU` | one scan layer (log-space, positive states, `a_t ∈ (0,1)`); parallel `forward`, recurrent `step`; optional time-decay (`decay=`, `decay_rate=`, `log1p_delta=`) scales `a_t` only — see "Time-aware decay" |
 | `SignedMinGRU` | signed diagonal transitions (linear-space scan, `a_t ∈ (−1,1)`, unconstrained states); `coupled=False` (default, decoupled eigenvalue) or `coupled=True` (legacy reproduction); same API; same time-decay kwargs as `MinGRU` |
-| `RotationMinGRU` | 2x2 block rotation transitions (non-diagonal, matrix scan); `snap` grid manufactures exact-angle attractors; validated at `L=1` only; same API; same time-decay kwargs, scaling the whole 2x2 block (direction unaffected) |
+| `RotationMinGRU` | 2x2 block rotation transitions (non-diagonal, matrix scan); `snap` grid manufactures exact-angle attractors; depth is a measured tradeoff, not a fixed limit (see "Rotation variant"); same API; same time-decay kwargs, scaling the whole 2x2 block (direction unaffected) |
 | `linear_scan` | Hillis–Steele associative scan for `h_t = a_t·h_{t−1} + b_t` with signed scalar coefficients |
 | `matrix_scan` | Hillis–Steele associative scan for `h_t = M_t @ h_{t−1} + b_t` with 2x2 matrix coefficients (non-commutative composition) |
 | `MinGRUBlock` | pre-norm residual block: LN → mixer → +x, LN → MLP → +x (`mixer` selects `"log"`, `"signed"`, or `"rotation"`; `mixer_kwargs` forwarded to its constructor); `forward`/`step` take an optional `delta_t`, forwarded to the block's mixer unchanged |
-| `MinGRUStack` | input projection → N blocks → final LN; full state threading; same `mixer=`/`mixer_kwargs` applied to every block; `decay_layers="all"` (default) or `"last"` selects which blocks receive the mixer_kwargs' decay keys; `forward`/`step` take an optional `delta_t`, routed only to blocks whose mixer has decay enabled |
+| `MinGRUStack` | input projection → N blocks → final LN; full state threading; `mixer=` is a `str` (applied to every block, unchanged) or a `list[str]` of length `n_layers` mixing types per block (e.g. one rotation block inside a signed/log stack); `mixer_kwargs` is the current flat dict for a `str` mixer, or `None`/a dict keyed by mixer type for a `list` mixer, applied to every block of that type (two blocks of the same type share one config); more than one `"rotation"` entry warns once per construction (STE-compounding, doesn't block construction) and proceeds; `decay_layers="all"` (default) or `"last"` selects which blocks receive the resolved kwargs' decay keys, positionally, whatever each block's type; `forward`/`step` take an optional `delta_t`, routed only to blocks whose mixer has decay enabled |
 
 `MinGRU` is deliberately atomic. A single layer's gates cannot condition on
 accumulated state (that is the parallelism trade); stacking recovers
@@ -156,8 +156,28 @@ legacy_stack = MinGRUStack(
 # bit-exact reproduction of the previous default parameterization
 
 rot_stack = MinGRUStack(32, 256, n_layers=1, mixer="rotation")
-# non-diagonal 2x2 rotation blocks; validated at n_layers=1 only, and only
-# under the best-val@128 training protocol -- see "Rotation variant" below
+# non-diagonal 2x2 rotation blocks; single-mixer use, and only under the
+# best-val@128 training protocol -- see "Rotation variant" below
+```
+
+Mixing mixer types across layers (`mixer=` as a `list[str]`, one name per
+block; `mixer_kwargs` keyed by type instead of flat):
+
+```python
+import torch
+from min_gru import MinGRUStack
+
+hetero_stack = MinGRUStack(
+    32, 256, n_layers=2, mixer=["signed", "rotation"],
+    mixer_kwargs={"signed": {"coupled": True}, "rotation": {"snap": (2, 3, 6)}},
+)
+x = torch.randn(4, 10, 32)
+y, state = hetero_stack(x)            # (B, T, 32) -> (B, T, 256), per-block states
+# one rotation block inside a deeper signed stack (extract-then-compose);
+# mixer_kwargs is keyed by mixer type, not applied flat, when mixer is a
+# list -- see "Rotation variant" for the measured depth/hierarchy tradeoffs.
+# A mixer list with more than one "rotation" entry (e.g. ["rotation",
+# "rotation"]) warns once per construction (STE-compounding) and proceeds.
 ```
 
 Streaming inference (O(1) memory; state is `n_layers × d_model` per sample):
@@ -282,7 +302,9 @@ operations, like following three cups through a shuffle. The rung-2
 subtlety returns, sharper: the useful angles (a third of a turn, for
 three cups) are not places training naturally settles, so this variant
 snaps its angles to an exact grid — which is also why the grid must
-contain the angles your problem needs.
+contain the angles your problem needs. Whether depth can supply the
+feature extraction a single rung-3 layer lacks turns out to be a real
+tradeoff, not a yes/no — see "Rotation variant," below.
 
 **Rung 4 — memory that reads itself (a standard GRU).** Everything
 below shares one discipline: the update at step *t* is chosen by the
@@ -476,10 +498,48 @@ grow, drift, or fade — then there's no period to snap to, and the
 rotation grid isn't the right tool for that part of the problem:
 that's what the fading (decay) and flipping (signed) rungs are for.
 
-**Validated at L=1 only.** Stacking `RotationMinGRU` mixers is not
-supported: the straight-through discontinuity compounds across layers
-and breaks snap training. Treat depth as an open question for this
-mixer, not a configuration to rely on.
+**Depth: L=2 is validated under the best-val@128 protocol; L=4 is
+untested.** Measured through the `MinGRUStack` list-mixer path (task
+`S3`, best-val@128 protocol, 3 seeds each (0, 1, 2), `MAX_STEPS=1600`):
+rotation→signed reaches 0.9663 mean acc@1024, rotation×2 (two rotation
+blocks — still emits the multi-rotation warning below) reaches 0.9413,
+and signed→rotation reaches 0.8626 — all close to the recorded L=1
+row's 0.958 @1024 (n=8, above). Deeper homogeneous rotation stacks
+(L=4) are untested under this protocol and remain open. (Run history
+for the earlier stacking-failure observation:
+`experiments/EXPERIMENTS.md`.)
+
+**Depth vs. hierarchy: a tradeoff, not a ranking.** A second probe
+task, `S3-hier` (chance ≈ 1/6), pairs consecutive sub-tokens through a
+fixed Latin-square lookup built to be non-representable by either group
+of order six, so the generator for each pair must be *extracted* before
+it can be *composed* — a lone rotation layer can't absorb the lookup by
+relabeling angles the way it can for a plain group operation. Measured
+over 3 seeds each (0, 1, 2), `MAX_STEPS=1600` unless noted: homogeneous
+2-layer signed-tanh wins in-budget fit decisively (0.985 mean acc@64,
+0.866 @256) but shows the same length decay documented for
+`SignedMinGRU` above (0.6205 @1024) — a diagonal-scan approximation to
+a genuinely non-commutative composition, not the exact automaton. The
+extract-then-compose hetero stack (signed → rotation) sits near chance
+at this budget (0.4863 mean acc@64) — but at 4x budget
+(`MAX_STEPS=6400`), one of three seeds finds the exact solution and
+generalizes to 0.9834 @1024 in that seed alone (the best
+length-generalization figure measured on `S3-hier`), while the other
+two don't, pulling the 4x mean down to 0.890/0.658/0.570/0.502
+@64/256/512/1024; best-val@128 correctly flags those two seeds (0.573,
+0.763) as runs to retry, not trust — the same fast-but-unstable
+training dynamic already documented for plain `minGRU-rotsnap`,
+extending into the hetero stack's harder joint extract-and-compose
+optimization problem. L=1 rotation alone, rotation×2, rotation→signed,
+and an unconstrained `GRU` all sit at or near chance on `S3-hier` — no
+single capability (depth alone, or a rotation mechanism alone) is
+enough; extracting the pair and composing it non-commutatively both
+have to happen. Read together: homogeneous depth trains reliably and
+fits fast but decays with length; the heterogeneous rotation stack is a
+seed lottery — unreliable in-budget, rare-but-exact at 4x budget when
+it lands. Neither configuration "wins" outright and neither claim is
+budget-independent — every number above is relative to the stated step
+budget, not a claim that any configuration solves `S3-hier`.
 
 **Training protocol: best-val@128 selection + retry-on-flag.** The
 exact automaton is reachable but is **not** a stable attractor of
@@ -780,14 +840,24 @@ python probes.py TASK MODEL [N_LAYERS]
   them.
 - **`MODEL`** — one of `GRU`, `minGRU`, `minGRU-signed`,
   `minGRU-signed-tanh`, `minGRU-signed-tanh-tdecay`,
-  `minGRU-signed-tanh-tdecay-mech`, `minGRU-rotsnap`. `minGRU-signed` is
+  `minGRU-signed-tanh-tdecay-mech`, `minGRU-rotsnap`, `minGRU-hetero-sr`,
+  `minGRU-hetero-rs`, `minGRU-rotation2`. `minGRU-signed` is
   pinned to `coupled=True`: the legacy parameterization, kept under its
   historical name so recorded rows keep their meaning. The two
   `-tdecay` rows are `decay="learnable"` at `decay_rate=0.05`,
   `log1p_delta=True`; `-mech` skips the `delta_t` feature concat (see
-  "Time-aware decay").
-- **`N_LAYERS`** — defaults to `1`; `RotationMinGRU` (`minGRU-rotsnap`)
-  is validated at `L=1` only.
+  "Time-aware decay"). `minGRU-hetero-sr`/`-rs` are 2-layer
+  `MinGRUStack(mixer=["signed", "rotation"])` stacks, one order each
+  (signed→rotation, rotation→signed); `minGRU-rotation2` is
+  `mixer=["rotation", "rotation"]`, the broken-baseline reference (emits
+  one `UserWarning` at construction). All three fix `N_LAYERS` to the
+  mixer list's length (2) — omit it or pass 2 explicitly; a conflicting
+  value raises `ValueError`. See "Rotation variant" for their measured
+  accuracy.
+- **`N_LAYERS`** — defaults to `1`. The single-mixer `minGRU-rotsnap`
+  row runs at `L=1` (its recorded protocol); rotation at depth runs
+  through the list-mixer rows above — see "Rotation variant" for the
+  measured depth tradeoff.
 - **`MAX_STEPS`** (env var) — overrides the training budget (default
   1600).
 - **`CKPT=1`** (env var) — replaces early-stop with best-val@128
