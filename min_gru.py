@@ -1542,6 +1542,107 @@ class MinGRUBlock(nn.Module):
         return x_t, h
 
 
+def _resolve_stack_mixer_spec(
+    mixer: str | list[str], mixer_kwargs: dict | None, n_layers: int
+) -> tuple[list[str], dict[str, dict | None]]:
+    """Normalize ``MinGRUStack``'s ``mixer``/``mixer_kwargs`` pair.
+
+    The kwargs schema is decided entirely by the *type* of ``mixer``:
+    a ``str`` always means a flat ``mixer_kwargs`` dict (one type, used
+    by every block); a ``list[str]`` always means ``mixer_kwargs`` is
+    ``None`` or a dict keyed by mixer type name. ``mixer_kwargs`` is
+    never inspected to guess which schema was intended -- a dict whose
+    shape doesn't match the schema implied by ``mixer``'s type raises
+    ``ValueError`` describing both schemas, rather than being silently
+    reinterpreted.
+
+    Parameters
+    ----------
+    mixer : str or list of str
+        See ``MinGRUStack.__init__``.
+    mixer_kwargs : dict, optional
+        See ``MinGRUStack.__init__``.
+    n_layers : int
+        Expected length of ``mixer`` when it is a list.
+
+    Returns
+    -------
+    tuple of (list of str, dict)
+        ``mixer_list``: one mixer name per block, length ``n_layers``.
+        ``kwargs_by_type``: each mixer type name present in
+        ``mixer_list`` mapped to its resolved flat kwargs dict (or
+        ``None``).
+
+    Raises
+    ------
+    ValueError
+        If ``mixer`` is a list with length != ``n_layers``; if a list
+        entry is not a valid mixer name; if ``mixer`` is a str and
+        ``mixer_kwargs`` looks type-keyed (a key matches a mixer type
+        name); if ``mixer`` is a list and ``mixer_kwargs`` has a key
+        that is not a valid mixer name or names a type absent from
+        ``mixer``; if ``mixer`` is neither a str nor a list.
+
+    Notes
+    -----
+    An unknown ``str`` mixer name is deliberately NOT validated here --
+    that check is left to ``MinGRUBlock``'s own constructor, exactly as
+    before this function existed, so the string-mixer construction path
+    raises from the same call site, in the same position relative to
+    ``in_proj`` construction, as prior versions.
+    """
+    valid_names = MinGRUBlock._MIXER_CLASSES
+    if isinstance(mixer, str):
+        if mixer_kwargs:
+            type_keyed_hits = sorted(k for k in mixer_kwargs if k in valid_names)
+            if type_keyed_hits:
+                raise ValueError(
+                    f"mixer={mixer!r} is a single mixer name, so mixer_kwargs "
+                    "must be a flat dict of that mixer's constructor kwargs "
+                    "(e.g. {'coupled': True}); got key(s) matching a mixer "
+                    f"type name instead ({type_keyed_hits!r}), which is the "
+                    "schema for a list mixer (mixer_kwargs keyed by type, "
+                    "e.g. {'signed': {...}, 'rotation': {...}})."
+                )
+        return [mixer] * n_layers, {mixer: mixer_kwargs}
+
+    if isinstance(mixer, list):
+        if len(mixer) != n_layers:
+            raise ValueError(
+                f"mixer list length ({len(mixer)}) must equal n_layers "
+                f"({n_layers})"
+            )
+        unknown = sorted({name for name in mixer if name not in valid_names})
+        if unknown:
+            raise ValueError(
+                f"unknown mixer name(s) {unknown!r} in mixer list; expected "
+                f"one of {sorted(valid_names)}"
+            )
+        types_in_stack = set(mixer)
+        if mixer_kwargs is None:
+            kwargs_by_type: dict[str, dict | None] = {
+                name: None for name in types_in_stack
+            }
+        else:
+            bad_keys = sorted(
+                k
+                for k in mixer_kwargs
+                if k not in valid_names or k not in types_in_stack
+            )
+            if bad_keys:
+                raise ValueError(
+                    "mixer_kwargs keys must name a mixer type present in "
+                    f"mixer={mixer!r} (one of {sorted(types_in_stack)}); got "
+                    f"unexpected key(s) {bad_keys!r}. For a list mixer, "
+                    "mixer_kwargs is None or a dict keyed by mixer type name "
+                    "(e.g. {'signed': {...}}), not a flat kwargs dict."
+                )
+            kwargs_by_type = {name: mixer_kwargs.get(name) for name in types_in_stack}
+        return list(mixer), kwargs_by_type
+
+    raise ValueError(f"mixer must be a str or list[str] (got {type(mixer).__name__})")
+
+
 class MinGRUStack(nn.Module):
     """N stacked MinGRUBlocks with input projection and final norm.
 
@@ -1561,39 +1662,83 @@ class MinGRUStack(nn.Module):
         Passed through to every block; routed to the block's mixer
         when ``mixer`` is ``"log"`` or ``"signed"``, unused for
         ``"rotation"`` (see ``MinGRUBlock``).
-    mixer : {"log", "signed", "rotation"}, default="log"
-        Sequence mixer used by every block; see ``MinGRUBlock``. Any
-        other value raises ``ValueError``.
+    mixer : str or list of str, default="log"
+        Sequence mixer for the blocks; one of ``{"log", "signed",
+        "rotation"}`` (see ``MinGRUBlock``). A single ``str`` uses that
+        mixer for every block, bit-identical to prior versions: same
+        construction order, same RNG consumption, same state_dict
+        keys. Unknown ``str`` values raise ``ValueError`` (from
+        ``MinGRUBlock``, unchanged). A ``list[str]`` of length
+        ``n_layers`` gives one mixer name per block, in order, so a
+        single ``"rotation"`` block can live inside a deeper stack of
+        ``"signed"``/``"log"`` blocks; a length mismatch or an unknown
+        name anywhere in the list raises ``ValueError`` naming the
+        valid set. More than one ``"rotation"`` entry emits exactly one
+        ``UserWarning`` per construction (see Notes) and then proceeds;
+        a single ``"rotation"`` entry in a mixed stack does not warn.
     mixer_kwargs : dict, optional
-        Extra constructor kwargs forwarded to every block's mixer; see
-        ``MinGRUBlock``. Include ``decay``/``decay_rate``/
-        ``log1p_delta`` here to enable time decay (see
-        ``decay_layers`` for which blocks receive them).
+        Schema is decided by the *type* of ``mixer``, never by
+        inspecting ``mixer_kwargs`` itself:
+
+        - ``mixer: str`` -> the current flat dict, forwarded as-is to
+          every block's mixer constructor (e.g. ``{"coupled": True}``
+          for ``"signed"``).
+        - ``mixer: list[str]`` -> ``None``, or a dict keyed by mixer
+          type name, e.g. ``{"signed": {"coupled": True}, "rotation":
+          {"snap": (2, 3, 6)}}``; each value is that type's flat
+          kwargs dict, applied to every block of that type (two blocks
+          of the same type share one config -- no per-block-index
+          overrides). A key that is not a valid mixer name, or names a
+          type absent from ``mixer``, raises ``ValueError``.
+
+        A flat dict alongside a list ``mixer``, or a type-keyed dict
+        alongside a str ``mixer``, raises ``ValueError`` describing
+        both schemas.
     decay_layers : {"all", "last"}, default="all"
         Which blocks receive the decay-related keys
-        (``decay``, ``decay_rate``, ``log1p_delta``) from
-        ``mixer_kwargs``. ``"all"`` (default, uniform decay) applies
-        them to every block unchanged. ``"last"`` strips those three
-        keys from ``mixer_kwargs`` for every block except the final
-        one, so only the last block decays. Any
-        other value raises ``ValueError`` at construction. If
-        ``mixer_kwargs`` carries no decay keys, ``"last"`` is a
-        harmless no-op (nothing to strip).
+        (``decay``, ``decay_rate``, ``log1p_delta``) from each block's
+        RESOLVED ``mixer_kwargs`` (the type-specific dict when
+        ``mixer`` is a list). ``"all"`` (default, uniform decay)
+        applies them to every block unchanged. ``"last"`` strips those
+        three keys, by position, from every block except the final one
+        (position ``n_layers - 1``) -- whatever that block's mixer
+        type. Any other value raises ``ValueError`` at construction. If
+        a block's resolved kwargs carry no decay keys, ``"last"`` is a
+        harmless no-op for it (nothing to strip).
+
+        Trap in mixed stacks: ``decay_layers`` is purely positional, so
+        under ``"last"`` the final block keeps its decay kwargs
+        whatever type it is -- if that happens to be the ``"rotation"``
+        block, decay lands there and every ``"signed"``/``"log"`` block
+        is stripped, regardless of where you put the decay keys in
+        ``mixer_kwargs``. Prefer per-type ``mixer_kwargs`` (put decay
+        keys only under the type(s) you want decayed) to place decay
+        deliberately in a mixed stack; reserve ``decay_layers="last"``
+        for homogeneous (single-``str``-mixer) stacks.
 
     Notes
     -----
     Shapes: ``forward`` maps ``(B, T, input_size)`` to
     ``(B, T, d_model)``; ``step`` maps ``(B, input_size)`` and a state
     (a list of ``n_layers`` tensors of shape ``(B, d_model)``) to the
-    output ``(B, d_model)`` and the updated state. Both also accept an
-    optional ``delta_t`` (same shapes as the mixers' ``delta_t``): it
-    is routed to a given block only if that block's mixer has decay
-    enabled (checked via the mixer's own ``decay`` attribute), so a
+    output ``(B, d_model)`` and the updated state -- uniform across
+    mixer types, so mixed stacks use the same ``forward``/``step``
+    contract as homogeneous ones. Both also accept an optional
+    ``delta_t`` (same shapes as the mixers' ``delta_t``): it is routed
+    to a given block only if that block's mixer has decay enabled
+    (checked via the mixer's own ``decay`` attribute), so a
     ``decay_layers="last"`` stack silently gives ``delta_t`` only to
     its final block. If NO block in the stack has decay enabled,
     passing ``delta_t`` raises ``ValueError`` (the mode-error rule);
     if at least one block decays, that block's own pairing contract
     raises if ``delta_t`` was left out.
+
+    More than one ``"rotation"`` block in ``mixer`` triggers exactly
+    one ``UserWarning`` per construction: the straight-through snap
+    discontinuity is known to compound across rotation layers and
+    break snap training (see the README's Rotation variant section,
+    "Validated at L=1 only"); construction proceeds regardless. A
+    single ``"rotation"`` block in a mixed stack does not warn.
     """
 
     def __init__(
@@ -1604,7 +1749,7 @@ class MinGRUStack(nn.Module):
         mlp_expansion: int = 4,
         dropout: float = 0.0,
         learnable_h0: bool = False,
-        mixer: str = "log",
+        mixer: str | list[str] = "log",
         mixer_kwargs: dict | None = None,
         decay_layers: str = "all",
     ):
@@ -1617,23 +1762,51 @@ class MinGRUStack(nn.Module):
         self.in_proj = (
             nn.Linear(input_size, d_model) if input_size != d_model else nn.Identity()
         )
-        # "last": non-final blocks get mixer_kwargs with decay keys
-        # stripped; the final block keeps the original mixer_kwargs
-        # unchanged. "all" (default) passes the same mixer_kwargs to
-        # every block, exactly matching pre-decay_layers construction
-        # order/values for non-decay configs.
-        stripped_kwargs = (
-            {k: v for k, v in mixer_kwargs.items() if k not in _DECAY_MIXER_KWARGS}
-            if decay_layers == "last" and mixer_kwargs
-            else mixer_kwargs
+        # Normalize mixer/mixer_kwargs to a per-block mixer list and a
+        # kwargs dict keyed by mixer type name (a str mixer collapses to
+        # a single-entry list/dict, so the rest of __init__ is generic
+        # over both forms). See _resolve_stack_mixer_spec for the
+        # ValueError cases (length mismatch, unknown name, schema
+        # mismatch between mixer's type and mixer_kwargs's shape).
+        mixer_list, kwargs_by_type = _resolve_stack_mixer_spec(
+            mixer, mixer_kwargs, n_layers
         )
+        # "last": non-final blocks get their resolved kwargs with decay
+        # keys stripped, by position, whatever that block's mixer type;
+        # the final block keeps its resolved kwargs unchanged. "all"
+        # (default) passes every block's resolved kwargs unchanged,
+        # exactly matching pre-decay_layers / pre-list-mixer
+        # construction order and values for non-decay, string-mixer
+        # configs.
+        stripped_by_type = {
+            name: (
+                {k: v for k, v in kw.items() if k not in _DECAY_MIXER_KWARGS}
+                if decay_layers == "last" and kw
+                else kw
+            )
+            for name, kw in kwargs_by_type.items()
+        }
+        n_rotation_blocks = mixer_list.count("rotation")
+        if n_rotation_blocks > 1:
+            warnings.warn(
+                "stack contains more than one 'rotation' block "
+                f"({n_rotation_blocks} of {n_layers}): the straight-through "
+                "snap discontinuity is known to compound across rotation "
+                "layers and break snap training (see the README's Rotation "
+                "variant section, 'Validated at L=1 only'); proceeding "
+                "anyway.",
+                stacklevel=2,
+            )
         blocks = []
         for i in range(n_layers):
             is_last_block = i == n_layers - 1
-            block_kwargs = mixer_kwargs if is_last_block else stripped_kwargs
+            name = mixer_list[i]
+            block_kwargs = (
+                kwargs_by_type[name] if is_last_block else stripped_by_type[name]
+            )
             blocks.append(
                 MinGRUBlock(
-                    d_model, mlp_expansion, dropout, learnable_h0, mixer, block_kwargs
+                    d_model, mlp_expansion, dropout, learnable_h0, name, block_kwargs
                 )
             )
         self.blocks = nn.ModuleList(blocks)
@@ -2608,6 +2781,204 @@ if __name__ == "__main__":
     err = (y_par_rd - y_seq_rd).abs().max().item()
     print(f"decayed stack (rotation, learnable) parallel vs streaming max abs diff: {err:.3e}")
     assert err < 1e-4
+
+    # =====================================================================
+    # Task 3 (heterogeneous stacks): list-mixer construction, kwargs schema,
+    # multi-rotation warning, mixed-stack equivalence (spec section 9.1)
+    # =====================================================================
+
+    # --- valid 2-layer mixed construction: signed -> rotation ---
+    torch.manual_seed(501)
+    hetero2 = MinGRUStack(D_in, D_h, 2, mixer=["signed", "rotation"]).eval()
+    assert isinstance(hetero2.blocks[0].mingru, SignedMinGRU)
+    assert isinstance(hetero2.blocks[1].mingru, RotationMinGRU)
+    with torch.no_grad():
+        _ = hetero2(x)
+    print("2-layer mixed stack (signed, rotation): construction + forward ok")
+
+    # --- valid 3-layer mixed construction, with per-type mixer_kwargs
+    # (coupled signed + a custom snap grid on rotation) ---
+    torch.manual_seed(502)
+    hetero3 = MinGRUStack(
+        D_in, D_h, 3, mixer=["signed", "signed", "rotation"],
+        mixer_kwargs={"signed": {"coupled": True}, "rotation": {"snap": (2, 3, 6)}},
+    ).eval()
+    assert all(block.mingru.coupled for block in hetero3.blocks[:2])
+    assert hetero3.blocks[2].mingru.snap == (2, 3, 6)
+    with torch.no_grad():
+        _ = hetero3(x)
+    print("3-layer mixed stack (signed, signed, rotation) + per-type mixer_kwargs: ok")
+
+    # --- mixer list length mismatch raises ValueError ---
+    try:
+        MinGRUStack(D_in, D_h, 3, mixer=["signed", "rotation"])
+        raise AssertionError("mixer list length mismatch should have raised ValueError")
+    except ValueError:
+        pass
+    print("mixer list length mismatch raises ValueError: ok")
+
+    # --- unknown mixer name in list raises ValueError ---
+    try:
+        MinGRUStack(D_in, D_h, 2, mixer=["signed", "bogus"])
+        raise AssertionError("unknown mixer name in list should have raised ValueError")
+    except ValueError:
+        pass
+    print("unknown mixer name in list raises ValueError: ok")
+
+    # --- flat dict with list mixer raises ValueError (the dict's key isn't a
+    # valid mixer name, exactly the same structural check as "unknown/absent
+    # type key" below applied to a fully flat dict) ---
+    try:
+        MinGRUStack(
+            D_in, D_h, 2, mixer=["signed", "rotation"], mixer_kwargs={"coupled": True}
+        )
+        raise AssertionError("flat dict with list mixer should have raised ValueError")
+    except ValueError:
+        pass
+    print("flat dict with list mixer raises ValueError: ok")
+
+    # --- type-keyed dict with str mixer raises ValueError ---
+    try:
+        MinGRUStack(
+            D_in, D_h, 2, mixer="signed", mixer_kwargs={"signed": {"coupled": True}}
+        )
+        raise AssertionError("type-keyed dict with str mixer should have raised ValueError")
+    except ValueError:
+        pass
+    print("type-keyed dict with str mixer raises ValueError: ok")
+
+    # --- mixer_kwargs key naming a type absent from the list raises ValueError
+    # ("rotation" is a globally valid mixer name, but not present in this
+    # particular mixer list) ---
+    try:
+        MinGRUStack(
+            D_in, D_h, 2, mixer=["signed", "signed"],
+            mixer_kwargs={"rotation": {"snap": (3,)}},
+        )
+        raise AssertionError(
+            "mixer_kwargs key naming a type absent from the list should have "
+            "raised ValueError"
+        )
+    except ValueError:
+        pass
+    print("mixer_kwargs key naming a type absent from the list raises ValueError: ok")
+
+    # --- mixer of an unsupported type (neither str nor list) raises ValueError ---
+    try:
+        MinGRUStack(D_in, D_h, 2, mixer=("signed", "rotation"))
+        raise AssertionError("mixer of an unsupported type should have raised ValueError")
+    except ValueError:
+        pass
+    print("mixer of an unsupported type (tuple) raises ValueError: ok")
+
+    # --- warn-once: exactly one UserWarning for a rotation x2 mixed stack ---
+    with _warnings.catch_warnings(record=True) as rec:
+        _warnings.simplefilter("always")
+        MinGRUStack(D_in, D_h, 3, mixer=["rotation", "signed", "rotation"])
+        rot_warnings = [w for w in rec if issubclass(w.category, UserWarning)]
+    assert len(rot_warnings) == 1, (
+        f"expected exactly one multi-rotation UserWarning, got {len(rot_warnings)}"
+    )
+    print("multi-rotation (rotation x2) mixed stack: exactly one UserWarning: ok")
+
+    # --- no warning for a single-rotation mixed stack ---
+    with _warnings.catch_warnings(record=True) as rec:
+        _warnings.simplefilter("always")
+        MinGRUStack(D_in, D_h, 3, mixer=["signed", "signed", "rotation"])
+        rot_warnings = [w for w in rec if issubclass(w.category, UserWarning)]
+    assert len(rot_warnings) == 0, (
+        f"single-rotation mixed stack must not warn, got {len(rot_warnings)}"
+    )
+    print("single-rotation mixed stack: zero UserWarning: ok")
+
+    # --- mixed stack (no decay): parallel vs streaming, chunked vs full ---
+    torch.manual_seed(503)
+    mixed_stack = MinGRUStack(D_in, D_h, 3, mixer=["signed", "rotation", "signed"]).eval()
+    with torch.no_grad():
+        y_par_m, _ = mixed_stack(x)
+        state = mixed_stack.init_state()
+        ys = []
+        for t in range(T):
+            y_t, state = mixed_stack.step(x[:, t], state)
+            ys.append(y_t)
+        y_seq_m = torch.stack(ys, dim=1)
+    err = (y_par_m - y_seq_m).abs().max().item()
+    print(f"mixed stack (signed, rotation, signed) parallel vs streaming max abs diff: {err:.3e}")
+    assert err < 1e-4
+
+    with torch.no_grad():
+        y_a_m, carry_m = mixed_stack(x[:, : T // 2])
+        y_b_m, _ = mixed_stack(x[:, T // 2 :], state=carry_m)
+        y_chunked_m = torch.cat([y_a_m, y_b_m], dim=1)
+    err = (y_par_m - y_chunked_m).abs().max().item()
+    print(f"mixed stack (signed, rotation, signed) chunked vs full max abs diff: {err:.3e}")
+    assert err < 1e-4
+
+    loss = mixed_stack(x)[0].sum()
+    loss.backward()
+    print("mixed stack (signed, rotation, signed) gradcheck ok")
+
+    # --- mixed stack, decay on ONE type only (per-type mixer_kwargs): parallel
+    # vs streaming, chunked vs full, delta_t reaches only the decayed type's
+    # block(s) ---
+    torch.manual_seed(504)
+    mixed_decay_stack = MinGRUStack(
+        D_in, D_h, 3, mixer=["signed", "rotation", "signed"],
+        mixer_kwargs={"signed": {"decay": "learnable", "decay_rate": 1.0}},
+    ).eval()
+    assert mixed_decay_stack.blocks[0].mingru.decay == "learnable"
+    assert mixed_decay_stack.blocks[2].mingru.decay == "learnable"
+    assert mixed_decay_stack.blocks[1].mingru.decay is None, (
+        "rotation block must not receive decay kwargs meant for 'signed'"
+    )
+    dt_mixed = torch.rand(B, T) * 2.0 + 1e-2
+    with torch.no_grad():
+        y_par_md, _ = mixed_decay_stack(x, delta_t=dt_mixed)
+        state = mixed_decay_stack.init_state()
+        ys = []
+        for t in range(T):
+            y_t, state = mixed_decay_stack.step(x[:, t], state, delta_t=dt_mixed[:, t])
+            ys.append(y_t)
+        y_seq_md = torch.stack(ys, dim=1)
+    err = (y_par_md - y_seq_md).abs().max().item()
+    print(
+        "mixed stack, decay on 'signed' only: parallel vs streaming max abs "
+        f"diff: {err:.3e}"
+    )
+    assert err < 1e-4
+
+    Th_m = T // 2
+    assert dt_mixed[:, Th_m].min().item() > 0, "test setup: boundary gap must be nonzero"
+    with torch.no_grad():
+        y_a_md, carry_md = mixed_decay_stack(x[:, :Th_m], delta_t=dt_mixed[:, :Th_m])
+        y_b_md, _ = mixed_decay_stack(
+            x[:, Th_m:], state=carry_md, delta_t=dt_mixed[:, Th_m:]
+        )
+        y_chunked_md = torch.cat([y_a_md, y_b_md], dim=1)
+    err = (y_par_md - y_chunked_md).abs().max().item()
+    print(
+        "mixed stack, decay on 'signed' only: chunked vs full (nonzero "
+        f"boundary gap) max abs diff: {err:.3e}"
+    )
+    assert err < 1e-4
+
+    loss = mixed_decay_stack(x, delta_t=dt_mixed)[0].sum()
+    loss.backward()
+    assert mixed_decay_stack.blocks[0].mingru.rho.grad is not None
+    assert mixed_decay_stack.blocks[2].mingru.rho.grad is not None
+    print("mixed stack, decay on 'signed' only: gradcheck ok")
+
+    # delta_t reaches only decay-enabled blocks: the rotation block's mixer
+    # has decay=None, so MinGRUStack.forward/step's per-block routing (see
+    # `_check_delta_t_has_decay` / the `block.mingru.decay is not None` gate)
+    # must never pass it delta_t even though the stack-level call carries one.
+    decay_enabled_blocks = [
+        i for i, b in enumerate(mixed_decay_stack.blocks) if b.mingru.decay is not None
+    ]
+    assert decay_enabled_blocks == [0, 2], (
+        f"expected delta_t routing to blocks [0, 2] only, got {decay_enabled_blocks}"
+    )
+    print("mixed stack: delta_t reaches only decay-enabled blocks ([0, 2]): ok")
 
     # =====================================================================
     # Structural guard: DecayMixin._init_decay constructs a mixer's decay
