@@ -215,6 +215,79 @@ class RotationMinGRU(nn.Module):
         return h.reshape(B, T, self.hidden_size)
 
 
+class DeltaNetMixer(nn.Module):
+    """Generalized-Householder delta rule (DeltaNet nh=1; DeltaProduct
+    nh>1) -- the incumbent-mechanism comparison point for
+    RotationMinGRU's snap variant, reimplemented from Yang et al. /
+    Grazzi et al. as a plain-torch, sequential recurrence (no
+    chunked/parallel form, no port of the official Triton kernels).
+
+    Per head, state is a d_k x d_v matrix H (d_k = d_v = d_h / n_heads).
+    Per token, nh micro-steps j = 1..nh apply IN ORDER:
+
+        H <- (I - beta_j k_j k_j^T) H + beta_j k_j v_j^T
+
+    with k_j L2-normalized and beta_j = 2*sigmoid(.) in (0, 2) (beta=2
+    with unit k is an exact Householder reflection: I - 2 k k^T is
+    orthogonal with det -1). Readout y_t = H_t^T q_t per head; heads
+    concatenate through an output projection.
+
+    nh=1 (DeltaNet) is the single-reflection floor -- their paper's own
+    ablation axis. nh=2 (DeltaProduct) composes two reflections per
+    token, which can realize a rotation: the rotation-capable
+    counterpart to RotationMinGRU's snap grid.
+    """
+
+    def __init__(self, d_in, d_h, nh=1, n_heads=4):
+        super().__init__()
+        assert d_h % n_heads == 0, "d_h must be divisible by n_heads"
+        self.d_in = d_in
+        self.d_h = d_h
+        self.nh = nh
+        self.n_heads = n_heads
+        self.d_k = d_h // n_heads
+        self.d_v = self.d_k
+        self.linear_q = nn.Linear(d_in, n_heads * self.d_k)
+        self.linear_k = nn.ModuleList(
+            nn.Linear(d_in, n_heads * self.d_k) for _ in range(nh)
+        )
+        self.linear_v = nn.ModuleList(
+            nn.Linear(d_in, n_heads * self.d_v) for _ in range(nh)
+        )
+        self.linear_beta = nn.ModuleList(nn.Linear(d_in, n_heads) for _ in range(nh))
+        self.out_proj = nn.Linear(n_heads * self.d_v, d_h)
+
+    def _step(self, H, k, v, beta):
+        """One Householder micro-step: H <- (I - beta k k^T) H + beta k v^T.
+
+        H: (B, n_heads, d_k, d_v); k: (B, n_heads, d_k) L2-normalized;
+        v: (B, n_heads, d_v); beta: (B, n_heads).
+        """
+        kH = torch.einsum("bhk,bhkv->bhv", k, H)  # k^T H, per head
+        beta = beta[..., None, None]
+        H = H - beta * torch.einsum("bhk,bhv->bhkv", k, kH)
+        H = H + beta * torch.einsum("bhk,bhv->bhkv", k, v)
+        return H
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        q = self.linear_q(x).view(B, T, self.n_heads, self.d_k)
+        ks = [
+            F.normalize(lin(x).view(B, T, self.n_heads, self.d_k), dim=-1)
+            for lin in self.linear_k
+        ]
+        vs = [lin(x).view(B, T, self.n_heads, self.d_v) for lin in self.linear_v]
+        betas = [2 * torch.sigmoid(lin(x)) for lin in self.linear_beta]  # (B,T,n_heads)
+        H = x.new_zeros(B, self.n_heads, self.d_k, self.d_v)
+        ys = []
+        for t in range(T):
+            for j in range(self.nh):
+                H = self._step(H, ks[j][:, t], vs[j][:, t], betas[j][:, t])
+            ys.append(torch.einsum("bhk,bhkv->bhv", q[:, t], H))
+        y = torch.stack(ys, dim=1).reshape(B, T, self.n_heads * self.d_v)
+        return self.out_proj(y)
+
+
 # ---------------------------------------------------------------- blocks
 class VariantBlock(nn.Module):
     """Pre-norm residual block around an arbitrary sequence mixer.
@@ -302,6 +375,14 @@ VARIANTS = {
     "rotation-snap-reg001": lambda d_in, d_h: RotationMinGRU(
         d_in, d_h, snap=(2, 3, 4, 6), reg=0.01
     ),
+    # Incumbent-mechanism comparison (DeltaNet/DeltaProduct, Yang et al.
+    # / Grazzi et al.): generalized-Householder delta rule reimplemented
+    # in this harness (mechanism only -- official Triton/CUDA code is
+    # not run here). nh=1 is the single-reflection floor (DeltaNet);
+    # nh=2 composes two reflections per token, the rotation-capable
+    # counterpart to rotation-snap.
+    "deltanet": lambda d_in, d_h: DeltaNetMixer(d_in, d_h, nh=1),
+    "deltaproduct2": lambda d_in, d_h: DeltaNetMixer(d_in, d_h, nh=2),
 }
 
 
@@ -313,6 +394,109 @@ def aux_penalty(model):
         if pen is not None:
             total = total + pen
     return total
+
+
+def _deltanet_dense_construction(H0, ks, vs, betas):
+    """Explicit dense construction of one token's delta-rule update,
+    independent of DeltaNetMixer._step: builds each micro-step's
+    Householder transition A_j = I - beta_j k_j k_j^T and injection
+    b_j = beta_j k_j v_j^T from scratch, then composes
+
+        H_nh = (A_nh ... A_1) H0 + sum_j (A_nh ... A_{j+1}) b_j
+
+    which is the closed form of applying A_j H + b_j sequentially for
+    j = 1..nh (order fixed by the spec). Used only to cross-check
+    DeltaNetMixer._step's iterative application; not called in the
+    forward path.
+    """
+    nh = len(ks)
+    B, Hh, dk = ks[0].shape
+    dv = vs[0].shape[-1]
+    eye = torch.eye(dk).expand(B, Hh, dk, dk)
+    As, bs = [], []
+    for j in range(nh):
+        kkT = torch.einsum("bhk,bhl->bhkl", ks[j], ks[j])
+        As.append(eye - betas[j][..., None, None] * kkT)
+        bs.append(betas[j][..., None, None] * torch.einsum("bhk,bhv->bhkv", ks[j], vs[j]))
+    M = As[0]
+    for j in range(1, nh):
+        M = torch.einsum("bhkl,bhlm->bhkm", As[j], M)
+    inj = torch.zeros(B, Hh, dk, dv)
+    for j in range(nh):
+        P = eye
+        for later in range(j + 1, nh):
+            P = torch.einsum("bhkl,bhlm->bhkm", As[later], P)
+        inj = inj + torch.einsum("bhkl,bhlv->bhkv", P, bs[j])
+    return torch.einsum("bhkl,bhlv->bhkv", M, H0) + inj
+
+
+def _selftest_deltanet_dense_equivalence():
+    """DeltaNetMixer._step applied iteratively (j = 1..nh, in order)
+    must equal the explicit dense-matrix construction of the same
+    update, pinning both the (I - beta k k^T) H + beta k v^T formula
+    and the left-to-right micro-step composition order."""
+    torch.manual_seed(1)
+    B, Hh, dk, dv, nh = 2, 3, 4, 4, 3  # dv == dk: DeltaNetMixer requires d_v = d_k
+    H0 = torch.randn(B, Hh, dk, dv)
+    ks = [F.normalize(torch.randn(B, Hh, dk), dim=-1) for _ in range(nh)]
+    vs = [torch.randn(B, Hh, dv) for _ in range(nh)]
+    betas = [2 * torch.sigmoid(torch.randn(B, Hh)) for _ in range(nh)]
+
+    mixer = DeltaNetMixer(d_in=1, d_h=Hh * dk, nh=nh, n_heads=Hh)
+    H_iter = H0
+    for j in range(nh):
+        H_iter = mixer._step(H_iter, ks[j], vs[j], betas[j])
+    H_dense = _deltanet_dense_construction(H0, ks, vs, betas)
+    err = (H_iter - H_dense).abs().max().item()
+    print(f"deltanet dense-matrix equivalence max abs diff: {err:.3e}")
+    assert err < 1e-5, "delta-rule iterative update does not match dense construction"
+
+    # order matters: swapping the last two micro-steps' (k, v, beta) must
+    # change the result (guards against an order-insensitive/broken test).
+    ks_swapped = ks[:-2] + [ks[-1], ks[-2]]
+    vs_swapped = vs[:-2] + [vs[-1], vs[-2]]
+    betas_swapped = betas[:-2] + [betas[-1], betas[-2]]
+    H_dense_swapped = _deltanet_dense_construction(H0, ks_swapped, vs_swapped, betas_swapped)
+    assert (H_dense - H_dense_swapped).abs().max().item() > 1e-4, (
+        "dense construction is insensitive to micro-step order -- test is not pinning order"
+    )
+
+
+def _selftest_deltanet_householder():
+    """beta=2, unit k: I - beta k k^T must be an exact Householder
+    reflection -- orthogonal, det -1, eigenvalues {1 (x dk-1), -1}."""
+    torch.manual_seed(2)
+    dk = 6
+    k = F.normalize(torch.randn(dk), dim=0)
+    beta = torch.tensor(2.0)
+    A = torch.eye(dk) - beta * torch.outer(k, k)
+    orth_err = (A.T @ A - torch.eye(dk)).abs().max().item()
+    print(f"deltanet Householder orthogonality max abs diff: {orth_err:.3e}")
+    assert orth_err < 1e-5, "I - 2 k k^T is not orthogonal at beta=2, unit k"
+    det = torch.linalg.det(A).item()
+    assert abs(det - (-1.0)) < 1e-4, f"expected det -1, got {det:.4f}"
+    eigvals = torch.linalg.eigvalsh(A).sort().values
+    expected = torch.cat([torch.tensor([-1.0]), torch.full((dk - 1,), 1.0)])
+    eig_err = (eigvals - expected).abs().max().item()
+    assert eig_err < 1e-4, f"expected eigenvalues {{1 (x {dk - 1}), -1}}, got {eigvals.tolist()}"
+    print("deltanet Householder algebra (orthogonal, det=-1, eigenvalues) ok")
+
+
+def _selftest_deltanet_shapes_grad():
+    """Shapes (B,T,d)->(B,T,d) and finite gradients on every parameter,
+    for both registered nh values."""
+    torch.manual_seed(3)
+    B, T, d = 2, 9, 64
+    x = torch.randn(B, T, d)
+    for nh in (1, 2):
+        mixer = DeltaNetMixer(d, d, nh=nh, n_heads=4)
+        y = mixer(x)
+        assert y.shape == (B, T, d), f"nh={nh}: expected shape {(B, T, d)}, got {tuple(y.shape)}"
+        y.sum().backward()
+        for name, p in mixer.named_parameters():
+            assert p.grad is not None, f"nh={nh}: {name} received no gradient"
+            assert torch.isfinite(p.grad).all(), f"nh={nh}: {name} has non-finite gradient"
+    print("deltanet shapes/gradients ok (nh=1, nh=2)")
 
 
 def selftest():
@@ -339,6 +523,10 @@ def selftest():
     Bc.sum().backward()
     assert M.grad is not None and torch.isfinite(M.grad).all()
     print("matrix_scan gradcheck-lite ok")
+    # delta-rule (DeltaNet/DeltaProduct) checks -- spec section 10.
+    _selftest_deltanet_dense_equivalence()
+    _selftest_deltanet_householder()
+    _selftest_deltanet_shapes_grad()
 
 
 # ---------------------------------------------------------------- driver
