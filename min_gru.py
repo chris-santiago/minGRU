@@ -2084,7 +2084,7 @@ if __name__ == "__main__":
     # the decay=None bit-identity check below is a real regression against
     # the actual prior module, not a self-consistency check of the new
     # module against itself.
-    _PRE_EXTENSION_COMMIT = "9828b91d3a5384df5d9016c7200eb6a36adb10fd"
+    _PRE_EXTENSION_COMMIT = "4a0f8c85b9cca0d11b605400d6bb183dc079e935"
 
     def _load_pre_extension_module() -> types.ModuleType:
         """Load the pre-extension min_gru.py from git history.

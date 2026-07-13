@@ -447,12 +447,20 @@ same role `tanh`'s asymptote plays for `SignedMinGRU`'s eigenvalue:
 without it (`snap=None`, a legitimate, documented ladder rung),
 continuous rotation angles have no attractor and drift under length
 generalization, since error in the angle compounds with sequence
-length. **The snap grid must contain the group being tracked**: choose
-`K` values whose rotations (`2π/K`) generate, or coincide with, the
-target group's rotation subgroup, or the exact automaton is not
-representable on the grid at all (e.g. tracking Z/5 needs a multiple
-of 5 in `snap`). The default `snap=(2, 3, 4, 6)` was chosen for the
-D3/S3 task; other state-tracking targets need their own grid.
+length. **The snap grid must contain the rotations being tracked.** A
+block with `K` in its grid can land exactly only on angles that are
+whole multiples of `2π/K` — picture a clock face with `K` positions.
+If the pattern your task cycles through has a period that isn't on
+that clock, the exact solution doesn't exist on the grid and the
+model can only approximate it, no matter how long it trains.
+Concretely: a task cycling through 5 states needs steps of `2π/5`,
+which a `K=5` (or 10, 15, ...) clock has and a `K=4` or `K=6` clock
+does not — so tracking Z/5 needs a multiple of 5 somewhere in `snap`.
+Rule of thumb: for every cyclic pattern of period `n` the task must
+track exactly, include a `K` that is a multiple of `n`. The default
+`snap=(2, 3, 4, 6)` was chosen for the D3/S3 task — its rotation part
+is a 3-cycle, covered by the `3` and `6` in the grid; other
+state-tracking targets need their own grid.
 
 **Validated at L=1 only.** Stacking `RotationMinGRU` mixers is not
 supported: the straight-through discontinuity compounds across layers
