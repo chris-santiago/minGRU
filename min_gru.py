@@ -39,10 +39,14 @@ O(1)-memory streaming via step().
 """
 
 import math
+import warnings
+from typing import Literal
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+Decay = Literal["fixed", "learnable"] | None
 
 
 def g(x: torch.Tensor) -> torch.Tensor:
@@ -121,6 +125,295 @@ def parallel_scan_log(log_coeffs: torch.Tensor, log_values: torch.Tensor) -> tor
     return torch.exp(log_h)[:, 1:]
 
 
+# --- Shared time-decay machinery -------------------------------------------
+#
+# Exponential time decay (``gamma = exp(-lambda * f(delta_t))``) is threaded
+# through all three mixers below. The pieces are factored into small
+# module-level functions rather than duplicated per class: the
+# squeeze/clamp/log1p pipeline, the decay/delta_t pairing contract, and
+# decay-parameter construction are byte-for-byte identical across
+# ``MinGRU``, ``SignedMinGRU``, and ``RotationMinGRU``; only how ``gamma``
+# is folded into that mixer's transition coefficients differs (log-space
+# additive for ``MinGRU``, multiplicative for the other two), so that part
+# stays in each class's own coefficient computation.
+
+
+# Cap applied to +inf entries during delta_t sanitization (see
+# normalize_delta_t). Empirically, an unclamped +inf overflows MinGRU's
+# log-space scan to NaN; 1e10 was verified (by the __main__ NaN/inf test)
+# to stay finite end-to-end for all three mixers, at every decay_rate the
+# self-test suite exercises.
+_DELTA_T_POSINF_CAP = 1e10
+
+
+def normalize_delta_t(
+    delta_t: torch.Tensor, canonical_ndim: int, log1p_delta: bool = False
+) -> tuple[torch.Tensor, bool]:
+    """Normalize a raw ``delta_t`` tensor into the shared decay pipeline's form.
+
+    Implements the pipeline in order: squeeze a trailing singleton
+    dimension down to ``canonical_ndim`` dims, then sanitize
+    unconditionally and branch-free (``NaN`` -> 0 — ``NaN < 0`` is False,
+    so a negative-only clamp would silently let it propagate; ``+inf`` ->
+    ``_DELTA_T_POSINF_CAP``, a large finite value — an unbounded ``+inf``
+    overflows the log-space scan to NaN; ``-inf`` and any remaining
+    negative value -> 0 via the trailing clamp), then optionally apply
+    ``log1p``.
+
+    The sanitization itself never inspects tensor content on the host —
+    it is unconditional and applies to every element — so it costs no
+    CUDA sync, the same no-host-sync posture as ``MinGRU.forward``'s
+    ``torch._assert_async`` h_0 check. The *warn-once courtesy message*
+    is a separate concern: deciding whether to warn requires a boolean
+    reduction over the tensor, which IS a host sync, so that inspection
+    is performed ONLY when ``delta_t`` is already on CPU (free there).
+    On CUDA, negative/NaN/infinite timestamps are silently sanitized
+    with no warning — a deliberate throughput/courtesy tradeoff, not an
+    oversight. Warn-once STATE is not owned here — a pure function has
+    nowhere to persist it across calls — so this only reports whether
+    the (CPU-only) inspection found invalid entries; the caller holds a
+    ``_warned_negative_dt`` flag on its own module instance and decides
+    whether to actually emit the warning.
+
+    Parameters
+    ----------
+    delta_t : torch.Tensor
+        Shape ``(..., )`` matching ``canonical_ndim`` dims exactly, or
+        with one extra trailing size-1 dim to squeeze (e.g. ``forward``
+        passes ``canonical_ndim=2`` for ``(B, T)`` or ``(B, T, 1)``;
+        ``step`` passes ``canonical_ndim=1`` for ``(B,)`` or ``(B, 1)``).
+    canonical_ndim : int
+        The expected number of dims after squeezing.
+    log1p_delta : bool, default=False
+        If True, apply ``log1p`` after sanitizing.
+
+    Returns
+    -------
+    tuple of (torch.Tensor, bool)
+        The normalized ``delta_t`` (squeezed; NaN, +/-inf, and negative
+        entries sanitized to finite non-negative values; ``log1p``
+        applied if configured), and — CPU only — whether any negative,
+        ``NaN``, or infinite entries were found in the raw input
+        (always False on non-CPU devices, since that inspection is
+        skipped there to avoid a host sync).
+
+    Raises
+    ------
+    ValueError
+        If ``delta_t``'s shape doesn't match ``canonical_ndim`` dims
+        (optionally plus one trailing size-1 dim).
+    """
+    if delta_t.dim() == canonical_ndim + 1:
+        if delta_t.size(-1) != 1:
+            raise ValueError(
+                f"delta_t with {delta_t.dim()} dims must have a trailing "
+                f"size-1 dimension to squeeze (got shape "
+                f"{tuple(delta_t.shape)})"
+            )
+        delta_t = delta_t.squeeze(-1)
+    elif delta_t.dim() != canonical_ndim:
+        raise ValueError(
+            f"delta_t must have {canonical_ndim} dims (or "
+            f"{canonical_ndim + 1} with a trailing size-1 dim to squeeze); "
+            f"got shape {tuple(delta_t.shape)}"
+        )
+    has_invalid = False
+    if delta_t.device.type == "cpu":
+        has_invalid = bool(((delta_t < 0) | delta_t.isnan() | delta_t.isinf()).any())
+    delta_t = delta_t.nan_to_num(nan=0.0, posinf=_DELTA_T_POSINF_CAP).clamp(min=0)
+    if log1p_delta:
+        delta_t = torch.log1p(delta_t)
+    return delta_t, has_invalid
+
+
+def _validate_delta_t_pairing(decay: Decay, delta_t: torch.Tensor | None) -> None:
+    """Enforce the decay/``delta_t`` pairing contract.
+
+    Parameters
+    ----------
+    decay : {"fixed", "learnable", None}
+        The mixer's decay mode.
+    delta_t : torch.Tensor or None
+        The ``delta_t`` argument passed to this call.
+
+    Raises
+    ------
+    ValueError
+        If decay is enabled but ``delta_t`` is omitted, or ``delta_t``
+        is supplied but decay is disabled.
+    """
+    if decay is not None and delta_t is None:
+        raise ValueError(f"decay={decay!r} requires delta_t to be provided.")
+    if decay is None and delta_t is not None:
+        raise ValueError(
+            "delta_t was provided but decay is disabled (decay=None); "
+            "construct the mixer with decay='fixed' or decay='learnable' "
+            "to use delta_t."
+        )
+
+
+def _warn_once_invalid_delta_t(module: nn.Module, has_invalid: bool) -> None:
+    """Emit the invalid-``delta_t`` warning once per module instance.
+
+    ``has_invalid`` is only ever True when ``normalize_delta_t`` ran its
+    (CPU-only) content inspection and found negative, ``NaN``, or
+    infinite entries; it is always False on non-CPU devices, so this
+    never warns on CUDA — the same no-host-sync posture as
+    ``MinGRU.forward``'s ``torch._assert_async`` h_0 check.
+
+    Parameters
+    ----------
+    module : nn.Module
+        The calling mixer instance; the warned flag is stored as
+        ``module._warned_negative_dt``.
+    has_invalid : bool
+        Whether negative, ``NaN``, or infinite entries were found by
+        ``normalize_delta_t``.
+    """
+    if has_invalid and not module._warned_negative_dt:
+        warnings.warn(
+            "delta_t contains negative, NaN, or infinite entries (likely "
+            "out-of-order or corrupted timestamps); sanitizing to finite, "
+            "non-negative values.",
+            stacklevel=3,
+        )
+        module._warned_negative_dt = True
+
+
+def _prepare_decay(
+    module: nn.Module, delta_t: torch.Tensor | None, canonical_ndim: int
+) -> torch.Tensor | None:
+    """Validate, normalize, and warn for a mixer's ``delta_t`` input.
+
+    Enforces the decay/``delta_t`` pairing contract (``ValueError`` both
+    directions via ``_validate_delta_t_pairing``), then — only when
+    decay is enabled, i.e. ``delta_t is not None`` — normalizes it via
+    ``normalize_delta_t`` and emits the once-per-instance invalid-entries
+    warning (CPU only; see ``normalize_delta_t``). Shared by every
+    mixer's ``forward``/``step`` so the pairing/normalization/warning
+    logic cannot drift between classes or between the two call paths.
+
+    Parameters
+    ----------
+    module : nn.Module
+        The calling mixer; reads ``module.decay``, ``module.log1p_delta``,
+        ``module._warned_negative_dt``.
+    delta_t : torch.Tensor or None
+        Raw ``delta_t``, or None if decay is disabled.
+    canonical_ndim : int
+        2 for ``forward`` (``(B, T)``), 1 for ``step`` (``(B,)``).
+
+    Returns
+    -------
+    torch.Tensor or None
+        Normalized ``delta_t``, or None (decay disabled — guaranteed by
+        the pairing check to mean ``delta_t`` was also None).
+    """
+    _validate_delta_t_pairing(module.decay, delta_t)
+    if delta_t is None:
+        return None
+    dt, has_invalid = normalize_delta_t(delta_t, canonical_ndim, module.log1p_delta)
+    _warn_once_invalid_delta_t(module, has_invalid)
+    return dt
+
+
+def _init_decay(
+    module: nn.Module,
+    decay: Decay,
+    decay_rate: float,
+    log1p_delta: bool,
+    num_channels: int,
+) -> None:
+    """Validate and construct a mixer's decay parameters/buffers.
+
+    Must be called AFTER all of a mixer's other parameters/buffers are
+    constructed (last line of ``__init__``): that ordering, combined
+    with this function never drawing RNG in any mode, is what keeps
+    ``decay=None`` construction/state_dict layout and same-seed weight
+    values bit-identical to the pre-extension module, and keeps
+    ``decay="learnable"``'s extra ``rho`` parameter from perturbing the
+    RNG stream consumed by the mixer's existing ``nn.Linear`` layers.
+
+    Parameters
+    ----------
+    module : nn.Module
+        The mixer instance under construction. Sets ``decay``,
+        ``decay_rate``, ``log1p_delta``, ``_warned_negative_dt`` on it
+        directly, plus ``decay_rate_buf`` (fixed) or ``rho`` (learnable)
+        when decay is enabled.
+    decay : {"fixed", "learnable", None}
+        Decay mode.
+    decay_rate : float
+        Fixed value, or the learnable rate's init target
+        (``softplus(rho) == decay_rate`` at construction).
+    log1p_delta : bool
+        Stored for use by ``normalize_delta_t`` at call time.
+    num_channels : int
+        Number of decay-rate channels: ``hidden_size`` for
+        ``MinGRU``/``SignedMinGRU``, ``n_blocks`` for
+        ``RotationMinGRU``.
+
+    Raises
+    ------
+    ValueError
+        If ``decay`` is not one of ``None``, ``"fixed"``, ``"learnable"``;
+        or if decay is enabled and ``decay_rate <= 0``. ``lambda`` must
+        be strictly positive in both modes for ``gamma = exp(-lambda *
+        f(delta_t)) in (0, 1]`` to hold for all ``delta_t >= 0`` (spec
+        §7): a non-positive fixed ``decay_rate`` is used directly as
+        ``lambda`` and would let ``gamma`` reach or exceed 1
+        (amplification); a non-positive ``decay_rate`` in learnable mode
+        has no valid ``rho`` (``math.log(math.expm1(x))`` is undefined
+        for ``x <= 0``) and would otherwise surface as an opaque
+        ``math domain error``.
+    """
+    if decay not in (None, "fixed", "learnable"):
+        raise ValueError(
+            f"decay must be None, 'fixed', or 'learnable' (got {decay!r})"
+        )
+    if decay is not None and decay_rate <= 0:
+        raise ValueError(
+            f"decay_rate must be > 0 when decay={decay!r} is enabled (got "
+            f"{decay_rate!r}); lambda = decay_rate (fixed) or "
+            "softplus(rho) == decay_rate at init (learnable) must be "
+            "strictly positive so gamma = exp(-lambda * f(delta_t)) stays "
+            "in (0, 1] and never amplifies."
+        )
+    module.decay = decay
+    module.decay_rate = decay_rate
+    module.log1p_delta = log1p_delta
+    module._warned_negative_dt = False
+    if decay == "fixed":
+        module.register_buffer("decay_rate_buf", torch.full((), decay_rate))
+    elif decay == "learnable":
+        # softplus(rho) == decay_rate at init; math.log(math.expm1(.)) is a
+        # computed constant (no RNG), so this cannot perturb bit-identity
+        # for the decay=None path or the RNG stream other params consume.
+        rho_init = math.log(math.expm1(decay_rate))
+        module.rho = nn.Parameter(torch.full((num_channels,), rho_init))
+
+
+def _decay_lambda(module: nn.Module) -> torch.Tensor:
+    """Per-channel decay rate ``lambda`` for a mixer with decay enabled.
+
+    Parameters
+    ----------
+    module : nn.Module
+        A mixer instance with ``decay in {"fixed", "learnable"}``, and
+        either ``decay_rate_buf`` (fixed) or ``rho`` (learnable)
+        registered by ``_init_decay``.
+
+    Returns
+    -------
+    torch.Tensor
+        ``lambda``, always non-negative: the fixed scalar buffer, or
+        ``softplus(rho)`` per channel (shape ``(num_channels,)``).
+    """
+    if module.decay == "fixed":
+        return module.decay_rate_buf
+    return F.softplus(module.rho)
+
+
 class MinGRU(nn.Module):
     """minGRU layer: log-space parallel-scan training, recurrent inference.
 
@@ -138,13 +431,48 @@ class MinGRU(nn.Module):
         (so positivity is by construction). Used whenever ``forward()``
         or ``step()`` receive no explicit state. Zero-init gives
         ``g(0) = 0.5``, matching the fixed default.
+    decay : {"fixed", "learnable", None}, default=None
+        Exponential time decay of the carried state, driven by
+        ``delta_t``: ``gamma = exp(-lambda * f(delta_t))`` multiplies
+        the log-space transition coefficient (``log(1 - z)``) additively
+        in log-space, i.e. ``log(gamma * (1 - z)) = log(1 - z) -
+        lambda * f(delta_t)`` — no new exp/log round-trip. ``None``
+        disables decay: ``delta_t`` must then be omitted, and behavior
+        is bit-identical to the module without this feature.
+        ``"fixed"``: ``lambda = decay_rate``, a scalar buffer uniform
+        across channels. ``"learnable"``: ``lambda = softplus(rho)``,
+        one ``rho`` per hidden channel, initialized so
+        ``lambda == decay_rate`` at construction. ``delta_t = 0`` gives
+        ``gamma = 1`` exactly (no decay), with no special-casing of
+        ``t = 0``: callers pass ``delta_t = 0`` at a true sequence
+        start, and chunked calls pass the real gap at the chunk
+        boundary to match a full forward exactly.
+    decay_rate : float, default=1.0
+        Fixed decay rate, or the learnable rate's init target.
+    log1p_delta : bool, default=False
+        If True, ``delta_t`` is passed through ``log1p`` before scaling
+        by ``lambda`` (compresses large gaps). See ``normalize_delta_t``.
+        Note: negative/NaN/inf ``delta_t`` entries are always sanitized
+        to finite non-negative values; the courtesy warning about them
+        fires on CPU only (on CUDA they are fixed silently — no host
+        sync, same rationale as the ``h_0`` async validation).
+
+    Raises
+    ------
+    ValueError
+        If ``decay`` is not one of ``None``, ``"fixed"``, ``"learnable"``
+        (at construction); or if ``decay`` is enabled without
+        ``delta_t``, or ``delta_t`` is given without decay enabled (at
+        call time, in ``forward``/``step``).
 
     Notes
     -----
     Shapes: ``forward`` maps ``x (B, T, input_size)`` with optional
     ``h_0 (B, 1, hidden_size)`` to ``(B, T, hidden_size)``; ``step``
     maps ``x_t (B, input_size)`` with optional ``h_prev
-    (B, hidden_size)`` to ``(B, hidden_size)``.
+    (B, hidden_size)`` to ``(B, hidden_size)``. ``delta_t`` follows the
+    same optionality: ``(B, T)`` or ``(B, T, 1)`` for ``forward``,
+    ``(B,)`` or ``(B, 1)`` for ``step``.
     """
 
     def __init__(
@@ -153,6 +481,9 @@ class MinGRU(nn.Module):
         hidden_size: int,
         bias: bool = True,
         learnable_h0: bool = False,
+        decay: Decay = None,
+        decay_rate: float = 1.0,
+        log1p_delta: bool = False,
     ):
         super().__init__()
         self.input_size = input_size
@@ -162,6 +493,7 @@ class MinGRU(nn.Module):
         self.h0_pre: nn.Parameter | None = (
             nn.Parameter(torch.zeros(1, 1, hidden_size)) if learnable_h0 else None
         )
+        _init_decay(self, decay, decay_rate, log1p_delta, hidden_size)
 
     def _default_log_h0(self, B: int, x: torch.Tensor) -> torch.Tensor:
         if self.h0_pre is not None:
@@ -170,7 +502,12 @@ class MinGRU(nn.Module):
             (B, 1, self.hidden_size), 0.5, dtype=x.dtype, device=x.device
         ).log()
 
-    def forward(self, x: torch.Tensor, h_0: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        h_0: torch.Tensor | None = None,
+        delta_t: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Parallel (training-mode) forward over a full sequence.
 
         Parameters
@@ -187,6 +524,11 @@ class MinGRU(nn.Module):
             ``g(0) = 0.5``, matching ``step()``'s default. For
             chunked/TBPTT training, carry ``h_0 = prev_out[:, -1:]``
             (detach as appropriate).
+        delta_t : torch.Tensor, optional
+            Time gaps preceding each event, shape ``(B, T)`` or
+            ``(B, T, 1)``; required iff ``decay`` is enabled (see class
+            docstring). ``delta_t[:, t]`` is the gap preceding event
+            ``t``; ``delta_t = 0`` means no decay at that step.
 
         Returns
         -------
@@ -201,6 +543,9 @@ class MinGRU(nn.Module):
             of pre-activation misuse). Raised device-side via
             ``torch._assert_async``; on CUDA the error surfaces at the
             next sync point rather than at this call.
+        ValueError
+            If ``decay`` is enabled without ``delta_t``, or ``delta_t``
+            is given without decay enabled.
         """
         B = x.size(0)
         if h_0 is None:
@@ -222,6 +567,11 @@ class MinGRU(nn.Module):
         k = self.linear_z(x)                    # pre-activation of z
         log_z = -F.softplus(-k)                 # log(sigmoid(k)) = log(z)
         log_coeffs = -F.softplus(k)             # log(1 - sigmoid(k)) = log(1 - z)
+        dt = _prepare_decay(self, delta_t, canonical_ndim=2)
+        if dt is not None:
+            # log(gamma * (1 - z)) = log(1 - z) - lambda * f(dt); additive
+            # in log-space, so no new exp/log round-trip.
+            log_coeffs = log_coeffs - _decay_lambda(self) * dt.unsqueeze(-1)
         log_tilde_h = log_g(self.linear_h(x))
         return parallel_scan_log(
             log_coeffs,
@@ -229,7 +579,12 @@ class MinGRU(nn.Module):
         )
 
     @torch.no_grad()
-    def step(self, x_t: torch.Tensor, h_prev: torch.Tensor | None = None) -> torch.Tensor:
+    def step(
+        self,
+        x_t: torch.Tensor,
+        h_prev: torch.Tensor | None = None,
+        delta_t: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Single recurrent step for streaming/token-by-token inference.
 
         Numerically equivalent to ``forward()`` one timestep at a time
@@ -246,11 +601,20 @@ class MinGRU(nn.Module):
             output of ``step()`` or ``forward()``. Defaults to
             ``g(0) = 0.5`` (or the learned initial state if
             ``learnable_h0``), matching ``forward()``'s default.
+        delta_t : torch.Tensor, optional
+            Time gap preceding this event, shape ``(B,)`` or ``(B, 1)``;
+            required iff ``decay`` is enabled.
 
         Returns
         -------
         torch.Tensor
             New hidden state ``h_t``, shape ``(B, hidden_size)``.
+
+        Raises
+        ------
+        ValueError
+            If ``decay`` is enabled without ``delta_t``, or ``delta_t``
+            is given without decay enabled.
         """
         if h_prev is None:
             if self.h0_pre is not None:
@@ -259,7 +623,12 @@ class MinGRU(nn.Module):
                 h_prev = x_t.new_full((x_t.size(0), self.hidden_size), 0.5)
         z = torch.sigmoid(self.linear_z(x_t))
         h_tilde = g(self.linear_h(x_t))
-        return (1 - z) * h_prev + z * h_tilde
+        a = 1 - z
+        dt = _prepare_decay(self, delta_t, canonical_ndim=1)
+        if dt is not None:
+            gamma = torch.exp(-_decay_lambda(self) * dt.unsqueeze(-1))
+            a = gamma * a
+        return a * h_prev + z * h_tilde
 
     def extra_repr(self) -> str:
         return f"input_size={self.input_size}, hidden_size={self.hidden_size}"
@@ -418,6 +787,36 @@ class SignedMinGRU(nn.Module):
         If True, use the legacy coupled eigenvalue
         ``a_t = (1 - z_t) * tanh(Linear_s(x_t))``. If False (default),
         use the decoupled eigenvalue ``a_t = tanh(Linear_s(x_t))``.
+    decay : {"fixed", "learnable", None}, default=None
+        Exponential time decay of the carried state:
+        ``a_decayed = gamma * a`` with
+        ``gamma = exp(-lambda * f(delta_t))`` — magnitude decays, sign
+        is preserved, applied identically for both ``coupled`` values.
+        ``None`` disables decay: ``delta_t`` must then be omitted, and
+        behavior (including the ``coupled=True`` bit-exact reproduction
+        guarantee) is bit-identical to the module without this feature.
+        ``"fixed"``: ``lambda = decay_rate``, a scalar buffer.
+        ``"learnable"``: ``lambda = softplus(rho)``, one ``rho`` per
+        hidden channel, initialized so ``lambda == decay_rate`` at
+        construction. ``delta_t = 0`` gives ``gamma = 1`` exactly, with
+        no special-casing of ``t = 0``.
+    decay_rate : float, default=1.0
+        Fixed decay rate, or the learnable rate's init target.
+    log1p_delta : bool, default=False
+        If True, ``delta_t`` is passed through ``log1p`` before scaling
+        by ``lambda``. See ``normalize_delta_t``.
+        Note: negative/NaN/inf ``delta_t`` entries are always sanitized
+        to finite non-negative values; the courtesy warning about them
+        fires on CPU only (on CUDA they are fixed silently — no host
+        sync, same rationale as the ``h_0`` async validation).
+
+    Raises
+    ------
+    ValueError
+        If ``decay`` is not one of ``None``, ``"fixed"``, ``"learnable"``
+        (at construction); or if ``decay`` is enabled without
+        ``delta_t``, or ``delta_t`` is given without decay enabled (at
+        call time, in ``forward``/``step``).
 
     Notes
     -----
@@ -432,6 +831,9 @@ class SignedMinGRU(nn.Module):
         bias: bool = True,
         learnable_h0: bool = False,
         coupled: bool = False,
+        decay: Decay = None,
+        decay_rate: float = 1.0,
+        log1p_delta: bool = False,
     ):
         super().__init__()
         self.input_size = input_size
@@ -443,15 +845,42 @@ class SignedMinGRU(nn.Module):
         self.h0: nn.Parameter | None = (
             nn.Parameter(torch.zeros(1, 1, hidden_size)) if learnable_h0 else None
         )
+        _init_decay(self, decay, decay_rate, log1p_delta, hidden_size)
 
-    def _coeffs(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _coeffs(
+        self, x: torch.Tensor, dt: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Transition coefficient and injection; shared by forward/step.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Shape ``(..., input_size)``.
+        dt : torch.Tensor, optional
+            Already-normalized ``delta_t`` (see ``_prepare_decay``),
+            shape matching ``x``'s leading dims. None if decay is
+            disabled.
+
+        Returns
+        -------
+        tuple of torch.Tensor
+            ``a`` (possibly decayed) and ``b``, each ``(..., hidden_size)``.
+        """
         z = torch.sigmoid(self.linear_z(x))
         tanh_s = torch.tanh(self.linear_s(x))
         a = (1 - z) * tanh_s if self.coupled else tanh_s
         b = z * self.linear_h(x)
+        if dt is not None:
+            gamma = torch.exp(-_decay_lambda(self) * dt.unsqueeze(-1))
+            a = gamma * a
         return a, b
 
-    def forward(self, x: torch.Tensor, h_0: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        h_0: torch.Tensor | None = None,
+        delta_t: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Parallel forward over a full sequence.
 
         Parameters
@@ -462,12 +891,21 @@ class SignedMinGRU(nn.Module):
             Initial hidden state, shape ``(B, 1, hidden_size)``. Any
             real values. Defaults to zeros (or the learned initial
             state if ``learnable_h0``).
+        delta_t : torch.Tensor, optional
+            Time gaps preceding each event, shape ``(B, T)`` or
+            ``(B, T, 1)``; required iff ``decay`` is enabled.
 
         Returns
         -------
         torch.Tensor
             All hidden states ``h_1..h_T``, shape
             ``(B, T, hidden_size)``.
+
+        Raises
+        ------
+        ValueError
+            If ``decay`` is enabled without ``delta_t``, or ``delta_t``
+            is given without decay enabled.
         """
         if h_0 is None:
             h_0 = (
@@ -475,13 +913,23 @@ class SignedMinGRU(nn.Module):
                 if self.h0 is not None
                 else x.new_zeros(x.size(0), 1, self.hidden_size)
             )
-        a, b = self._coeffs(x)
+        dt = _prepare_decay(self, delta_t, canonical_ndim=2)
+        a, b = self._coeffs(x, dt)
         A, Bc = linear_scan(a, b)
         return A * h_0 + Bc
 
     @torch.no_grad()
-    def step(self, x_t: torch.Tensor, h_prev: torch.Tensor | None = None) -> torch.Tensor:
+    def step(
+        self,
+        x_t: torch.Tensor,
+        h_prev: torch.Tensor | None = None,
+        delta_t: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Single recurrent step; same real-state convention as forward().
+
+        Computed from the same ``_coeffs`` helper ``forward()`` uses, so
+        decayed and non-decayed dynamics cannot drift between the two
+        call paths.
 
         Parameters
         ----------
@@ -490,11 +938,20 @@ class SignedMinGRU(nn.Module):
         h_prev : torch.Tensor, optional
             Previous hidden state, shape ``(B, hidden_size)``. Defaults
             to zeros (or the learned initial state).
+        delta_t : torch.Tensor, optional
+            Time gap preceding this event, shape ``(B,)`` or ``(B, 1)``;
+            required iff ``decay`` is enabled.
 
         Returns
         -------
         torch.Tensor
             New hidden state, shape ``(B, hidden_size)``.
+
+        Raises
+        ------
+        ValueError
+            If ``decay`` is enabled without ``delta_t``, or ``delta_t``
+            is given without decay enabled.
         """
         if h_prev is None:
             h_prev = (
@@ -502,7 +959,8 @@ class SignedMinGRU(nn.Module):
                 if self.h0 is not None
                 else x_t.new_zeros(x_t.size(0), self.hidden_size)
             )
-        a, b = self._coeffs(x_t)
+        dt = _prepare_decay(self, delta_t, canonical_ndim=1)
+        a, b = self._coeffs(x_t, dt)
         return a * h_prev + b
 
     def extra_repr(self) -> str:
@@ -601,11 +1059,36 @@ class RotationMinGRU(nn.Module):
         Per-block angle-snap grid orders ``K`` (cycled across blocks);
         each block's angle snaps to multiples of ``2*pi/K``. ``None``
         disables snapping (continuous rotations; see above).
+    decay : {"fixed", "learnable", None}, default=None
+        Exponential time decay of the carried state: ``M_decayed =
+        gamma * M`` per block, with ``gamma = exp(-lambda *
+        f(delta_t))``. Scalar decay commutes with the rotation/
+        reflection group action, so the composed transition's ANGLE is
+        unaffected (stays exactly on the snap grid) — only amplitude
+        fades. ``None`` disables decay: ``delta_t`` must then be
+        omitted, and behavior is bit-identical to the module without
+        this feature. ``"fixed"``: ``lambda = decay_rate``, a scalar
+        buffer. ``"learnable"``: ``lambda = softplus(rho)``, one
+        ``rho`` per block (``n_blocks`` channels), initialized so
+        ``lambda == decay_rate`` at construction. ``delta_t = 0`` gives
+        ``gamma = 1`` exactly, with no special-casing of ``t = 0``.
+    decay_rate : float, default=1.0
+        Fixed decay rate, or the learnable rate's init target.
+    log1p_delta : bool, default=False
+        If True, ``delta_t`` is passed through ``log1p`` before scaling
+        by ``lambda``. See ``normalize_delta_t``.
+        Note: negative/NaN/inf ``delta_t`` entries are always sanitized
+        to finite non-negative values; the courtesy warning about them
+        fires on CPU only (on CUDA they are fixed silently — no host
+        sync, same rationale as the ``h_0`` async validation).
 
     Raises
     ------
     ValueError
-        If ``hidden_size`` is odd.
+        If ``hidden_size`` is odd, or ``decay`` is not one of ``None``,
+        ``"fixed"``, ``"learnable"`` (at construction); or if ``decay``
+        is enabled without ``delta_t``, or ``delta_t`` is given without
+        decay enabled (at call time, in ``forward``/``step``).
 
     Notes
     -----
@@ -615,7 +1098,9 @@ class RotationMinGRU(nn.Module):
     mixers: ``forward`` maps ``x (B, T, input_size)`` with optional
     ``h_0 (B, 1, hidden_size)`` to ``(B, T, hidden_size)``; ``step``
     maps ``x_t (B, input_size)`` with optional ``h_prev
-    (B, hidden_size)`` to ``(B, hidden_size)``.
+    (B, hidden_size)`` to ``(B, hidden_size)``. ``delta_t`` follows the
+    same optionality: ``(B, T)`` or ``(B, T, 1)`` for ``forward``,
+    ``(B,)`` or ``(B, 1)`` for ``step``.
     """
 
     def __init__(
@@ -624,6 +1109,9 @@ class RotationMinGRU(nn.Module):
         hidden_size: int,
         bias: bool = True,
         snap: tuple[int, ...] | None = (2, 3, 4, 6),
+        decay: Decay = None,
+        decay_rate: float = 1.0,
+        log1p_delta: bool = False,
     ):
         super().__init__()
         if hidden_size % 2 != 0:
@@ -653,8 +1141,11 @@ class RotationMinGRU(nn.Module):
                     [2 * math.pi / snap[j % len(snap)] for j in range(self.n_blocks)]
                 ),
             )
+        _init_decay(self, decay, decay_rate, log1p_delta, self.n_blocks)
 
-    def _coeffs(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def _coeffs(
+        self, x: torch.Tensor, dt: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Per-block transition matrix and injection; shared by forward/step.
 
         Parameters
@@ -666,15 +1157,23 @@ class RotationMinGRU(nn.Module):
             the elementwise ops here broadcast uniformly over leading
             dims, so this single helper serves both call paths and
             they cannot drift apart.
+        dt : torch.Tensor, optional
+            Already-normalized ``delta_t`` (see ``_prepare_decay``),
+            shape matching ``x``'s leading dims. None if decay is
+            disabled.
 
         Returns
         -------
         tuple of torch.Tensor
             ``M``, shape ``(..., n_blocks, 2, 2)``: the (possibly
-            snapped) transition ``R(theta_t) @ diag(1, tanh(u_t))``.
-            ``b``, shape ``(..., n_blocks, 2)``: the injection
-            ``z_t * Linear_h(x_t)``, reshaped into ``n_blocks``
-            2-vectors.
+            snapped, possibly decayed) transition
+            ``gamma * R(theta_t) @ diag(1, tanh(u_t))``. Decay scales
+            the whole block matrix by a positive scalar per
+            ``(..., n_blocks)``, so ``atan2`` of the matrix entries
+            recovers the exact (snapped) angle unchanged — only
+            amplitude is affected. ``b``, shape ``(..., n_blocks, 2)``:
+            the injection ``z_t * Linear_h(x_t)`` (never decayed),
+            reshaped into ``n_blocks`` 2-vectors.
         """
         theta = self.linear_theta(x)
         if self.snap is not None:
@@ -688,13 +1187,21 @@ class RotationMinGRU(nn.Module):
         row0 = torch.stack([cos_t, -sin_t * d], dim=-1)
         row1 = torch.stack([sin_t, cos_t * d], dim=-1)
         M = torch.stack([row0, row1], dim=-2)
+        if dt is not None:
+            gamma = torch.exp(-_decay_lambda(self) * dt.unsqueeze(-1))
+            M = gamma.unsqueeze(-1).unsqueeze(-1) * M
 
         z = torch.sigmoid(self.linear_z(x))
         b = z * self.linear_h(x)
         b = b.reshape(*b.shape[:-1], self.n_blocks, 2)
         return M, b
 
-    def forward(self, x: torch.Tensor, h_0: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        h_0: torch.Tensor | None = None,
+        delta_t: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Parallel forward over a full sequence.
 
         Parameters
@@ -705,24 +1212,39 @@ class RotationMinGRU(nn.Module):
             Initial hidden state, shape ``(B, 1, hidden_size)``. Any
             real values (reshaped into ``n_blocks`` 2-vectors
             internally). Defaults to the learned initial state.
+        delta_t : torch.Tensor, optional
+            Time gaps preceding each event, shape ``(B, T)`` or
+            ``(B, T, 1)``; required iff ``decay`` is enabled.
 
         Returns
         -------
         torch.Tensor
             All hidden states ``h_1..h_T``, shape
             ``(B, T, hidden_size)``.
+
+        Raises
+        ------
+        ValueError
+            If ``decay`` is enabled without ``delta_t``, or ``delta_t``
+            is given without decay enabled.
         """
         B, T, _ = x.shape
         if h_0 is None:
             h_0 = self.h0.expand(B, 1, self.hidden_size)
         h0_blocks = h_0.reshape(B, self.n_blocks, 2)
-        M, b = self._coeffs(x)
+        dt = _prepare_decay(self, delta_t, canonical_ndim=2)
+        M, b = self._coeffs(x, dt)
         A, Bc = matrix_scan(M, b)
         h = torch.einsum("btnij,bnj->btni", A, h0_blocks) + Bc
         return h.reshape(B, T, self.hidden_size)
 
     @torch.no_grad()
-    def step(self, x_t: torch.Tensor, h_prev: torch.Tensor | None = None) -> torch.Tensor:
+    def step(
+        self,
+        x_t: torch.Tensor,
+        h_prev: torch.Tensor | None = None,
+        delta_t: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Single recurrent step; same real-state convention as forward().
 
         Computed from the same ``_coeffs`` helper ``forward()`` uses
@@ -737,17 +1259,27 @@ class RotationMinGRU(nn.Module):
         h_prev : torch.Tensor, optional
             Previous hidden state, shape ``(B, hidden_size)``. Defaults
             to the learned initial state.
+        delta_t : torch.Tensor, optional
+            Time gap preceding this event, shape ``(B,)`` or ``(B, 1)``;
+            required iff ``decay`` is enabled.
 
         Returns
         -------
         torch.Tensor
             New hidden state, shape ``(B, hidden_size)``.
+
+        Raises
+        ------
+        ValueError
+            If ``decay`` is enabled without ``delta_t``, or ``delta_t``
+            is given without decay enabled.
         """
         B = x_t.size(0)
         if h_prev is None:
             h_prev = self.h0.expand(B, 1, self.hidden_size)[:, 0]
         h_prev_blocks = h_prev.reshape(B, self.n_blocks, 2)
-        M, b = self._coeffs(x_t)
+        dt = _prepare_decay(self, delta_t, canonical_ndim=1)
+        M, b = self._coeffs(x_t, dt)
         h = torch.einsum("bnij,bnj->bni", M, h_prev_blocks) + b
         return h.reshape(B, self.hidden_size)
 
@@ -1322,3 +1854,366 @@ if __name__ == "__main__":
             f"block {i} linear_s received no gradient under mixer_kwargs={{'coupled': True}}"
         )
     print("stack mixer='signed', mixer_kwargs={'coupled': True} gradcheck ok")
+
+    # =====================================================================
+    # Task 1 (time-aware decay): per-mixer self-tests (spec section 9.1)
+    # =====================================================================
+    import subprocess
+    import types
+    import warnings as _warnings
+
+    # Commit immediately before the time-decay work started (verified above,
+    # via `git log`/`git diff main --stat`, to be HEAD == main at review
+    # time): the true pre-extension min_gru.py, loaded from git history so
+    # the decay=None bit-identity check below is a real regression against
+    # the actual prior module, not a self-consistency check of the new
+    # module against itself.
+    _PRE_EXTENSION_COMMIT = "9828b91d3a5384df5d9016c7200eb6a36adb10fd"
+
+    def _load_pre_extension_module() -> types.ModuleType:
+        """Load the pre-extension min_gru.py from git history.
+
+        Raises
+        ------
+        subprocess.CalledProcessError
+            If `git show` fails (e.g. the commit isn't reachable — a
+            shallow clone that doesn't include it).
+        FileNotFoundError, OSError
+            If `git` itself isn't available, or the repo/.git isn't
+            present (e.g. a vendored copy of this single file with no
+            surrounding git checkout).
+        """
+        src = subprocess.run(
+            ["git", "show", f"{_PRE_EXTENSION_COMMIT}:min_gru.py"],
+            cwd=__import__("pathlib").Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        mod = types.ModuleType("_min_gru_pre_extension")
+        exec(compile(src, "<min_gru_pre_extension>", "exec"), mod.__dict__)
+        return mod
+
+    # This module is meant to be usable as a standalone vendored file (no
+    # surrounding git checkout required, e.g. a tarball export or shallow
+    # clone), so the git-history regression below is best-effort: on any
+    # git/subprocess failure, skip only the four bit-identity checks loudly
+    # and let the rest of the suite run.
+    try:
+        _pre = _load_pre_extension_module()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError) as _git_err:
+        _pre = None
+        print(
+            "pre-extension bit-identity check SKIPPED: git history unavailable "
+            f"({type(_git_err).__name__}: {_git_err}) — run from a full clone "
+            "to exercise it"
+        )
+
+    def _check_bit_identical_vs_pre_extension(
+        cls_name: str, ctor_kwargs: dict, D_in: int, D_h: int, seed: int, x: torch.Tensor
+    ) -> None:
+        """decay=None must reproduce the pre-extension class bit-for-bit."""
+        old_cls = getattr(_pre, cls_name)
+        new_cls = globals()[cls_name]
+        torch.manual_seed(seed)
+        m_old = old_cls(D_in, D_h, **ctor_kwargs)
+        torch.manual_seed(seed)
+        m_new = new_cls(D_in, D_h, decay=None, **ctor_kwargs)
+        with torch.no_grad():
+            err = (m_old(x) - m_new(x)).abs().max().item()
+        assert err == 0.0, (
+            f"{cls_name}{ctor_kwargs}: decay=None must be bit-identical to the "
+            f"pre-extension module (diff {err})"
+        )
+        print(f"{cls_name}{ctor_kwargs} decay=None bit-identical to pre-extension: ok")
+
+    if _pre is not None:
+        _check_bit_identical_vs_pre_extension("MinGRU", {}, D_in, D_h, seed=101, x=x)
+        _check_bit_identical_vs_pre_extension(
+            "SignedMinGRU", {"coupled": False}, D_in, D_h, seed=102, x=x
+        )
+        _check_bit_identical_vs_pre_extension(
+            "SignedMinGRU", {"coupled": True}, D_in, D_h, seed=103, x=x
+        )
+        _check_bit_identical_vs_pre_extension("RotationMinGRU", {}, D_in, D_h, seed=104, x=x)
+
+    def _check_decay_suite(
+        cls_name: str, ctor_kwargs: dict, D_in: int, D_h: int, B: int, T: int, seed: int
+    ) -> nn.Module:
+        """Per-mixer x {fixed, learnable}: delta_t=0, parallel-vs-step, chunked-vs-full.
+
+        Returns the last constructed (learnable-mode) instance, for any
+        further mixer-specific probing (e.g. rotation's angle-grid check).
+        """
+        cls = globals()[cls_name]
+        m_decay = None
+        for mode in ("fixed", "learnable"):
+            torch.manual_seed(seed)
+            x_local = torch.randn(B, T, D_in)
+            torch.manual_seed(seed)
+            m_none = cls(D_in, D_h, decay=None, **ctor_kwargs).eval()
+            torch.manual_seed(seed)
+            m_decay = cls(D_in, D_h, decay=mode, decay_rate=1.0, **ctor_kwargs).eval()
+
+            # delta_t = 0 -> gamma = 1 exactly: matches the no-decay path
+            # on identical weights, bit-for-bit.
+            with torch.no_grad():
+                out_none = m_none(x_local)
+                out_zero = m_decay(x_local, delta_t=torch.zeros(B, T))
+            err = (out_none - out_zero).abs().max().item()
+            print(f"{cls_name} ({mode}) delta_t=0 vs no-decay max abs diff: {err:.3e}")
+            assert err == 0.0, f"{cls_name} ({mode}): delta_t=0 must give gamma=1 exactly"
+
+            # Parallel forward vs iterated step, random positive delta_t.
+            torch.manual_seed(seed + 1)
+            dt = torch.rand(B, T) * 3.0 + 1e-2  # strictly positive gaps
+            with torch.no_grad():
+                h_par = m_decay(x_local, delta_t=dt)
+                h = None
+                hs = []
+                for t in range(T):
+                    h = m_decay.step(x_local[:, t], h, delta_t=dt[:, t])
+                    hs.append(h)
+                h_seq = torch.stack(hs, dim=1)
+            err = (h_par - h_seq).abs().max().item()
+            print(f"{cls_name} ({mode}) parallel vs step (decay) max abs diff: {err:.3e}")
+            assert err < 1e-4
+
+            # Chunked vs full, with a real (nonzero) gap at the chunk boundary.
+            Th = T // 2
+            assert dt[:, Th].min().item() > 0, "test setup: boundary gap must be nonzero"
+            with torch.no_grad():
+                h_full = m_decay(x_local, delta_t=dt)
+                h_a = m_decay(x_local[:, :Th], delta_t=dt[:, :Th])
+                h_b = m_decay(x_local[:, Th:], h_0=h_a[:, -1:], delta_t=dt[:, Th:])
+                h_chunked = torch.cat([h_a, h_b], dim=1)
+            err = (h_full - h_chunked).abs().max().item()
+            print(
+                f"{cls_name} ({mode}) chunked vs full (nonzero boundary gap) "
+                f"max abs diff: {err:.3e}"
+            )
+            assert err < 1e-4
+
+            if mode == "learnable":
+                loss = m_decay(x_local, delta_t=dt).sum()
+                loss.backward()
+                assert m_decay.rho.grad is not None and m_decay.rho.grad.abs().sum() > 0, (
+                    f"{cls_name}: rho received no gradient"
+                )
+                print(f"{cls_name} (learnable): rho gradcheck ok")
+        return m_decay
+
+    _check_decay_suite("MinGRU", {}, D_in, D_h, B=4, T=128, seed=201)
+    _check_decay_suite("SignedMinGRU", {"coupled": False}, D_in, D_h, B=4, T=128, seed=202)
+    _check_decay_suite("SignedMinGRU", {"coupled": True}, D_in, D_h, B=4, T=128, seed=203)
+    mr_decay_learnable = _check_decay_suite(
+        "RotationMinGRU", {}, D_in, D_h, B=4, T=128, seed=204
+    )
+
+    # --- RotationMinGRU: snapped angles remain exact grid multiples under active decay ---
+    torch.manual_seed(205)
+    x_rot = torch.randn(4, 128, D_in)
+    dt_rot = torch.rand(4, 128) * 2.0 + 1e-2
+    with torch.no_grad():
+        M_used, _ = mr_decay_learnable._coeffs(x_rot, dt_rot)
+    theta_used = torch.atan2(M_used[..., 1, 0], M_used[..., 0, 0])
+    ratio = theta_used / mr_decay_learnable.snap_step
+    dev = (ratio - torch.round(ratio)).abs().max().item()
+    print(f"rotation (decay=learnable) snapped angle grid deviation under decay: {dev:.3e}")
+    assert dev < 1e-4, "snapped angles must remain exact grid multiples under active decay"
+
+    # --- decay/delta_t pairing: ValueError both directions, all three mixers ---
+    def _check_delta_t_value_errors(cls_name: str, ctor_kwargs: dict, D_in: int, D_h: int) -> None:
+        cls = globals()[cls_name]
+        x_local = torch.randn(2, 5, D_in)
+        m_none = cls(D_in, D_h, decay=None, **ctor_kwargs)
+        try:
+            m_none(x_local, delta_t=torch.rand(2, 5))
+            raise AssertionError(
+                f"{cls_name}: delta_t without decay should have raised ValueError"
+            )
+        except ValueError:
+            pass
+        m_decay = cls(D_in, D_h, decay="fixed", **ctor_kwargs)
+        try:
+            m_decay(x_local)
+            raise AssertionError(
+                f"{cls_name}: decay enabled without delta_t should have raised ValueError"
+            )
+        except ValueError:
+            pass
+        print(f"{cls_name}: both delta_t/decay ValueError modes: ok")
+
+    _check_delta_t_value_errors("MinGRU", {}, D_in, D_h)
+    _check_delta_t_value_errors("SignedMinGRU", {}, D_in, D_h)
+    _check_delta_t_value_errors("RotationMinGRU", {}, D_in, D_h)
+
+    # --- invalid decay string raises ValueError at construction ---
+    for _cls_name in ("MinGRU", "SignedMinGRU", "RotationMinGRU"):
+        _cls = globals()[_cls_name]
+        try:
+            _cls(D_in, D_h, decay="bogus")
+            raise AssertionError(
+                f"{_cls_name}: invalid decay string should have raised ValueError"
+            )
+        except ValueError:
+            pass
+    print("invalid decay string raises ValueError: ok")
+
+    # --- non-positive decay_rate raises ValueError, both modes (gamma in
+    # (0, 1] requires lambda > 0; a non-positive fixed decay_rate would let
+    # gamma amplify, and a non-positive learnable decay_rate has no valid
+    # rho init, otherwise surfacing as an opaque math domain error) ---
+    for _mode in ("fixed", "learnable"):
+        for _bad_rate in (0.0, -1.0):
+            try:
+                MinGRU(D_in, D_h, decay=_mode, decay_rate=_bad_rate)
+                raise AssertionError(
+                    f"MinGRU: decay={_mode!r}, decay_rate={_bad_rate} should "
+                    "have raised ValueError"
+                )
+            except ValueError:
+                pass
+    print("non-positive decay_rate raises ValueError, both modes: ok")
+
+    # --- negative delta_t: warn once per instance, then clamp to 0 exactly ---
+    torch.manual_seed(206)
+    x_neg = torch.randn(3, 6, D_in)
+    m_neg = MinGRU(D_in, D_h, decay="fixed").eval()
+    dt_neg = torch.rand(3, 6) + 0.5
+    dt_neg[0, 2] = -4.0
+    dt_clamped = dt_neg.clone()
+    dt_clamped[0, 2] = 0.0
+    with _warnings.catch_warnings(record=True) as rec:
+        _warnings.simplefilter("always")
+        with torch.no_grad():
+            out_neg = m_neg(x_neg, delta_t=dt_neg)
+            out_neg_again = m_neg(x_neg, delta_t=dt_neg)  # 2nd call: no new warning
+        neg_warnings = [w for w in rec if issubclass(w.category, UserWarning)]
+    assert len(neg_warnings) == 1, (
+        f"expected exactly one negative-delta_t warning (warn-once), got {len(neg_warnings)}"
+    )
+    with torch.no_grad():
+        out_clamped = m_neg(x_neg, delta_t=dt_clamped)
+    err = (out_neg - out_clamped).abs().max().item()
+    assert err == 0.0, "negative delta_t must clamp to 0, exactly matching the zero-gap output"
+    assert torch.isfinite(out_neg).all() and torch.isfinite(out_neg_again).all()
+    print("negative delta_t: warn-once + exact clamp-to-0: ok")
+
+    # --- log1p_delta=True: per mixer, delta_t=0 exact, parallel-vs-step ok,
+    # and it must actually change outputs vs log1p_delta=False on nonzero delta_t ---
+    def _check_log1p_delta(
+        cls_name: str, ctor_kwargs: dict, D_in: int, D_h: int, B: int, T: int, seed: int
+    ) -> None:
+        cls = globals()[cls_name]
+        torch.manual_seed(seed)
+        x_local = torch.randn(B, T, D_in)
+        torch.manual_seed(seed)
+        m_none = cls(D_in, D_h, decay=None, **ctor_kwargs).eval()
+        torch.manual_seed(seed)
+        m_log1p = cls(
+            D_in, D_h, decay="fixed", decay_rate=1.0, log1p_delta=True, **ctor_kwargs
+        ).eval()
+        torch.manual_seed(seed)
+        m_plain = cls(
+            D_in, D_h, decay="fixed", decay_rate=1.0, log1p_delta=False, **ctor_kwargs
+        ).eval()
+
+        # delta_t = 0 -> log1p(0) = 0 -> gamma = 1 exactly, same as log1p_delta=False.
+        with torch.no_grad():
+            out_none = m_none(x_local)
+            out_zero = m_log1p(x_local, delta_t=torch.zeros(B, T))
+        err = (out_none - out_zero).abs().max().item()
+        assert err == 0.0, f"{cls_name} (log1p_delta=True): delta_t=0 must give gamma=1 exactly"
+
+        # Parallel vs step equivalence still holds under log1p_delta.
+        torch.manual_seed(seed + 1)
+        dt = torch.rand(B, T) * 3.0 + 1e-2
+        with torch.no_grad():
+            h_par = m_log1p(x_local, delta_t=dt)
+            h = None
+            hs = []
+            for t in range(T):
+                h = m_log1p.step(x_local[:, t], h, delta_t=dt[:, t])
+                hs.append(h)
+            h_seq = torch.stack(hs, dim=1)
+        err = (h_par - h_seq).abs().max().item()
+        assert err < 1e-4, f"{cls_name} (log1p_delta=True): parallel vs step max diff {err}"
+
+        # log1p_delta actually changes the decay applied on the same nonzero delta_t
+        # (log1p(dt) != dt for dt > 0, so the two must diverge on identical weights).
+        with torch.no_grad():
+            out_log1p = m_log1p(x_local, delta_t=dt)
+            out_plain = m_plain(x_local, delta_t=dt)
+        diff = (out_log1p - out_plain).abs().max().item()
+        assert diff > 1e-6, (
+            f"{cls_name}: log1p_delta=True should differ from log1p_delta=False "
+            "on the same nonzero delta_t"
+        )
+        print(
+            f"{cls_name} log1p_delta=True: delta_t=0 exact, parallel-vs-step "
+            f"ok ({err:.3e}), differs from log1p_delta=False (diff {diff:.3e})"
+        )
+
+    _check_log1p_delta("MinGRU", {}, D_in, D_h, B=4, T=64, seed=301)
+    _check_log1p_delta("SignedMinGRU", {"coupled": False}, D_in, D_h, B=4, T=64, seed=302)
+    _check_log1p_delta("SignedMinGRU", {"coupled": True}, D_in, D_h, B=4, T=64, seed=303)
+    _check_log1p_delta("RotationMinGRU", {}, D_in, D_h, B=4, T=64, seed=304)
+
+    # --- normalize_delta_t: trailing-singleton squeeze path, both call shapes,
+    # plus the malformed-shape ValueError ---
+    torch.manual_seed(310)
+    x_sq = torch.randn(3, 10, D_in)
+    m_sq = MinGRU(D_in, D_h, decay="fixed").eval()
+    dt_2d = torch.rand(3, 10) + 0.1
+
+    # forward: (B, T) vs (B, T, 1) must be bit-identical after squeeze.
+    with torch.no_grad():
+        out_2d = m_sq(x_sq, delta_t=dt_2d)
+        out_3d = m_sq(x_sq, delta_t=dt_2d.unsqueeze(-1))
+    err = (out_2d - out_3d).abs().max().item()
+    assert err == 0.0, "delta_t (B, T, 1) must be bit-identical to (B, T) after squeeze"
+
+    # step: (B,) vs (B, 1) must be bit-identical after squeeze.
+    dt_t0 = dt_2d[:, 0]
+    with torch.no_grad():
+        h_1d = m_sq.step(x_sq[:, 0], None, delta_t=dt_t0)
+        h_2d = m_sq.step(x_sq[:, 0], None, delta_t=dt_t0.unsqueeze(-1))
+    err = (h_1d - h_2d).abs().max().item()
+    assert err == 0.0, "step delta_t (B, 1) must be bit-identical to (B,) after squeeze"
+
+    # malformed shape: an extra trailing dim that isn't a squeezable size-1.
+    try:
+        m_sq(x_sq, delta_t=torch.rand(3, 10, 2))
+        raise AssertionError("malformed delta_t shape (B, T, 2) should have raised ValueError")
+    except ValueError:
+        pass
+    print(
+        "delta_t trailing-singleton squeeze (forward (B,T,1), step (B,1)) + "
+        "malformed-shape ValueError: ok"
+    )
+
+    # --- NaN / +inf delta_t: sanitized to finite outputs on all three mixers
+    # (log-space MinGRU especially), and the CPU warn-once fires for them ---
+    def _check_nan_inf_delta_t(cls_name: str, ctor_kwargs: dict, D_in: int, D_h: int) -> None:
+        cls = globals()[cls_name]
+        torch.manual_seed(311)
+        x_local = torch.randn(3, 12, D_in)
+        m = cls(D_in, D_h, decay="fixed", **ctor_kwargs).eval()
+        dt = torch.rand(3, 12) + 0.1
+        dt[0, 3] = float("nan")
+        dt[1, 5] = float("inf")
+        with _warnings.catch_warnings(record=True) as rec:
+            _warnings.simplefilter("always")
+            with torch.no_grad():
+                out = m(x_local, delta_t=dt)
+            fired = any(issubclass(w.category, UserWarning) for w in rec)
+        assert torch.isfinite(out).all(), (
+            f"{cls_name}: NaN/+inf delta_t must produce finite outputs, got {out}"
+        )
+        assert fired, f"{cls_name}: CPU warn-once must fire for NaN/+inf delta_t"
+        print(f"{cls_name}: NaN/+inf delta_t -> finite outputs, CPU warn fires: ok")
+
+    _check_nan_inf_delta_t("MinGRU", {}, D_in, D_h)
+    _check_nan_inf_delta_t("SignedMinGRU", {}, D_in, D_h)
+    _check_nan_inf_delta_t("RotationMinGRU", {}, D_in, D_h)
