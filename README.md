@@ -500,12 +500,20 @@ that's what the fading (decay) and flipping (signed) rungs are for.
 
 **Depth: L=2 is validated under the best-val@128 protocol; L=4 is
 untested.** Measured through the `MinGRUStack` list-mixer path (task
-`S3`, best-val@128 protocol, 3 seeds each (0, 1, 2), `MAX_STEPS=1600`):
-rotation→signed reaches 0.9663 mean acc@1024, rotation×2 (two rotation
-blocks — still emits the multi-rotation warning below) reaches 0.9413,
-and signed→rotation reaches 0.8626 — all close to the recorded L=1
-row's 0.958 @1024 (n=8, above). Deeper homogeneous rotation stacks
-(L=4) are untested under this protocol and remain open. (Run history:
+`S3`, best-val@128 protocol, 3 seeds each (0, 1, 2), `MAX_STEPS=1600`),
+multi-seed means:
+
+| L=2 stack (task `S3`) | seeds | acc@64 | acc@256 | acc@512 | acc@1024 |
+|---|---|---|---|---|---|
+| rotation → signed (`minGRU-hetero-rs`) | 3 | 1.000 | 1.000 | 0.999 | 0.966 |
+| rotation × 2 (`minGRU-rotation2`) | 3 | 1.000 | 0.999 | 0.983 | 0.941 |
+| signed → rotation (`minGRU-hetero-sr`) | 3 | 0.999 | 0.976 | 0.940 | 0.863 |
+| *L=1 reference (`minGRU-rotsnap`, above)* | *8* | *1.000* | *1.000* | *0.996* | *0.958* |
+
+All three depth-2 configurations land close to the L=1 reference;
+rotation×2 (two rotation blocks) still emits the multi-rotation
+warning below. Deeper homogeneous rotation stacks (L=4) are untested
+under this protocol and remain open. (Run history:
 `experiments/EXPERIMENTS.md`.)
 
 **Depth vs. hierarchy: a tradeoff, not a ranking.** A second probe
@@ -514,23 +522,33 @@ fixed Latin-square lookup built to be non-representable by either group
 of order six. The generator for each pair must be *extracted* before it
 can be *composed*: a lone rotation layer can't absorb the lookup by
 relabeling angles the way it can for a plain group operation. Measured
-over 3 seeds each (0, 1, 2), `MAX_STEPS=1600` unless noted: homogeneous
-2-layer signed-tanh wins in-budget fit decisively (0.985 mean acc@64,
-0.866 @256) but shows the same length decay documented for
-`SignedMinGRU` above (0.6205 @1024), a diagonal-scan approximation to a
-genuinely non-commutative composition, not the exact automaton. The
-extract-then-compose hetero stack (signed → rotation) sits near chance
-at this budget (0.4863 mean acc@64).
+over 3 seeds each (0, 1, 2), `MAX_STEPS=1600` unless noted, multi-seed
+means:
 
-At 4x budget (`MAX_STEPS=6400`), the hetero stack's mean rises to
-0.890/0.658/0.570/0.502 @64/256/512/1024, but the mean hides a split:
-one of three seeds finds the exact solution and generalizes to 0.9834
-@1024 (the best length-generalization figure measured on `S3-hier`),
-while the other two don't. Best-val@128 correctly flags those two seeds
-(0.573, 0.763) as runs to retry, not trust. This is the same
-fast-but-unstable training dynamic already documented for plain
-`minGRU-rotsnap`, extending into the hetero stack's harder joint
-extract-and-compose optimization problem.
+| config (task `S3-hier`, chance ≈ 0.167) | seeds | acc@64 | acc@256 | acc@512 | acc@1024 |
+|---|---|---|---|---|---|
+| signed-tanh, L=2 (homogeneous) | 3 | 0.985 | 0.866 | 0.754 | 0.620 |
+| signed → rotation (`minGRU-hetero-sr`) | 3 | 0.486 | 0.331 | 0.295 | 0.264 |
+| rotation → signed (`minGRU-hetero-rs`) | 3 | 0.448 | 0.325 | 0.247 | 0.206 |
+| rotation × 2 (`minGRU-rotation2`) | 3 | 0.365 | 0.256 | 0.212 | 0.189 |
+| `GRU`, L=1 | 3 | 0.232 | 0.184 | 0.175 | 0.171 |
+| `minGRU-rotsnap`, L=1 | 3 | 0.225 | 0.183 | 0.174 | 0.170 |
+| signed → rotation at 4x budget (`MAX_STEPS=6400`) | 3 | 0.890 | 0.658 | 0.570 | 0.502 |
+
+Homogeneous 2-layer signed-tanh wins in-budget fit decisively but
+shows the same length decay documented for `SignedMinGRU` above: a
+diagonal-scan approximation to a genuinely non-commutative
+composition, not the exact automaton. The extract-then-compose hetero
+stack (signed → rotation) sits near chance at the standard budget.
+
+The 4x-budget row's mean hides a split: one of three seeds finds the
+exact solution and generalizes to 0.9834 @1024 (the best
+length-generalization figure measured on `S3-hier`), while the other
+two don't. Best-val@128 correctly flags those two seeds (0.573, 0.763)
+as runs to retry, not trust. This is the same fast-but-unstable
+training dynamic already documented for plain `minGRU-rotsnap`,
+extending into the hetero stack's harder joint extract-and-compose
+optimization problem.
 
 L=1 rotation alone, rotation×2, rotation→signed, and an unconstrained
 `GRU` all sit at or near chance on `S3-hier`: no single capability
