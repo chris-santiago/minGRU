@@ -233,6 +233,66 @@ corresponding docstrings in `min_gru.py` (`forward`, `step`, `log_g`).
   `SignedMinGRU` (no exp/log round-trip), ~1e-6 for `RotationMinGRU` —
   none exact by construction.
 
+## The ladder: fading, flipping, turning, reading
+
+Every mixer in this module is a machine that carries a small memory
+along a sequence and updates it at each step. The differences between
+them come down to one question: **what is the update allowed to do to
+the memory?** Answer it four increasingly generous ways and you get a
+ladder — each rung does everything below it, plus exactly one new
+thing.
+
+**Rung 1 — memory that fades (`MinGRU`).** The base minGRU's update
+is: keep some fraction of what you had, blend in some of what you just
+saw. The fraction is always between 0 and 1, so old memory can only
+shrink toward new input. That's a moving average with an
+input-controlled blend — genuinely useful (it is most of what
+"context" means in practice), but it can *only* fade. Ask it whether
+it has seen an even or odd number of 1s and it's stuck: an average of
+what you saw carries no trace of even-versus-odd. Measured: chance on
+parity at any depth.
+
+**Rung 2 — memory that flips (`SignedMinGRU`).** Let the keep-fraction
+go negative: multiply the memory by −1 and it flips sign.
+Even-versus-odd is now trivial — flip on every 1, hold on every 0,
+read the sign at the end. The new capability is alternation: state
+that oscillates and cancels instead of only decaying. The subtlety the
+experiments surfaced is that *reachable in principle* isn't enough —
+the −1 has to be a place training naturally settles. That is why the
+default parameterization matters: `tanh` saturates at exactly −1,
+while the legacy coupled form can approach but never reach it, and the
+shortfall compounds with sequence length.
+
+**Rung 3 — memory that turns (`RotationMinGRU`).** A flip is still
+just multiplication by a number, and numbers commute: ×(−1) then ×(+1)
+equals ×(+1) then ×(−1). So no rung-2 machine can track anything where
+*order* matters. The fix: make the memory a little arrow in a plane
+and each update a rotation (or reflection) of that arrow. Rotations
+don't commute — turn-then-flip lands somewhere different from
+flip-then-turn — so the arrow can carry the running composition of
+operations, like following three cups through a shuffle. The rung-2
+subtlety returns, sharper: the useful angles (a third of a turn, for
+three cups) are not places training naturally settles, so this variant
+snaps its angles to an exact grid — which is also why the grid must
+contain the angles your problem needs.
+
+**Rung 4 — memory that reads itself (a standard GRU).** Everything
+below shares one discipline: the update at step *t* is chosen by the
+input at step *t* alone, never by looking at the current memory. That
+discipline is the entire reason rungs 1–3 train in one parallel pass —
+updates fixed in advance can be composed in any grouping, so a scan
+works. A GRU breaks the discipline: it reads its memory before
+deciding how to change it. That buys genuinely sequential computation
+(one layer solves both probe tasks at every length tested, and harder
+tasks this repo doesn't attempt), and it costs exactly the thing this
+repo exists to keep — each step must wait for the one before it.
+
+The ladder is not "worse to better." It's a menu of what you can
+afford: rungs 1–3 keep parallel training and each buys one specific
+new kind of memory; rung 4 buys the rest and pays with sequentiality.
+The probes in "What this shows" measure precisely these boundaries,
+and "Expressivity limits" below is the formal version of this picture.
+
 ## Expressivity limits
 
 - **Positive states (log-space variant).** Each `MinGRU` block's scan
