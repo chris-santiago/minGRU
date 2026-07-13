@@ -546,3 +546,136 @@ the round-by-round hypothesis/outcome log earlier in this file are
 left as the record of what rounds 1-9 and `verify-baselines` actually
 observed under the pre-fix seeding — read them as history, not as
 current claims.
+
+## Round: heterogeneous stacks (hetero-legA / legB-v2 / ceiling)
+
+Task 1 added per-layer mixer specification to `MinGRUStack` (a `list[str]`
+`mixer`, one entry per block, e.g. `["signed", "rotation"]`). Task 2 built
+on that contract: a new probe task, `S3-hier`, and multi-seed evidence for
+two questions -- does one rotation block survive being stacked with
+signed blocks (leg A, task `S3`), and does depth buy hierarchical
+composition (leg B, task `S3-hier`). Per-seed rows for every cell below
+are appended to `lab_results.jsonl` under the round tags named in each
+subsection; full narrative and provenance discussion lives in the task's
+own report (not part of this repo -- superseded by this section as the
+durable record).
+
+### Leg A: does one rotation block survive depth? (task `S3`, best-val@128 protocol, `MAX_STEPS=1600`, 3 seeds; round `hetero-legA`)
+
+Unaffected by the later `LATIN` fix below -- task `S3` composes
+per-token and does not reference `LATIN` at all.
+
+| model | seeds | ckpt@128 (per seed) | mean acc@64/256/512/1024 |
+|---|---|---|---|
+| `minGRU-rotation2` (rotation x2, broken baseline) | 0,1,2 | 1.000/1.000/1.000 | 1.000/0.999/0.9828/0.9413 |
+| `minGRU-hetero-sr` (signed -> rotation) | 0,1,2 | 0.985/0.999/1.000 | 0.999/0.976/0.9403/0.8626 |
+| `minGRU-hetero-rs` (rotation -> signed) | 0,1,2 | 1.000/1.000/1.000 | 1.000/1.000/0.9986/0.9663 |
+
+Recorded L=1 rotsnap reference (README, n=8, CKPT protocol): acc@64/256/512/1024
+= 1.000/1.000/0.996/0.958. All three leg-A configurations land close to
+that row; every construction of `minGRU-rotation2` (two rotation blocks)
+emitted exactly one `UserWarning` (the multi-rotation STE-compounding
+notice), as designed.
+
+### Leg B v2: does depth buy hierarchy? (task `S3-hier`, `MAX_STEPS=1600` unless noted, 3 seeds; chance ~= 1/6 ~= 0.167; round `hetero-legB-v2`)
+
+Current record, run under the fixed `LATIN` constant (non-isotopic to
+either group of order 6 -- see `probes.py`'s `LATIN` comment). None of
+these six 1x-budget configurations solves `S3-hier` in budget; every
+number is budget-relative.
+
+| model | protocol | mean acc@64/256/512/1024 |
+|---|---|---|
+| `minGRU-rotsnap` L=1 (no feature layer) | CKPT | 0.2247/0.1827/0.1743/0.1703 (near chance) |
+| `minGRU-signed-tanh` L=2 (no composition) | early-stop | 0.985/0.866/0.754/0.6205 |
+| `minGRU-hetero-sr` (signed -> rotation) | CKPT | 0.4863/0.3307/0.2951/0.2637 |
+| `minGRU-hetero-rs` (rotation -> signed) | CKPT | 0.4477/0.3253/0.2468/0.2063 (near chance) |
+| `minGRU-rotation2` (rotation x2) | CKPT | 0.3647/0.2563/0.2115/0.1889 (near chance) |
+| `GRU` (intended ceiling) | early-stop | 0.2317/0.184/0.1749/0.1707 (near chance -- ceiling did not hold in budget) |
+
+### Ceiling check: `minGRU-hetero-sr` at 4x budget (`MAX_STEPS=6400`, CKPT, 3 seeds; round `hetero-legB-ceiling`)
+
+| seed | ckpt@128 | acc@64/256/512/1024 |
+|---|---|---|
+| 0 | 0.573 | 0.754/0.390/0.2825/0.2237 |
+| 1 | **1.000** | **1.000/1.000/0.9999/0.9834** |
+| 2 | 0.763 | 0.917/0.583/0.4268/0.2979 |
+| **mean** | **0.779** | **0.890/0.658/0.570/0.502** |
+
+Seed 1 finds the exact solution (best-val@128 = 1.000) and generalizes to
+0.9834@1024 -- the best single length-generalization figure measured on
+`S3-hier`. Seeds 0 and 2 do not, and best-val@128 correctly flags both
+(0.573, 0.763) as runs to retry -- the same fast-but-unstable training
+dynamic already documented for plain `minGRU-rotsnap`, extending into the
+hetero stack's harder joint extract-and-compose optimization problem.
+`minGRU-signed-tanh` L=2 was not re-run at 4x: its 1x fit is already
+saturated (0.973-0.997@64 across seeds), and this file's own Round 6
+finding ("once train accuracy saturates, the loss cannot see the
+difference between the exact solution and a decaying shortcut") is why
+extra budget is not expected to close its length-decay gap.
+
+### Superseded: leg B under `LATIN = COMPOSE` (round `hetero-legB-v1-superseded`)
+
+The original `S3-hier` evidence used `LATIN = COMPOSE` (S3's own Cayley
+table). `COMPOSE` is trivially isotopic to S3, and `RotationMinGRU`'s
+per-token angle assignment (a learned linear map) gives a rotation layer
+the same relabeling freedom an isotopy allows -- so this pair function
+was partially representable by one rotation layer, not just the narrower
+"literal-index additive" form the cheap `_has_additive_violation` check
+screens for. This leaked signal into every rotation-containing row
+(`minGRU-rotsnap` L=1 reached 0.377@64 under the leak, vs. 0.225@64 after
+the fix; `GRU`, with no rotation mechanism at all, moved from 0.401@64 to
+0.232@64, confirming the leak was in the task, not one architecture), and
+inflated the original headline finding ("heterogeneous stack wins") well
+beyond what the fixed task supports (`minGRU-hetero-sr` dropped from
+0.799@64, v1's "clear winner," to 0.486@64, v2, well below
+`minGRU-signed-tanh` L=2's 0.985@64). All 18 v1 per-seed rows are
+preserved in `lab_results.jsonl` under round `hetero-legB-v1-superseded`
+for audit purposes, each tagged with a `note` field naming this leak --
+**do not cite those numbers as current evidence; see the "Leg B v2"
+table above for the corrected record.**
+
+### Round tags in `lab_results.jsonl`
+
+`hetero-legA` (9 rows), `hetero-legB-v2` (18 rows), `hetero-legB-ceiling`
+(3 rows), `hetero-legB-v1-superseded` (18 rows, each with a `note`
+explaining the leak). Full per-seed detail (steps, secs, ckpt step,
+rotation-warning counts) beyond the means tabulated above is in those
+rows.
+
+## Round: time-decay evidence rescue (tdecay-probe / tdecay-sweep)
+
+Per-seed rows behind the README's "Time-aware decay" section (channel
+ablation, lambda-recovery check, and the `decay_rate` init sweep) were
+gathered across several scratch sessions whose own reports were later
+deleted; rescued here from the raw run logs before the branch that
+produced them closed, tagged into `lab_results.jsonl` under two round
+names:
+
+- `tdecay-probe` (47 rows): the original 4-condition evidence sweep
+  (session-parity / `minGRU-signed-tanh-tdecay`, session-parity /
+  `minGRU-signed-tanh` feature-only baseline, parity-timestamped /
+  `minGRU-signed-tanh-tdecay` lambda-recovery check, plain parity /
+  `minGRU-signed-tanh` non-decay comparison point), its mechanical-only
+  channel-ablation counterpart (`minGRU-signed-tanh-tdecay-mech`) and
+  that mechanism's `MAX_STEPS=6000` ceiling check, a `decay_rate=1.0`
+  init variant run for comparison against the recorded `decay_rate=0.05`
+  default, and the post-fix reruns of seeds 1-2 for every condition
+  above once the train/eval RNG-collision bug (documented earlier in
+  this file, `reseed-fix`) was found and corrected. Seed 0 is unaffected
+  by that fix in every case (reproduces `manual_seed(1)` regardless);
+  each row's `note` field states whether it predates or postdates the
+  fix, and which sibling row it should be combined with for the
+  corrected 3-seed record.
+- `tdecay-sweep` (18 rows): a finer `decay_rate` init sweep (R in
+  `{0.005, 0.01, 0.02}`, both timestamped tasks, 3 seeds each, run after
+  the RNG fix) motivating the choice of `0.05` as the shipped default --
+  R=0.05 itself is the `tdecay-probe` rows above, not rerun in this
+  sweep.
+
+Only `acc@64`/`acc@256` were ever measured for these conditions (no
+512/1024 eval was run); each row's `acc` dict has just those two keys,
+reconstructed as faithfully as the source logs allow. See README's
+"Time-aware decay" section for the recorded means and protocol
+narrative; the per-seed rows here are the durable evidence trail behind
+those numbers.
