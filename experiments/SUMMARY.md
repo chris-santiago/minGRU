@@ -16,12 +16,16 @@ training.
 **Delivered:** two variants + a selection protocol + a mechanism
 certificate.
 
+Numbers below are re-validated under the `reseed-fix` round (a
+train/eval generator-seeding collision fix in `experiments/variants.py`
+— seed 0 unchanged, seeds >= 1 corrected; see `EXPERIMENTS.md`).
+
 | task (train @64) | baseline (current env, 3 seeds) | best variant | result |
 |---|---|---|---|
-| parity @256 | 0.894 (coupled L=1) | signed-tanh L=1 | ≥0.9999 all 6 seeds |
-| parity @1024 | 0.610 | signed-tanh L=1 | mean 0.996, worst 0.979 (n=6) |
-| S3 @256 | 0.54 (coupled L=4) | rotation-snap L=1 | mean 0.987 (n=8) |
-| S3 @1024 | 0.34 (coupled L=4) | rotation-snap L=1 | mean 0.889; exact 1.0 in 2/8 seeds |
+| parity @256 | 0.866 (coupled L=1) | signed-tanh L=1 | 1.000 all 6 seeds |
+| parity @1024 | 0.592 | signed-tanh L=1 | mean 0.994, worst 0.984 (n=6) |
+| S3 @256 | 0.649 (coupled L=4) | rotation-snap L=1 | mean 1.000 (n=8) |
+| S3 @1024 | 0.347 (coupled L=4) | rotation-snap L=1 | mean 0.958; exact 1.0 in 1/8 seeds |
 | reference | GRU L=1: 1.0 everywhere (verified @1024, 3 seeds) | | |
 
 Mechanism verified: winning S3 models contain extractable 2×2
@@ -39,7 +43,9 @@ decay horizon (~ε·T).
 - Environment: torch 2.5.1, CPU (run via `uv run --with torch`).
   All numbers in this directory are from this torch version. README-sourced
   numbers are NOT comparable (S3 coupled L=4 @256: README 0.655 is
-  a lucky seed; current-env 3-seed mean is 0.54).
+  a single-seed report; current-env, `reseed-fix`-round 3-seed mean is
+  0.649 — close to the single-seed number, not a lucky-seed outlier as
+  the pre-fix 3-seed mean of 0.54 had suggested; see `EXPERIMENTS.md`).
 - Harness: `variants.py`. Same seeds/protocol as `probes.py`
   (seed-0 calibration cell reproduces probes.py bit-consistently);
   extra eval lengths 512/1024; results append to
@@ -77,9 +83,13 @@ rotations). L=1 mechanism only — depth breaks STE training.
 **Protocol** — full 1600-step budget + best-checkpoint selection by
 val accuracy at T=128 (2 batches, seed 5; not a test length).
 Required because exact solutions are reachable but NOT stable
-attractors of training: runs wander in and out (Round 6). Failed
-runs are detectable at train time: best val@128 < 1.0 flags them
-(perfectly separated good from bad seeds, n=8).
+attractors of training: runs wander in and out (Round 6). Best val@128
+< 1.0 flags a run as failed and it should be retried; under the
+`reseed-fix` round's clean 8-seed re-run, though, no run was flagged
+this way even though 7/8 were not exact at length — the "perfectly
+separated good from bad seeds" property reported for the pre-fix n=8
+evidence does not replicate under clean seeding (see EXPERIMENTS.md,
+`reseed-fix` round). Treat the flag as necessary, not sufficient.
 
 ## Round-by-round (hypothesis → outcome)
 
@@ -93,8 +103,9 @@ runs are detectable at train time: best val@128 < 1.0 flags them
 | 6 | undertraining (train past early stop) | **Refuted** — training wanders in AND out of exact solutions; one solved seed collapsed to 0.43@64. Instability, not undertraining |
 | 7 | H15 checkpoint selection val@128 | **Confirmed** — recovers exact solution wherever the run contained one (S3 2/3 seeds exact to 16×) |
 | 8 | H16 grid-attraction penalty; sharper selection | **Both refuted** — penalty hurts at both strengths (over-constrains search); sharper val selects same ckpt. Failing seed never contains exact solution |
-| 9 | success-rate quantification (fresh seeds) | S3 n=8: 0.987@256, 0.889@1024, exact 2/8; parity n=6: 0.996@1024. val@128<1.0 flags bad runs |
+| 9 | success-rate quantification (fresh seeds) | S3 n=8: 0.987@256, 0.889@1024, exact 2/8; parity n=6: 0.996@1024. val@128<1.0 flags bad runs. **Superseded** — these seeds were drawn under the train/eval generator-seeding bug fixed in `reseed-fix`; see that round below for the corrected numbers |
 | post | mechanism probes + baseline re-grounding | See below |
+| reseed-fix | train/eval generator-seeding collision fix + re-validation (seed 0 unchanged) | S3 n=8: 1.000@256, 0.958@1024, exact 1/8, no runs flagged by val@128; parity n=6: 0.994@1024, worst 0.984. Full comparison in `EXPERIMENTS.md` |
 
 ## Mechanism verification (the strongest result)
 
@@ -173,7 +184,9 @@ All cheap repairs tested and retired (`repair_probes.py`,
   collapses it). Injections through exact transitions are signal.
 
 **Final shipping story: variant + best-val@128 selection +
-retry-on-flag (best val < 1.0 catches every bad run).**
+retry-on-flag (best val < 1.0 flags a run as failed and it should be
+retried — though the `reseed-fix` round found this does not catch
+every non-exact run under clean seeding; see "Protocol," above).**
 
 ## Open work, prioritized
 

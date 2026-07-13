@@ -42,13 +42,13 @@ below and in `probes.py`) don't match 1:1 — here's the bridge:
 
 **Recommended:** for parity-like problems (state must flip sign based on a
 running property), use `SignedMinGRU` with its default `coupled=False`
-(`minGRU-signed-tanh` below) — it holds 0.996 mean accuracy at 16x the
-training length (n=6, worst seed 0.979), vs. 0.610 for the legacy
+(`minGRU-signed-tanh` below) — it holds 0.994 mean accuracy at 16x the
+training length (n=6, worst seed 0.984), vs. 0.592 for the legacy
 `coupled=True` form. For problems needing non-commutative state tracking
 (composing operations where order matters), use `RotationMinGRU`
 (`mixer="rotation"`, one layer only; `minGRU-rotsnap` below) with the
 `CKPT=1` best-val@128 protocol described in "Rotation variant" — it reaches
-0.889 mean accuracy at 16x length (n=8), though only 2 of 8 seeds land the
+0.958 mean accuracy at 16x length (n=8), though only 1 of 8 seeds lands the
 exact solution, so budget for retries. The base `MinGRU` (log-space,
 `mixer="log"`) stays at chance on both tasks regardless of depth — a
 parameterization limit, not a training one. A standard GRU remains the
@@ -64,17 +64,18 @@ best-val@128 protocol instead of early-stop.
 | task | model | layers | seeds | acc@64 | acc@256 | acc@512 | acc@1024 |
 |---|---|---|---|---|---|---|---|
 | parity | `GRU` | 1 | 3 | 1.000 | 1.000 | 1.000 | 1.000 |
-| parity | `minGRU-signed` (`coupled=True`) | 1 | 3 | 1.000 | 0.894 | 0.719 | 0.610 |
-| parity | **`minGRU-signed-tanh` (default)** | 1 | 6 | 1.000 | ≥0.9999 | 0.999 | 0.996 (worst seed 0.979) |
+| parity | `minGRU-signed` (`coupled=True`) | 1 | 3 | 1.000 | 0.866 | 0.687 | 0.592 |
+| parity | **`minGRU-signed-tanh` (default)** | 1 | 6 | 1.000 | 1.000 | 0.999 | 0.994 (worst seed 0.984) |
 | S3 | `GRU` | 1 | 3 | 1.000 | 1.000 | 1.000 | 1.000 |
-| S3 | `minGRU-signed` (`coupled=True`) | 1 | 3 | 0.414 | 0.339 | 0.275 | 0.223 |
-| S3 | `minGRU-signed` (`coupled=True`) | 4 | 3 | 0.885 | 0.544 | 0.426 | 0.342 |
-| S3 | **`minGRU-rotsnap` (best-val@128 protocol)** | 1 | 8 | 0.999 | 0.987 | 0.956 | 0.889 (exact-to-16x in 2/8 seeds) |
+| S3 | `minGRU-signed` (`coupled=True`) | 1 | 3 | 0.419 | 0.337 | 0.270 | 0.220 |
+| S3 | `minGRU-signed` (`coupled=True`) | 4 | 3 | 0.938 | 0.649 | 0.471 | 0.347 |
+| S3 | **`minGRU-rotsnap` (best-val@128 protocol)** | 1 | 8 | 1.000 | 1.000 | 0.996 | 0.958 (exact-to-16x in 1/8 seeds) |
 
-An earlier, single-seed run of this project reported 0.655 for the
-S3/`coupled=True`/L=4/@256 cell; the 3-seed mean above (0.544) supersedes
-it and is within normal seed variance, not a regression (full comparison
-in `experiments/EXPERIMENTS.md`).
+The S3/`coupled=True`/L=4 cell has high seed-to-seed variance (per-seed
+acc@256 spans ~0.47-0.76 in the current 3-seed run), so treat its mean
+above as indicative rather than tight. Run history for this cell and
+detail on a train/eval generator-seeding fix applied across this table
+(seed 0 unaffected) live in `experiments/EXPERIMENTS.md`.
 
 Base `MinGRU` (log-space) isn't re-tabulated multi-seed above: it cannot
 represent a −1 transition or a non-commuting one at any width, so it
@@ -490,9 +491,8 @@ best-checkpoint selection by validation accuracy at a length *longer*
 than the training length (T=128 when training at T=64 — not one of the
 eventual eval lengths, so it cannot leak into reported metrics),
 evaluated over the full step budget. A best-val@128 score below 1.0
-flags the run as failed; in the recorded evidence (n=8 seeds) this
-perfectly separated good from bad seeds — **retry** a flagged run
-rather than trust it. `probes.py`'s `CKPT=1` env var implements this
+flags the run as failed and should be retried rather than trusted.
+`probes.py`'s `CKPT=1` env var implements the selection half of this
 protocol:
 
 ```
@@ -500,16 +500,27 @@ CKPT=1 python probes.py S3 minGRU-rotsnap
 ```
 
 **Seed success rate.** Across 8 fresh seeds under this protocol, only
-2 of 8 land the exact solution (accuracy 1.0 to the checked precision
-at every length out to 1024); the rest are detectably flagged (best
-val@128 < 1.0) and decay measurably at 4x-16x the training length. The
-mean length-generalization numbers in "What this shows," above (0.987
-@256, 0.956 @512, 0.889 @1024) are the honest average over all 8
-seeds, including the flagged ones — not a best-seed headline. Per the
-mechanism verification in `experiments/SUMMARY.md`, every seed —
-including the flagged ones — contains a D3 representation readable off
-its weights; failed seeds are simply 5-15x less exact, not missing the
-mechanism. Budget for retries when reproducing this variant.
+1 of 8 lands the exact solution (accuracy 1.0 to the checked precision
+at every length out to 1024); the other 7 reach best-val@128 = 1.0 (no
+flag) yet still decay measurably at 4x-16x the training length (worst
+seed 0.859 @1024). The mean length-generalization numbers in "What this
+shows," above (1.000 @256, 0.996 @512, 0.958 @1024) are the honest
+average over all 8 seeds, including the non-exact ones — not a
+best-seed headline. Per the mechanism verification in
+`experiments/SUMMARY.md`, every seed — including the non-exact ones —
+contains a D3 representation readable off its weights; failed seeds
+are simply less exact, not missing the mechanism.
+
+An earlier run of this evidence (before a train/eval generator-seeding
+fix in `experiments/variants.py` — see `experiments/EXPERIMENTS.md`)
+reported 2 of 8 seeds exact, with every non-exact seed also flagged by
+best-val@128 < 1.0 ("perfectly separated good from bad seeds"). That
+flagging property does not replicate under the corrected seeding: all
+8 seeds above reach val@128 = 1.0, including the 7 that are not exact
+at length. Best-val@128 < 1.0 is still worth retrying when it occurs,
+but — per this re-validation — it is not a sufficient pass/fail check
+on its own; confirm length generalization directly rather than relying
+on the flag alone. Budget for retries when reproducing this variant.
 
 **Alternatives tried and dropped.** Three other fixes were tested and
 abandoned: a full orthogonality constraint on the transition matrices,

@@ -396,13 +396,24 @@ are equally deep; leak is elsewhere).
 | S3 coupled L=4 @256 | 0.54 (0.47/0.50/0.66) | 0.655 | **within seed variance** — a lucky seed, not env drift; fair quote is 0.54 |
 | GRU L=1, both tasks, @256-1024 | 1.0 all seeds | only @64/256 | ceiling confirmed at claimed lengths |
 
+**Superseded by the `reseed-fix` round below**: this table's seeds
+1/2 were drawn under the train/eval generator-seeding collision fixed
+in that round (seed 0 is unaffected and unchanged). Read the
+`reseed-fix` section for the current numbers; this table is kept as
+the historical record of what `verify-baselines` observed under the
+pre-fix seeding.
+
 Comparative claims in the synthesis should be read against these
 means; README-sourced numbers are struck from comparisons. Corrected
-headline comparisons (all current-env):
+headline comparisons (current-env, re-validated under the `reseed-fix`
+seeding fix — see that section below; pre-fix values in parens):
 
-- parity @1024: coupled 0.61 -> signed-tanh 0.996 (n=6); GRU 1.0.
-- S3 @256: coupled L=4 0.54 -> rotation-snap 0.987 (n=8); GRU 1.0.
-- S3 @1024: coupled L=4 0.34 -> rotation-snap 0.889 (n=8); GRU 1.0.
+- parity @1024: coupled 0.592 (was 0.610) -> signed-tanh 0.994, n=6
+  (was 0.996); GRU 1.0.
+- S3 @256: coupled L=4 0.649 (was 0.544) -> rotation-snap 1.000, n=8
+  (was 0.987); GRU 1.0.
+- S3 @1024: coupled L=4 0.347 (was 0.342) -> rotation-snap 0.958, n=8
+  (was 0.889); GRU 1.0.
 
 Not run (scoped out, review rec 1): Grazzi-parameterized incumbent,
 DeltaNet. Signed-tanh should be presented as the Grazzi negative-
@@ -447,3 +458,91 @@ prediction via eps*T), not a selector. Retired.
 **Closed shipping story**: rotation-snap + best-val@128 selection +
 retry-on-flag (best val < 1.0 flags every bad run). No repair
 machinery earned a place.
+
+## Round: RNG hygiene fix + re-validation (`reseed-fix`)
+
+**Bug found:** `variants.py`'s `run_cell` seeded its training-data
+generator `torch.Generator().manual_seed(1 + seed)`, while eval calls
+inside the same cell use fixed literal seeds — 2 (early-stop check),
+3 (in-distribution accuracy), 4 (generalization accuracy), 5 (val@128
+checkpoint selection). For seed >= 1 this put the training generator's
+seed on top of one of those eval seeds: seed=1's train generator (2)
+collides with the early-stop probe, seed=2's (3) with the
+in-distribution accuracy probe, seed=3's (4) with the generalization
+probe, seed=4's (5) with the val@128 probe. Train and eval draw
+different-shaped batches from the shared seed, so the two streams
+overlap only at the very start of training before diverging — a
+partial, seed-dependent train/eval contamination, not a full leak, but
+a real one. `probes.py`'s `run_one` had the identical flaw and was
+fixed first, to `manual_seed(1 + 10_000 * seed)` (see its docstring
+for the derivation); the same fix is applied here. `seed=0` maps to
+`manual_seed(1)` under both the old and new formula, so every seed-0
+row is bit-exact across the fix.
+
+**Cells re-run** (`EXP_ROUND=reseed-fix`, same protocol/budgets as the
+rows they replace; appended to `lab_results.jsonl`), with the seed-0
+exact-reproduction check:
+
+| cell | seeds | seed-0 exact match to its pre-fix row? |
+|---|---|---|
+| parity GRU L=1 | 0,1,2 | yes |
+| parity signed-coupled L=1 | 0,1,2 | yes |
+| parity signed-tanh L=1 | 0-5 | yes |
+| S3 GRU L=1 | 0,1,2 | yes |
+| S3 signed-coupled L=1 | 0,1,2 | yes |
+| S3 signed-coupled L=4 | 0,1,2 | yes |
+| S3 rotation-snap L=1 (`EXP_CKPT=1`) | 0-7 | yes |
+
+**Before -> after (README table cells; means over the seed counts
+recorded in the table):**
+
+| task/model/L (n) | before @64/@256/@512/@1024 | after @64/@256/@512/@1024 |
+|---|---|---|
+| parity GRU/1 (3) | 1.000/1.000/1.000/1.000 | 1.000/1.000/1.000/1.000 |
+| parity signed-coupled/1 (3) | 1.000/0.894/0.719/0.610 | 1.000/0.866/0.687/0.592 |
+| parity signed-tanh/1 (6) | 1.000/≥0.9999/0.999/0.996 (worst 0.979) | 1.000/1.000/0.999/0.994 (worst 0.984) |
+| S3 GRU/1 (3) | 1.000/1.000/1.000/1.000 | 1.000/1.000/1.000/1.000 |
+| S3 signed-coupled/1 (3) | 0.414/0.339/0.275/0.223 | 0.419/0.337/0.270/0.220 |
+| S3 signed-coupled/4 (3) | 0.885/0.544/0.426/0.342 | 0.938/0.649/0.471/0.347 |
+| S3 rotation-snap/1 (8) | 0.999/0.987/0.956/0.889 (exact 2/8) | 1.000/1.000/0.996/0.958 (exact 1/8) |
+
+Every non-GRU row moved beyond its displayed 3-decimal rounding.
+
+**Full history of the S3 signed-coupled L=4 @256 cell** (the largest
+shift in the table, and the one README now only summarizes as a
+high-variance caveat): a single-seed run early in this project
+reported 0.655 for this cell. A later 3-seed mean of 0.544 was
+reported in README as the fairer, multi-seed number, read at the time
+as "0.655 was a lucky seed, not env drift." That 3-seed mean's seeds 1
+and 2 were drawn under the train/eval generator-seeding bug fixed in
+this round: seed 1's training generator (old formula `1 + seed` = 2)
+collided with the early-stop eval seed (also 2), and seed 2's (3)
+collided with the in-distribution-accuracy eval seed (also 3) — see
+"Bug found," above. Re-run under the fix, seed-1/seed-2 @256 rose from
+0.503/0.659 to 0.711/0.765 (seed 0, uncontaminated either way, stayed
+at 0.471, an exact match to its pre-fix row). The corrected 3-seed
+mean is 0.649 — close to the original single-seed report of 0.655,
+not well below it as the pre-fix mean had suggested. Both the size and
+direction of this shift are consistent with the seeding fix removing
+train/eval overlap that had been suppressing this cell's
+higher-variance seeds, not with a regression or an error in either
+prior number; the cell remains genuinely high-variance seed-to-seed
+(current per-seed acc@256 spans 0.471-0.765), which is why README
+flags it as indicative rather than tight.
+
+rotation-snap's exact-seed count dropped from 2/8 to 1/8, but — more
+importantly — none of its 8 clean seeds were flagged by best-val@128
+< 1.0, including the 7 that are not exact at length; pre-fix, every
+non-exact seed had been flagged. The "best-val@128 perfectly separates
+good from bad seeds" claim does not replicate under clean seeding and
+has been corrected in README's "Rotation variant" section: the flag is
+still worth retrying when it fires, but is not a sufficient pass/fail
+check on its own.
+
+README.md, this file's "Corrected headline comparisons" (above), and
+SUMMARY.md's TL;DR table and Setup note have been updated to these
+`after` values. The historical "Baselines re-grounded" table above and
+the round-by-round hypothesis/outcome log earlier in this file are
+left as the record of what rounds 1-9 and `verify-baselines` actually
+observed under the pre-fix seeding — read them as history, not as
+current claims.

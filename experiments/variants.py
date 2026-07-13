@@ -349,7 +349,15 @@ def run_cell(task, variant, n_layers=1, seed=0, max_steps=None, return_model=Fal
         max_steps = MAX_STEPS
     make, vocab, n_cls = TASKS[task]
     torch.manual_seed(seed)
-    gen = torch.Generator().manual_seed(1 + seed)
+    # seed=0 reproduces the legacy manual_seed(1) exactly (1 + 10_000 * 0 ==
+    # 1); other seeds vary init and data order. The 10_000 multiplier keeps
+    # seed>=1's train generator (10001, 20001, ...) far from the small fixed
+    # eval seeds (2/3/4/5) used below -- plain `1 + seed` put seed=1's train
+    # gen at 2 (colliding with the early-stop eval seed) and seed=2's at 3
+    # (colliding with the acc_in eval seed), silently overlapping train and
+    # eval examples at T_TRAIN for those seeds. Eval seeds themselves are
+    # untouched. Mirrors probes.py's run_one fix for the identical flaw.
+    gen = torch.Generator().manual_seed(1 + 10_000 * seed)
     if variant == "gru":
         model = GRUTagger(vocab, n_cls, n_layers)
     else:
