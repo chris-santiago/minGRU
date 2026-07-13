@@ -279,13 +279,21 @@ def _is_latin_square(table):
 
 
 def _has_additive_violation(table):
-    """True iff some cell breaks ``table[i][j] == (table[i][0] +
-    table[0][j] - table[0][0]) % 6`` -- the additive form a single
-    rotation layer could represent exactly via angle addition. At least
-    one violation is required for S3-hier to be diagnostic of leg B
-    (spec section 6): an additive pair function would make the
-    hierarchical pair-composition task solvable by one rotation layer,
-    defeating the point of testing whether depth buys hierarchy."""
+    """Fast, NECESSARY-BUT-INSUFFICIENT sanity check -- not the real
+    non-representability guarantee. True iff some cell breaks
+    ``table[i][j] == (table[i][0] + table[0][j] - table[0][0]) % 6``,
+    the narrow "literal-index" additive form. Passing this check (a
+    violation exists) only rules out that one specific form; it does
+    NOT rule out ``LATIN`` being isotopic to a group under some
+    row/column/symbol relabeling -- exactly the loophole that let
+    ``LATIN = COMPOSE`` (isotopic to S3, but additive-violating by this
+    check) leak into a rotation layer's representable functions in an
+    earlier revision (see the module comment above ``LATIN``). The real
+    invariant is non-isotopy to both order-6 groups, checked by the slow
+    ``_latin_is_group_isotopic`` / ``_verify_latin_non_isotopic``
+    (opt-in via ``VERIFY_LATIN=1``, below) -- this function is retained
+    only as a cheap, always-on early warning, not a substitute for that
+    check."""
     base = table[0][0].item()
     return any(
         table[i][j].item() != (table[i][0].item() + table[0][j].item() - base) % 6
@@ -304,6 +312,91 @@ assert _has_additive_violation(LATIN), (
     "layer could solve the pair function by angle addition and S3-hier "
     "would not be diagnostic of leg B"
 )
+
+
+def _latin_is_group_isotopic(latin, group_table):
+    """Exhaustive isotopy search: True iff there exists a row permutation
+    ``f``, column permutation ``g``, and symbol permutation ``h`` with
+    ``latin[f(i)][g(j)] == h(group_table[i][j])`` for every ``i, j`` --
+    i.e. ``latin`` is isotopic to ``group_table``. ``h`` is built
+    incrementally and checked for consistency (early-exits per
+    ``(f, g)`` candidate on the first inconsistency), so unrelated
+    tables typically fail fast; only genuinely isotopic pairs pay
+    the full O(n^2) inner check. Order n! * n! * n^2 overall -- see
+    ``_verify_latin_non_isotopic`` for the opt-in, order-6-sized call
+    site; not intended to be called at import time or on every run.
+    """
+    import itertools
+
+    n = latin.shape[0]
+    latin_rows = latin.tolist()
+    group_rows = group_table.tolist()
+    for f in itertools.permutations(range(n)):
+        permuted = [latin_rows[f[i]] for i in range(n)]
+        for g in itertools.permutations(range(n)):
+            symbol_map = {}
+            consistent = True
+            for i in range(n):
+                for j in range(n):
+                    latin_val = permuted[i][g[j]]
+                    group_val = group_rows[i][j]
+                    mapped = symbol_map.get(group_val)
+                    if mapped is None:
+                        symbol_map[group_val] = latin_val
+                    elif mapped != latin_val:
+                        consistent = False
+                        break
+                if not consistent:
+                    break
+            if consistent:
+                return True
+    return False
+
+
+def _verify_latin_non_isotopic():
+    """The real non-representability guarantee behind S3-hier's
+    diagnostic power (spec section 6; see the module comment above
+    ``LATIN``): asserts ``LATIN`` is isotopic to NEITHER order-6 group
+    (Z6, the cyclic group; and S3, ``COMPOSE`` -- the only two groups of
+    order 6 up to isomorphism). ``_has_additive_violation`` above is
+    only a fast, necessary-but-insufficient proxy for this; this
+    function is the actual invariant, ported from the offline
+    ``generate_latin.py`` scratch script that originally produced
+    ``LATIN`` so the guarantee is re-verifiable from the repo itself,
+    not only from a script that never shipped.
+
+    Deliberately slow (~seconds; two O(6!^2) exhaustive isotopy
+    searches) and NOT run at import time -- opt in with
+    ``VERIFY_LATIN=1`` (see the bottom of this function's call site,
+    module level, below). Fails loudly (assertion error naming which
+    group) if ``LATIN`` is ever isotopic to either group -- e.g. if
+    someone edits the constant without re-running this check.
+    """
+    z6 = torch.tensor([[(i + j) % 6 for j in range(6)] for i in range(6)])
+    assert not _latin_is_group_isotopic(LATIN, z6), (
+        "LATIN must not be isotopic to Z6 (the cyclic group of order 6): "
+        "a rotation layer's learned per-token angle assignment could "
+        "represent this pair function via row/column/symbol relabeling, "
+        "the same leak that made the original LATIN = COMPOSE diagnostic "
+        "insufficient (see the module comment above LATIN)"
+    )
+    assert not _latin_is_group_isotopic(LATIN, COMPOSE), (
+        "LATIN must not be isotopic to S3 (COMPOSE, the other group of "
+        "order 6): a rotation layer's learned per-token angle assignment "
+        "could represent this pair function via row/column/symbol "
+        "relabeling, the same leak that made the original "
+        "LATIN = COMPOSE diagnostic insufficient (see the module comment "
+        "above LATIN)"
+    )
+
+
+# Opt-in, slow (~seconds) re-verification of the real LATIN invariant
+# (non-isotopy to both order-6 groups) -- off by default so import stays
+# fast, matching this module's other opt-in env flags (MAX_STEPS, CKPT):
+#     VERIFY_LATIN=1 python probes.py S3-hier minGRU-hetero-sr
+if os.environ.get("VERIFY_LATIN", "") not in ("", "0"):
+    _verify_latin_non_isotopic()
+    print("VERIFY_LATIN=1: LATIN confirmed non-isotopic to Z6 and to S3/COMPOSE", flush=True)
 
 
 def make_s3_hier(batch, T, gen):
