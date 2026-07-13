@@ -835,9 +835,12 @@ class MinGRUBlock(nn.Module):
             self.mlp = None
 
     def forward(
-        self, x: torch.Tensor, h_0: torch.Tensor | None = None, return_state: bool = False
-    ):
+        self, x: torch.Tensor, h_0: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Parallel forward over a full sequence.
+
+        Always returns ``(output, state)``, matching ``step()`` and the
+        ``nn.GRU`` convention; discard the state when not carrying it.
 
         Parameters
         ----------
@@ -846,23 +849,18 @@ class MinGRUBlock(nn.Module):
         h_0 : torch.Tensor, optional
             This block's real minGRU state carried from a previous
             chunk, shape ``(B, 1, d_model)``; see ``MinGRU.forward``.
-        return_state : bool, default=False
-            If True, also return the block's final minGRU state for
-            the next chunk.
 
         Returns
         -------
-        torch.Tensor or tuple of torch.Tensor
-            Output ``(B, T, d_model)``; if ``return_state``, a tuple of
-            the output and the final minGRU state ``(B, 1, d_model)``.
+        tuple of torch.Tensor
+            The output ``(B, T, d_model)`` and the block's final minGRU
+            state ``(B, 1, d_model)`` for the next chunk.
         """
         h_seq = self.mingru(self.norm1(x), h_0)
         x = x + self.drop(h_seq)
         if self.mlp is not None:
             x = x + self.mlp(self.norm2(x))
-        if return_state:
-            return x, h_seq[:, -1:]
-        return x
+        return x, h_seq[:, -1:]
 
     @torch.no_grad()
     def step(
@@ -952,9 +950,11 @@ class MinGRUStack(nn.Module):
         self,
         x: torch.Tensor,
         state: list[torch.Tensor | None] | None = None,
-        return_state: bool = False,
-    ):
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Parallel training-mode forward.
+
+        Always returns ``(output, state)``, matching ``step()`` and the
+        ``nn.GRU`` convention; discard the state when not carrying it.
 
         Parameters
         ----------
@@ -962,34 +962,25 @@ class MinGRUStack(nn.Module):
             Input sequence, shape ``(B, T, input_size)``.
         state : list of (torch.Tensor or None), optional
             Per-block minGRU states from a previous chunk — as returned
-            with ``return_state=True``, or from streaming ``step()``
-            after unsqueezing each entry to ``(B, 1, d_model)``. For
-            TBPTT, detach the returned state before feeding it to the
-            next chunk.
-        return_state : bool, default=False
-            If True, also return the per-block final states.
+            by a prior ``forward()``, or from streaming ``step()`` after
+            unsqueezing each entry to ``(B, 1, d_model)``. For TBPTT,
+            detach the returned state before feeding it to the next
+            chunk.
 
         Returns
         -------
-        torch.Tensor or tuple
-            Output ``(B, T, d_model)``; if ``return_state``, a tuple of
-            the output and a list of ``n_layers`` states, each
-            ``(B, 1, d_model)``.
+        tuple
+            The output ``(B, T, d_model)`` and a list of ``n_layers``
+            per-block final states, each ``(B, 1, d_model)``.
         """
         if state is None:
             state = self.init_state()
         x = self.in_proj(x)
         new_state = []
         for block, h_0 in zip(self.blocks, state):
-            if return_state:
-                x, h_last = block(x, h_0, return_state=True)
-                new_state.append(h_last)
-            else:
-                x = block(x, h_0)
-        out = self.norm_out(x)
-        if return_state:
-            return out, new_state
-        return out
+            x, h_last = block(x, h_0)
+            new_state.append(h_last)
+        return self.norm_out(x), new_state
 
     def init_state(self) -> list[None]:
         """Fresh streaming state.
@@ -1062,7 +1053,7 @@ if __name__ == "__main__":
     # --- Stack: parallel vs streaming equivalence ---
     stack = MinGRUStack(D_in, d_model=D_h, n_layers=3).eval()
     with torch.no_grad():
-        y_par = stack(x)
+        y_par, _ = stack(x)
 
     state = stack.init_state()
     ys = []
@@ -1086,14 +1077,14 @@ if __name__ == "__main__":
     assert err < 1e-4, "chunked forward with carried h_0 must match full forward"
 
     with torch.no_grad():
-        y_a, carry = stack(x[:, : T // 2], return_state=True)
-        y_b = stack(x[:, T // 2 :], state=carry)
+        y_a, carry = stack(x[:, : T // 2])
+        y_b, _ = stack(x[:, T // 2 :], state=carry)
         y_chunked = torch.cat([y_a, y_b], dim=1)
     err = (y_par - y_chunked).abs().max().item()
     print(f"stack chunked vs full max abs diff: {err:.3e}")
     assert err < 1e-4
 
-    loss = MinGRUStack(D_in, D_h, 3)(x).sum()
+    loss = MinGRUStack(D_in, D_h, 3)(x)[0].sum()
     loss.backward()
     print("stack gradcheck ok; param count:", sum(p.numel() for p in stack.parameters()))
 
@@ -1192,7 +1183,7 @@ if __name__ == "__main__":
 
     sstack = MinGRUStack(D_in, D_h, 3, mixer="signed").eval()
     with torch.no_grad():
-        y_par = sstack(x)
+        y_par, _ = sstack(x)
         state = sstack.init_state()
         ys = []
         for t in range(T):
@@ -1202,7 +1193,7 @@ if __name__ == "__main__":
     print(f"signed stack parallel vs streaming max abs diff: {err:.3e}")
     assert err < 1e-4
 
-    loss = MinGRUStack(D_in, D_h, 3, mixer="signed")(x).sum()
+    loss = MinGRUStack(D_in, D_h, 3, mixer="signed")(x)[0].sum()
     loss.backward()
     print("signed stack gradcheck ok")
 
@@ -1282,7 +1273,7 @@ if __name__ == "__main__":
     torch.manual_seed(0)
     rstack = MinGRUStack(D_in, D_h, 3, mixer="rotation").eval()
     with torch.no_grad():
-        y_par_r = rstack(x)
+        y_par_r, _ = rstack(x)
         state = rstack.init_state()
         ys = []
         for t in range(T):
@@ -1294,14 +1285,14 @@ if __name__ == "__main__":
 
     # --- MinGRUStack: mixer="rotation" chunked vs full (state carry) ---
     with torch.no_grad():
-        y_a_r, carry_r = rstack(x[:, : T // 2], return_state=True)
-        y_b_r = rstack(x[:, T // 2 :], state=carry_r)
+        y_a_r, carry_r = rstack(x[:, : T // 2])
+        y_b_r, _ = rstack(x[:, T // 2 :], state=carry_r)
         y_chunked_r = torch.cat([y_a_r, y_b_r], dim=1)
     err = (y_par_r - y_chunked_r).abs().max().item()
     print(f"rotation stack chunked vs full max abs diff: {err:.3e}")
     assert err < 1e-4
 
-    loss = MinGRUStack(D_in, D_h, 3, mixer="rotation")(x).sum()
+    loss = MinGRUStack(D_in, D_h, 3, mixer="rotation")(x)[0].sum()
     loss.backward()
     print("rotation stack gradcheck ok")
 
@@ -1323,7 +1314,7 @@ if __name__ == "__main__":
     # isolation but not coupled=True reached via the stack's mixer selector.)
     cstack = MinGRUStack(D_in, D_h, 3, mixer="signed", mixer_kwargs={"coupled": True})
     assert all(block.mingru.coupled for block in cstack.blocks)
-    loss = cstack(x).sum()
+    loss = cstack(x)[0].sum()
     loss.backward()
     for i, block in enumerate(cstack.blocks):
         grad = block.mingru.linear_s.weight.grad

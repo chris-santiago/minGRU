@@ -112,7 +112,7 @@ class MinGRUTagger(nn.Module):
         self.head = nn.Linear(D_MODEL, n_cls)
 
     def forward(self, x):
-        return self.head(self.stack(self.emb(x)))
+        return self.head(self.stack(self.emb(x))[0])
 
 
 def build(name, vocab, n_cls, n_layers=1):

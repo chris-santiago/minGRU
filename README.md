@@ -137,7 +137,7 @@ Training (parallel over T), default log-space mixer:
 
 ```python
 stack = MinGRUStack(input_size=32, d_model=256, n_layers=4)   # mixer="log" (default)
-y = stack(x)                          # (B, T, 32) -> (B, T, 256)
+y, state = stack(x)                   # (B, T, 32) -> (B, T, 256), per-block states
 ```
 
 Selecting a different mixer via `mixer=`/`mixer_kwargs`:
@@ -169,7 +169,7 @@ Chunked / TBPTT training:
 ```python
 carry = None
 for chunk in sequence_chunks:         # each (B, T_chunk, input_size)
-    y, carry = stack(chunk, state=carry, return_state=True)
+    y, carry = stack(chunk, state=carry)
     loss(y).backward()
     carry = [h.detach() for h in carry]
 ```
