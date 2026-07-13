@@ -78,9 +78,10 @@ from min_gru import MinGRUStack
 # (gamma(0-ish lambda) ~ 1) and must be pulled toward heavier decay by
 # gradient pressure where the session-boundary signal actually rewards
 # it, rather than starting at lambda=1.0 and needing to unlearn heavy
-# decay against weak gradient pressure at T_TRAIN=64 (the failure mode
-# observed in the first evidence pass -- see task-3-report.md's
-# lambda-init comparison).
+# decay against weak gradient pressure at T_TRAIN=64 (with a 1.0 init,
+# lambda barely moved and the decay row tied its feature-only baseline;
+# with the 0.05 init it wins consistently -- the README's channel-
+# ablation section records the numbers).
 MIXER_REGISTRY = {
     "minGRU": ("log", {}),
     "minGRU-signed": ("signed", {"coupled": True}),

@@ -543,7 +543,9 @@ from decay" special case (see migration deviations, below); callers
 who want no decay at the start of a sequence pass `delta_t[:, 0] = 0`
 themselves. Negative entries are clamped to `0` with a
 once-per-module-instance warning (a data-quality event, not a hard
-error). `log1p_delta=True` applies `log1p` before scaling by `lambda`
+error; the check runs on CPU tensors only — on CUDA it is skipped
+rather than forcing a host sync, though the clamp always applies).
+`log1p_delta=True` applies `log1p` before scaling by `lambda`
 — useful when raw gaps span orders of magnitude, compressing the
 range `lambda` needs to operate over. Passing `delta_t` with decay
 disabled, or enabling decay without passing `delta_t`, both raise
