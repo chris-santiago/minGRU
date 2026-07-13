@@ -550,13 +550,30 @@ training dynamic already documented for plain `minGRU-rotsnap`,
 extending into the hetero stack's harder joint extract-and-compose
 optimization problem.
 
+Why the results split this way: composition destroys information for
+any layer above it, so the order is forced — a rotation layer fed raw
+sub-tokens composes a mixture nothing downstream can take apart,
+which is why rotation→signed wins on plain `S3` (where tokens *are*
+the operations) and sits at chance here. And the working order is
+hard to train because the two layers need each other: the feature
+layer's learning signal passes through the composer's snapped,
+straight-through rotations, so until the extractor emits clean
+generators the composer has nothing exact to lock onto, and until the
+composer is meaningful the extractor gets noisy credit. Only some
+initializations escape that loop, and the escape is visible when it
+happens: best-val@128 hits 1.0 on the run that lands the exact
+automaton and flags the ones that don't. Treat it like rotation
+training generally — run seeds, keep flagged-clean runs, budget for
+retries.
+
 L=1 rotation alone, rotation×2, rotation→signed, and an unconstrained
 `GRU` all sit at or near chance on `S3-hier`: no single capability
 (depth alone, or a rotation mechanism alone) is enough, extracting the
 pair and composing it non-commutatively both have to happen. Read
 together: homogeneous depth trains reliably and fits fast but decays
-with length, and the heterogeneous rotation stack is a seed lottery,
-unreliable in-budget and rare-but-exact at 4x budget when it lands.
+with length, and the heterogeneous rotation stack trains unreliably
+in-budget: rare-but-exact at 4x budget when a run lands, with
+best-val@128 separating the runs that land from the ones to retry.
 Neither configuration "wins" outright and neither claim is
 budget-independent: every number above is relative to the stated step
 budget, not a claim that any configuration solves `S3-hier`.
