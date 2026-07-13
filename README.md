@@ -690,6 +690,41 @@ hyperparameter, not a knob training reliably anneals to zero on its
 own when a task doesn't need decay — pick it with the task's actual
 gap distribution in mind.
 
+A finer init sweep (same protocol and seeds, 3 per cell; the `0.05`
+rows are the tables above) makes the tradeoff explicit:
+
+| `decay_rate` init | session-parity acc@256 | steps to early-stop (avg) | recovery acc@256 |
+|---|---|---|---|
+| 0.005 | 0.9968 | 633 | 0.9967 |
+| 0.01 | 0.9949 | 533 | 0.9856 |
+| 0.02 | 0.9965 | 467 | 0.8954 |
+| 0.05 | 0.9979 | 233 | 0.7855 |
+| *reference* | *feature-only: 0.9929* | *600* | *non-decay: 1.0000* |
+
+Three things move monotonically and in lockstep with the per-boundary
+`gamma = exp(-R * ~4.3)` (0.98 at `R=0.005` down to 0.81 at
+`R=0.05`). The recovery gap closes as the init drops — essentially
+gone (0.33pp) at `0.005`. The session-parity advantage thins in the
+other direction: every init beats the feature-only baseline *at the
+mean*, but only `0.05` gives the seed-consistent, non-overlapping win,
+and convergence slows from 233 steps to 633 (slower than the
+baseline's 600) at the smallest init. No single init gets both ends.
+
+The sweep also sharpens *why* training won't fix this for you: the
+learned rate moves **up but never down**. On session-parity, `lambda`
+climbs above its init at every `R` (e.g. 0.0050 → 0.0057, 0.0500 →
+0.0530) — when decay helps fit the training sequences, the gradient
+signal exists and training uses it. On the recovery task it sits
+exactly at init at every `R`: over-decay's cost only materializes at
+lengths beyond `T_train`, so the training objective contains no
+signal against it. The init is a prior that training refines in one
+direction only. Since the trend is smooth and monotone, the reliable
+way to set `decay_rate` is validation at your *target* sequence
+length (the same longer-length selection lesson as the checkpoint
+protocol above): around `0.05` when gaps are known-informative,
+`0.005–0.01` as the conservative default when unsure, and
+`decay=None` when they're known-irrelevant.
+
 ## Reproducing
 
 `probes.py` tests the ladder empirically on the two word problems
