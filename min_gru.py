@@ -147,8 +147,8 @@ _DELTA_T_POSINF_CAP = 1e10
 
 # Constructor kwarg names that configure a mixer's decay behavior (see
 # _init_decay). MinGRUStack's decay_layers="last" strips exactly these
-# keys from mixer_kwargs for every block but the final one, reproducing
-# the reference TimeAwareGRU's last-layer-only decay default.
+# keys from mixer_kwargs for every block but the final one, giving
+# last-layer-only decay.
 _DECAY_MIXER_KWARGS = ("decay", "decay_rate", "log1p_delta")
 
 
@@ -1575,8 +1575,7 @@ class MinGRUStack(nn.Module):
         ``mixer_kwargs``. ``"all"`` (default, uniform decay) applies
         them to every block unchanged. ``"last"`` strips those three
         keys from ``mixer_kwargs`` for every block except the final
-        one, so only the last block decays — reproducing the
-        reference ``TimeAwareGRU``'s last-layer-only default. Any
+        one, so only the last block decays. Any
         other value raises ``ValueError`` at construction. If
         ``mixer_kwargs`` carries no decay keys, ``"last"`` is a
         harmless no-op (nothing to strip).

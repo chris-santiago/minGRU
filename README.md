@@ -539,7 +539,7 @@ Because `lambda >= 0` and `delta_t >= 0`, `gamma` is always in `(0,
 `delta_t[:, t]` is the gap *preceding* event `t`. `delta_t = 0` gives
 `gamma = 1` exactly — no discount — and this holds at every position,
 **including `t = 0`**: there is no implicit "first event is exempt
-from decay" special case (see migration deviations, below); callers
+from decay" special case (see design notes, below); callers
 who want no decay at the start of a sequence pass `delta_t[:, 0] = 0`
 themselves. Negative entries are clamped to `0` with a
 once-per-module-instance warning (a data-quality event, not a hard
@@ -564,32 +564,33 @@ disabled, or enabling decay without passing `delta_t`, both raise
 **`decay_layers`** (stack-level, `MinGRUStack(..., decay_layers=...)`):
 `"all"` (default) applies the decay keys in `mixer_kwargs` to every
 block uniformly; `"last"` strips them from every block but the final
-one, reproducing the reference `TimeAwareGRU`'s last-layer-only
-default. Any other string raises `ValueError` at construction.
+one, for last-layer-only decay (a common convention in stacked
+recurrent encoders). Any other string raises `ValueError` at
+construction.
 `delta_t` passed to a stack's `forward`/`step` is routed only to
 blocks whose mixer has decay enabled; if no block in the stack decays,
 passing `delta_t` raises `ValueError`.
 
-**Migration deviations from the reference `TimeAwareGRU` pattern**
-this was adapted from:
+**Design notes** — three choices worth knowing about, since other
+time-decayed RNNs commonly make them differently:
 
-1. **`softplus` on the rate parameter itself, not a `relu` projection
-   of `delta_t`.** The reference computes the rate as
-   `relu(decay_proj(delta_t))`. `softplus(decay_proj(0))` would be
-   strictly positive, decaying even at zero gap and violating the
-   `delta_t = 0 => gamma = 1` contract; `relu` has the module's own
-   documented dead-gradient problem (see `log_g` in "Implementation
-   notes"). Resolution: `softplus` on a plain learnable rate
-   (`lambda = softplus(rho)`), not on any function of `delta_t`.
-2. **No `t = 0` exemption.** The reference exempts the first event
-   from decay as a special case; this module doesn't need to — the
-   `delta_t[:, 0] = 0` convention already gives `gamma = 1` there for
-   a true sequence start, and *not* special-casing position 0 is what
-   keeps chunked-vs-full equivalence exact (an absolute-position
+1. **`softplus` on the rate parameter itself, not a learned projection
+   of `delta_t`.** A common alternative computes the rate as
+   `relu(proj(delta_t))`. Both halves of that form were rejected:
+   `relu` has the module's own documented dead-gradient problem (see
+   `log_g` in "Implementation notes"), and swapping in `softplus` over
+   a projection would make `softplus(proj(0))` strictly positive —
+   decaying even at zero gap and violating the `delta_t = 0 =>
+   gamma = 1` contract. Resolution: `softplus` on a plain learnable
+   rate (`lambda = softplus(rho)`), not on any function of `delta_t`.
+2. **No `t = 0` exemption.** Some implementations exempt the first
+   event from decay as a special case; this module doesn't need to —
+   the `delta_t[:, 0] = 0` convention already gives `gamma = 1` there
+   for a true sequence start, and *not* special-casing position 0 is
+   what keeps chunked-vs-full equivalence exact (an absolute-position
    exemption would have to know which chunk is the first one).
 3. **`decay_layers` defaults to `"all"`,** decaying every block
-   uniformly, rather than the reference's last-layer-only default;
-   `"last"` reproduces that reference default when wanted.
+   uniformly; `"last"` gives last-layer-only decay when wanted.
 
 ```python
 from min_gru import MinGRUStack
