@@ -1,14 +1,90 @@
 # minGRU
 
 PyTorch implementation of the minGRU from Feng, Tung, Ahmed, Bengio &
-Hajimirsadeghi, *Were RNNs All We Needed?* (arXiv:2410.01201), with a
-parallel-scan training path, an O(1)-memory streaming path, chunked/TBPTT
-state carry, and stacked residual blocks. The module ships three sequence
-mixers — log-space (`MinGRU`), signed diagonal (`SignedMinGRU`), and
-non-diagonal 2x2 rotation (`RotationMinGRU`) — selected through a common
-`mixer=` interface on `MinGRUBlock`/`MinGRUStack`.
+Hajimirsadeghi, *Were RNNs All We Needed?* (arXiv:2410.01201) — a recurrent
+layer whose gates depend only on the current input, so the whole sequence
+trains in one parallel scan instead of step-by-step backpropagation through
+time (BPTT). Single file, no dependencies beyond `torch`.
 
-Single file, no dependencies beyond `torch`.
+This repo ships the base minGRU plus two variants that each fix a specific
+gap in it: **`SignedMinGRU`** (state can flip sign, not just decay toward
+zero) and **`RotationMinGRU`** (state can track operations that don't
+commute, like composing permutations). All three share one `mixer=`
+interface on `MinGRUBlock`/`MinGRUStack`. What each variant actually buys
+you, in measured accuracy, is below.
+
+## What this shows
+
+Two word-problem tasks probe exactly the gaps above (full task/eval setup
+in "Reproducing," below):
+
+- **parity** — label each prefix of a bit string with its running XOR
+  (chance 0.5). The natural solution is a state that flips sign on a 1 and
+  holds on a 0: a transition coefficient of −1.
+- **S3** — label each prefix of a sequence of permutations of 3 objects
+  (picture cups being swapped and rotated) with their net composition so
+  far (chance ≈ 0.17). Composition order matters, so this needs a
+  transition that doesn't commute.
+
+Class names (used in the code) and probe/results names (used in the table
+below and in `probes.py`) don't match 1:1 — here's the bridge:
+
+| module class (`mixer=`) | name in probes / results table | notes |
+|---|---|---|
+| `MinGRU` (`mixer="log"`, default) | `minGRU` | log-space, positive states; chance-level on both tasks at any depth |
+| `SignedMinGRU`, `coupled=False` (default) | `minGRU-signed-tanh` | decoupled eigenvalue; recommended for parity-like tasks |
+| `SignedMinGRU`, `coupled=True` (legacy) | `minGRU-signed` | pinned to `coupled=True` in `probes.py`; kept under its historical name |
+| `RotationMinGRU` (`mixer="rotation"`) | `minGRU-rotsnap` | L=1 only; needs the `CKPT=1` best-val@128 protocol below |
+| `torch.nn.GRU` (reference baseline) | `GRU` | state-dependent gating; the ceiling both tasks are measured against |
+
+**Recommended:** for parity-like problems (state must flip sign based on a
+running property), use `SignedMinGRU` with its default `coupled=False`
+(`minGRU-signed-tanh` below) — it holds 0.996 mean accuracy at 16x the
+training length (n=6, worst seed 0.979), vs. 0.610 for the legacy
+`coupled=True` form. For problems needing non-commutative state tracking
+(composing operations where order matters), use `RotationMinGRU`
+(`mixer="rotation"`, one layer only; `minGRU-rotsnap` below) with the
+`CKPT=1` best-val@128 protocol described in "Rotation variant" — it reaches
+0.889 mean accuracy at 16x length (n=8), though only 2 of 8 seeds land the
+exact solution, so budget for retries. The base `MinGRU` (log-space,
+`mixer="log"`) stays at chance on both tasks regardless of depth — a
+parameterization limit, not a training one. A standard GRU remains the
+ceiling: state-dependent gating solves both tasks exactly at every tested
+length with a single layer.
+
+Numbers below are multi-seed means (torch 2.5.1, CPU; seed counts stated
+per row). Protocol: seq2seq tagging (dense supervision), T_train=64,
+d_model=64, batch 128, Adam lr 3e-3, budget ≤1600 steps, early-stop at
+99.9% train-length accuracy — **except** `minGRU-rotsnap`, which uses the
+best-val@128 protocol instead of early-stop.
+
+| task | model | layers | seeds | acc@64 | acc@256 | acc@512 | acc@1024 |
+|---|---|---|---|---|---|---|---|
+| parity | `GRU` | 1 | 3 | 1.000 | 1.000 | 1.000 | 1.000 |
+| parity | `minGRU-signed` (`coupled=True`) | 1 | 3 | 1.000 | 0.894 | 0.719 | 0.610 |
+| parity | **`minGRU-signed-tanh` (default)** | 1 | 6 | 1.000 | ≥0.9999 | 0.999 | 0.996 (worst seed 0.979) |
+| S3 | `GRU` | 1 | 3 | 1.000 | 1.000 | 1.000 | 1.000 |
+| S3 | `minGRU-signed` (`coupled=True`) | 1 | 3 | 0.414 | 0.339 | 0.275 | 0.223 |
+| S3 | `minGRU-signed` (`coupled=True`) | 4 | 3 | 0.885 | 0.544 | 0.426 | 0.342 |
+| S3 | **`minGRU-rotsnap` (best-val@128 protocol)** | 1 | 8 | 0.999 | 0.987 | 0.956 | 0.889 (exact-to-16x in 2/8 seeds) |
+
+An earlier, single-seed run of this project reported 0.655 for the
+S3/`coupled=True`/L=4/@256 cell; the 3-seed mean above (0.544) supersedes
+it and is within normal seed variance, not a regression (full comparison
+in `experiments/EXPERIMENTS.md`).
+
+Base `MinGRU` (log-space) isn't re-tabulated multi-seed above: it cannot
+represent a −1 transition or a non-commuting one at any width, so it
+stays at chance on both tasks regardless of seed or depth — a
+parameterization failure, not a training one.
+
+A few caveats apply to every number above: all runs use one learning
+rate, and null/partial results are budget-relative ("didn't land the
+exact solution in 1600 steps" ≠ "cannot"). The minGRU wrappers also
+include a block MLP that the `GRU` baseline lacks, which favors the
+minGRU variants — this strengthens their negative results (chance-level
+despite the extra capacity) and mildly weakens attribution of their
+positive ones.
 
 ## Model
 
@@ -73,7 +149,7 @@ signed_stack = MinGRUStack(32, 256, n_layers=4, mixer="signed")
 legacy_stack = MinGRUStack(
     32, 256, n_layers=4, mixer="signed", mixer_kwargs={"coupled": True}
 )
-# bit-exact reproduction of the pre-promotion SignedMinGRU
+# bit-exact reproduction of the previous default parameterization
 
 rot_stack = MinGRUStack(32, 256, n_layers=1, mixer="rotation")
 # non-diagonal 2x2 rotation blocks; validated at n_layers=1 only, and only
@@ -108,66 +184,56 @@ m = MinGRU(32, 64, learnable_h0=True)   # zero-init == fixed g(0)=0.5 default
 `"signed"`; `RotationMinGRU` owns its `h_0` unconditionally (see "Rotation
 variant" below) and does not accept the flag.
 
-Full per-seed evidence, the mechanism-verification homomorphism test, and
-the closed repair agenda behind the numbers in this README live in
-`experiments/` — `experiments/SUMMARY.md` (curated synthesis),
-`experiments/EXPERIMENTS.md` (round-by-round log), and
-`experiments/lab_results.jsonl` (raw cells).
-
 ## State conventions
 
 All exposed state is **real hidden state** — an output of `forward()` or
-`step()` — under one convention across every entry point and every mixer:
+`step()` — under one convention across every mixer:
 
-- `MinGRU.forward(h_0=...)` takes `(B, 1, d_h)`; `step(h_prev=...)` takes
+- `forward(h_0=...)` takes `(B, 1, d_h)`; `step(h_prev=...)` takes
   `(B, d_h)`. Crossing between streaming and chunked modes needs an
-  explicit unsqueeze — intentional, no silent dim coercion. Same shapes
-  for `SignedMinGRU` and `RotationMinGRU`.
-- **Do not pass pre-activations.** This deviates from the paper's
-  reference code, which applies `g` to `h_0` (treating it as a
-  pre-activation). That convention makes the natural chunked-carry
-  pattern `forward(h_0=prev[:, -1:])` silently wrong (double-applies
-  `g`, ~0.43 max error vs. 1e-5 when fixed). Here `log(h_0)` is used
-  directly; the learned-init use case, where the pre-activation
-  convention is genuinely useful, is encapsulated behind
-  `learnable_h0=True` instead of the call signature.
-- Validation: strictly negative entries in `h_0` (the signature of
-  pre-activation misuse) raise, via `torch._assert_async` — device-side
-  on CUDA, so chunked loops incur no per-chunk host sync. Exact zeros
-  are **accepted and clamped** to the dtype's smallest normal before
-  `log()`: legitimately small states underflow to 0.0 in fp16/bf16
-  (fp16 floor is ~6.1e-5; decayed states routinely sit below it), and
-  rejecting them would fail valid carries. This positivity check is a
-  property of the log-space `MinGRU` only — `SignedMinGRU` and
-  `RotationMinGRU` accept any real `h_0`, no clamp, no check.
+  explicit `unsqueeze` (intentional — no silent dimension coercion). Same
+  shapes for `MinGRU`, `SignedMinGRU`, and `RotationMinGRU`.
+- **Do not pass pre-activations.** The paper's reference code treats
+  `h_0` as a pre-activation and applies `g` to it internally; this
+  implementation does not. Passing a pre-activation here silently
+  double-applies `g` (~0.43 max error vs. 1e-5 when fixed) — a real
+  footgun if you reuse the paper's chunked-carry pattern verbatim. For a
+  learned initial state, use `learnable_h0=True` rather than passing a
+  pre-activation through the call signature.
+- **Validation (log-space `MinGRU` only).** Strictly negative entries in
+  `h_0` raise, via `torch._assert_async` (device-side on CUDA, so chunked
+  loops incur no per-chunk host sync). Exact zeros are accepted and
+  clamped to the dtype's smallest normal before `log()`, since
+  legitimately small states underflow to 0.0 in fp16/bf16. `SignedMinGRU`
+  and `RotationMinGRU` accept any real `h_0` — no clamp, no check; the
+  positivity constraint is a property of the log-space parameterization
+  only.
 - `RotationMinGRU.h_0` is an intrinsic learned parameter, not an optional
-  flag: `h_0 = 0` has no orbit under the group action (a fixed point
-  cannot demonstrate state tracking), and a state vector on a reflection
-  axis collapses reflections onto rotations. A random nonzero learned
-  vector avoids both failure modes.
+  flag (see "Rotation variant," below): a zero state has no orbit under
+  the group action, so it can't demonstrate tracking, and a state on a
+  reflection axis collapses reflections onto rotations.
+
+The full derivation and code path for each rule above is in the
+corresponding docstrings in `min_gru.py` (`forward`, `step`, `log_g`).
 
 ## Implementation notes
 
-- **`log_g` gradient at 0.** The paper's reference `log_g` guards the
-  `x ≥ 0` branch with `relu` (necessary: `torch.where` evaluates both
-  branches, and an unguarded `(x + 0.5).log()` NaNs for `x < −0.5`,
-  poisoning gradients even when unselected). But `relu'(0) = 0` gives
-  `log_g` gradient exactly 0 at `x = 0` — outside the true
-  subdifferential `[0.5, 2]` — which deadens any zero-initialized
-  parameter fed through it (e.g. `learnable_h0` at its default init:
-  no crash, no wrong output, the parameter just never trains). This
-  implementation uses a nested `where` instead: value-identical to
-  the relu guard, but the selected branch at 0 is plain `x`, giving
-  the correct gradient `1/g(0) = 2` while keeping the unselected
-  branch finite.
+- **`log_g` gradient at 0.** This implementation uses a nested `where`
+  instead of the paper's relu-guarded branch: value-identical everywhere,
+  but it gives the correct gradient (`1/g(0) = 2`) at `x = 0` instead of
+  the relu guard's incorrect 0, which silently deadens any zero-initialized
+  parameter routed through it (e.g. `learnable_h0` at its default init —
+  no crash, no wrong output, the parameter just never trains). Full
+  derivation is in the `log_g` docstring.
 - `step()` runs under `@torch.no_grad()` for every mixer. Training is
   intended through the parallel `forward`; if you need BPTT through the
   sequential path, remove the decorator.
-- Parallel/sequential agreement is ~1e-5 in fp32 at T=128 for `MinGRU`
-  (`logcumsumexp` accumulation), ~1e-7 for `SignedMinGRU` (no exp/log
-  round-trip), and ~1e-6 for `RotationMinGRU` — none exact.
+- Numerical agreement between the parallel and sequential paths, fp32 at
+  T=128: ~1e-5 for `MinGRU` (`logcumsumexp` accumulation), ~1e-7 for
+  `SignedMinGRU` (no exp/log round-trip), ~1e-6 for `RotationMinGRU` —
+  none exact by construction.
 
-## Caveats for sequence modeling
+## Expressivity limits
 
 - **Positive states (log-space variant).** Each `MinGRU` block's scan
   output lives in `(0, ∞)` (the residual stream itself is signed). If
@@ -215,24 +281,23 @@ a_t = (1 − z_t) ⊙ tanh(Linear_s(x_t))        # coupled=True (legacy)
 h_t = a_t ⊙ h_{t−1} + z_t ⊙ Linear_h(x_t)
 ```
 
-`coupled=True` is a bit-exact reproduction of the pre-promotion class
-(identical parameter shapes and construction order, so identical seeds
-give identical weights) — kept as the one-flag legacy path.
+`coupled=True` is a bit-exact reproduction of the parameterization this
+module shipped before this update (identical parameter shapes and
+construction order, so identical seeds give identical weights) — kept as
+the one-flag legacy path.
 
 **Why the default changed.** The coupled form imposes a ceiling
 `|a_t| ≤ 1 − z_t`: reaching the eigenvalue −1 that a task like parity
 needs asks the gate to *also* saturate (`z_t → 0`) — one target value,
-two simultaneous saturations to pay for. In practice this shows up as
-length-generalization decay: the coupled form solves parity at the
-training length but its accuracy erodes with distance as the
-imperfect eigenvalue compounds over more steps (current-env, 3-seed
-mean: 0.894 @256 → 0.610 @1024; see Results). The decoupled form
-removes the ceiling entirely: `tanh`'s own asymptote is the eigenvalue's
-attractor, so it needs only one saturation and reaches the target
-"for free," holding much closer to exact out to 4x-16x the training
-length (0.996 mean, worst seed 0.979, n=6; see Results). That is why
-`coupled=False` is now the default — the previous parameterization
-remains exactly reproducible behind `coupled=True`.
+two simultaneous saturations to pay for. That shows up as the
+length-generalization decay in the parity rows of "What this shows,"
+above. The decoupled form removes the ceiling entirely: `tanh`'s own
+asymptote is the eigenvalue's attractor (the value the gate settles
+toward under training), so it needs only one saturation and reaches the
+target "for free," holding much closer to exact out to 4x-16x the
+training length. That is why `coupled=False` is now the default — the
+previous parameterization remains exactly reproducible behind
+`coupled=True`.
 
 This decoupled mechanism is Grazzi et al.'s (ICLR 2025, *Unlocking
 State-Tracking in Linear RNNs Through Negative Eigenvalues*)
@@ -254,10 +319,10 @@ standard GRU). All diagonal variants, signed or not, remain in TC⁰ per
 Merrill et al.'s iterated-scalar-product argument.
 
 Practical differences from `MinGRU`: any real `h_0` is legal (no
-positivity check, no underflow clamp), parallel/sequential agreement is
-~1e−7 rather than ~1e−5 (no exp/log round-trip), and there are 3 linear
-heads instead of 2 (mind parameter-matched comparisons). The scan is
-O(T log T) work / O(log T) depth in pure torch ops.
+positivity check, no underflow clamp), and there are 3 linear heads
+instead of 2 (mind parameter-matched comparisons). The scan is
+O(T log T) work / O(log T) depth in pure torch ops. Numerical agreement
+vs. the sequential path is covered in "Implementation notes," above.
 
 The expressivity ladder, per layer:
 
@@ -308,8 +373,8 @@ take on their mechanism, not a claimed improvement over it.
 
 **Angle snapping (`snap`).** With `snap` set (default `(2, 3, 4, 6)`,
 cycled across blocks), `theta_t` is quantized per block to an exact
-multiple of `2π/K` via a straight-through estimator: forward uses the
-snapped angle, gradient passes through the pre-snap "soft" angle
+multiple of `2π/K` via a straight-through estimator (STE): forward uses
+the snapped angle, gradient passes through the pre-snap "soft" angle
 unchanged. This manufactures an attractor at exact group elements, the
 same role `tanh`'s asymptote plays for `SignedMinGRU`'s eigenvalue:
 without it (`snap=None`, a legitimate, documented ladder rung),
@@ -346,137 +411,44 @@ protocol:
 CKPT=1 python probes.py S3 minGRU-rotsnap
 ```
 
-**Seed-rate, stated plainly.** Across 8 fresh current-env seeds under
-this protocol, only 2 of 8 land the exact solution (accuracy 1.0 to
-the checked precision at every length out to 1024); the rest are
-detectably-flagged (best val@128 < 1.0) and decay measurably at
-4x-16x the training length. The mean length-generalization numbers in
-Results (0.987 @256, 0.956 @512, 0.889 @1024) are the honest average
-over all 8 seeds, including the flagged ones — not a best-seed
-headline. Per `experiments/SUMMARY.md`'s mechanism verification, every
-seed (including the flagged ones) contains a D3 representation
-readable off its weights; failed seeds are simply 5-15x less exact,
-not missing the mechanism. Budget for retries when reproducing this
-variant.
+**Seed success rate.** Across 8 fresh seeds under this protocol, only
+2 of 8 land the exact solution (accuracy 1.0 to the checked precision
+at every length out to 1024); the rest are detectably flagged (best
+val@128 < 1.0) and decay measurably at 4x-16x the training length. The
+mean length-generalization numbers in "What this shows," above (0.987
+@256, 0.956 @512, 0.889 @1024) are the honest average over all 8
+seeds, including the flagged ones — not a best-seed headline. Per the
+mechanism verification in `experiments/SUMMARY.md`, every seed —
+including the flagged ones — contains a D3 representation readable off
+its weights; failed seeds are simply 5-15x less exact, not missing the
+mechanism. Budget for retries when reproducing this variant.
 
-Excludes refuted experiment-loop mechanisms: no full orthogonality
-constraint, no grid-attraction regularizer, no post-hoc
-projection/ablation masks. All were tried and either hurt length
-generalization or were redundant with best-val selection above (see
-`experiments/SUMMARY.md`, rounds 5 and 8, and the closed repair agenda).
+**Alternatives tried and dropped.** Three other fixes were tested and
+abandoned: a full orthogonality constraint on the transition matrices,
+a regularizer that pulls angles toward the snap grid, and post-hoc
+projection/ablation of near-exact blocks at inference. Each either
+hurt length generalization or was redundant with the best-val@128
+selection above (full comparison in `experiments/SUMMARY.md`, rounds 5
+and 8).
 
 Practical differences from the other mixers: 4 linear heads (z, h,
 theta, u) vs. `SignedMinGRU`'s 3 / `MinGRU`'s 2 (mind parameter-matched
 comparisons); `h_0` is an intrinsic learned parameter with no
-`learnable_h0` flag (see State conventions); `hidden_size` must be
-even (`ValueError` otherwise); parallel/sequential agreement is
-~1e-6. The scan is O(T log T) work / O(log T) depth in pure torch ops,
-same tradeoff as `linear_scan`.
+`learnable_h0` flag (see "State conventions"); `hidden_size` must be
+even (`ValueError` otherwise). The scan is O(T log T) work / O(log T)
+depth in pure torch ops, same tradeoff as `linear_scan`. Numerical
+agreement vs. the sequential path is covered in "Implementation notes,"
+above.
 
-## Expressivity probes
+## Reproducing
 
-`probes.py` tests the ladder empirically on two word problems (seq2seq
-tagging with dense supervision, following Merrill et al.'s setup):
-
-**parity**: label each prefix with the running XOR of the bits so far.
-The natural one-channel recurrent solution is a sign flip: hold
-`h_t = −h_{t−1}` on input 1, `h_t = +h_{t−1}` on input 0, and read the
-answer off the sign. That is a transition coefficient of −1, exactly
-the eigenvalue `SignedMinGRU` adds and the positive-diagonal `MinGRU`
-(a ∈ (0,1)) cannot represent at any width. Parity is in TC⁰, so a
-failure here is a parameterization limit, not a complexity-class one.
-Chance is 0.5.
-
-**S3**: each token is one of the 6 permutations of three objects
-(picture three cups being swapped and rotated); the label at each step
-is the net permutation so far. Composition order matters:
-swap-then-rotate ≠ rotate-then-swap. A diagonal scan's per-channel
-state is a running product of scalars, and scalar multiplication
-commutes, so the mechanism is order-blind: diagonal variants of any
-sign fail per layer. `RotationMinGRU`'s non-commutative 2x2 blocks
-close this gap (see Results). Chance is 1/6 ≈ 0.17.
-
-Models train at T=64 and are evaluated at T=64 (in-distribution) and
-longer lengths (256/512/1024, length generalization) — the length-gen
-columns are what separate "expresses the recurrent solution" from
-"learned a depth-bounded shortcut for the training length."
-
-### Results
-
-All numbers below are **current-environment** (torch 2.5.1, CPU)
-**multi-seed means**, drawn from `experiments/lab_results.jsonl` as
-tabulated in `experiments/SUMMARY.md`; seed counts are stated per row.
-Protocol: seq2seq tagging (dense supervision), T_train=64, d_model=64,
-batch 128, Adam lr 3e-3, budget ≤1600 steps, early-stop at 99.9%
-train-length accuracy — **except** `minGRU-rotsnap`, which uses the
-best-val@128 protocol described above instead of early-stop. The @512
-column is not separately tabulated in `experiments/SUMMARY.md`; it is
-computed directly from `lab_results.jsonl` using the identical seed
-sets as the corresponding @256/@1024 cells.
-
-| task | model | layers | seeds | acc@64 | acc@256 | acc@512 | acc@1024 |
-|---|---|---|---|---|---|---|---|
-| parity | `GRU` | 1 | 3 | 1.000 | 1.000 | 1.000 | 1.000 |
-| parity | `minGRU-signed` (`coupled=True`) | 1 | 3 | 1.000 | 0.894 | 0.719 | 0.610 |
-| parity | `minGRU-signed-tanh` (default) | 1 | 6 | 1.000 | ≥0.9999 | 0.999 | 0.996 (worst seed 0.979) |
-| S3 | `GRU` | 1 | 3 | 1.000 | 1.000 | 1.000 | 1.000 |
-| S3 | `minGRU-signed` (`coupled=True`) | 1 | 3 | 0.414 | 0.339 | 0.275 | 0.223 |
-| S3 | `minGRU-signed` (`coupled=True`) | 4 | 3 | 0.885 | 0.544 | 0.426 | 0.342 |
-| S3 | `minGRU-rotsnap` (best-val@128 protocol) | 1 | 8 | 0.999 | 0.987 | 0.956 | 0.889 (exact-to-16x in 2/8 seeds) |
-
-Positive-diagonal `minGRU` (log-space) remains at chance on both tasks
-regardless of depth — it cannot represent the sign-flip (parity) or
-non-commutative (S3) mechanism at any width, a parameterization
-failure rather than a training one. It is not re-tabulated
-multi-seed here (the experiment loop scoped its runs to the signed and
-rotation variants, not the log-space baseline) since a chance-level
-result doesn't shift with seed or environment.
-
-**Footnote on prior numbers.** Earlier (pre-promotion) versions of this
-README quoted single-seed numbers that carried seed and environment
-variance and are **not comparable** to the table above: the old
-single-seed `minGRU-signed` L=4 S3 @256 figure was 0.655; the current
-3-seed current-env mean is 0.544 — within seed variance, not an
-environment regression (`experiments/EXPERIMENTS.md`, "Baselines
-re-grounded"). Any comparative claim in this README is backed only by
-the current-env multi-seed table above.
-
-Interpretation:
-
-- **Parity separates the sign; decoupling removes the residual decay.**
-  Coupled `minGRU-signed` solves parity at the training length but
-  decays with distance (0.894 → 0.610 mean, @256→@1024, n=3) because
-  reaching `a = −1` costs two simultaneous saturations. Decoupling
-  removes that ceiling: `minGRU-signed-tanh` holds ≥0.996 mean out to
-  1024 (n=6, worst seed 0.979) at the same L=1, no depth needed.
-- **S3 separates commutativity; only a non-diagonal scan closes it.**
-  Both coupled parameterizations plateau near a Z2 (even/odd) quotient
-  at L=1 (0.414 → 0.223 mean across lengths) and depth substitutes for
-  recurrence at L=4 (0.885 @64 falling to 0.342 @1024) — a
-  length-bounded shortcut, not the automaton, the same pattern Merrill
-  et al. report for Mamba/S4/transformers. `minGRU-rotsnap`'s
-  non-commutative 2x2 blocks close most of this gap in a single layer
-  (0.987 @256, 0.889 @1024, n=8), and per the mechanism verification in
-  `experiments/SUMMARY.md`, the winning seeds *do* contain an
-  inspectable, near-exact D3 representation (composition error ~1e-4)
-  — not a shortcut.
-- **Rotation-snap's residual gap is seed-rate, not capability.** Only
-  2 of 8 fresh seeds land the exact solution to 16x length; the rest
-  find the same representation 5-15x less exact (readable off the
-  weights) and decay measurably. Best-val@128 selection + retry-on-flag
-  is the shipped mitigation, not a cure — budget for retries when
-  reproducing this variant.
-- **GRU remains the ceiling.** State-dependent gating solves both tasks
-  exactly at every tested length (1.000, n=3) with a single layer — the
-  automaton construction the diagonal and rotation mixers approximate.
-
-Caveats that still apply: one learning rate, and null/partial results
-are budget-relative ("didn't land the exact solution in 1600 steps" ≠
-"cannot"). The minGRU wrappers include a block MLP the GRU baseline
-lacks, which favors the minGRU variants — strengthening their negative
-results, mildly weakening attribution of their positive ones.
-
-### Reproducing
+`probes.py` tests the ladder empirically on the two word problems
+defined in "What this shows" (seq2seq tagging with dense supervision,
+following Merrill et al.'s setup). Models train at T=64 and are
+evaluated at T=64 (in-distribution) and longer lengths (256/512/1024,
+length generalization) — the length-gen columns are what separate
+"expresses the recurrent solution" from "learned a depth-bounded
+shortcut for the training length."
 
 ```
 python probes.py TASK MODEL [N_LAYERS]
@@ -499,7 +471,7 @@ CKPT=1 python probes.py S3 minGRU-rotsnap                # protocol-correct rota
 ```
 
 A smoke-test grid covering the ladder (single seed per cell — the
-current-env *multi-seed* numbers in Results above come from
+multi-seed numbers in "What this shows," above, come from
 `experiments/variants.py`, same protocol plus extra seeds and eval
 lengths 512/1024):
 
@@ -518,9 +490,14 @@ CKPT=1 python probes.py S3 minGRU-rotsnap 1
 CPU-only is sufficient; most cells run in seconds to ~15 minutes
 (1-layer cells fastest), rotation-snap cells run ~1-2 minutes each.
 Expect small numeric differences across torch versions but the same
-qualitative pattern; see `experiments/SUMMARY.md` for the fully
-reproduced current-env evidence trail (loop rounds, mechanism
-verification, closed repair agenda).
+qualitative pattern.
+
+The @512 column in "What this shows" is not separately tabulated in
+`experiments/SUMMARY.md`; it is computed directly from
+`experiments/lab_results.jsonl` using the identical seed sets as the
+corresponding @256/@1024 cells. See `experiments/SUMMARY.md` for the
+fully reproduced evidence trail (per-seed results, the mechanism
+verification, and the record of what was tried and dropped).
 
 ## Tests
 
@@ -538,6 +515,19 @@ diagonal scans and into `h0_pre` **from zero-init** (guards the
 `log_g` fix), `log_g` gradient at 0 equal to 2, and `h_0` validation
 for the log-space variant (underflowed zeros accepted, negatives
 raise).
+
+## Further reading
+
+Full per-seed evidence, the mechanism-verification detail, and the
+record of what was tried and dropped behind the numbers in this README
+live in `experiments/`:
+
+- `experiments/SUMMARY.md` — curated synthesis: full multi-seed tables,
+  the D3 mechanism-verification detail, what was tried and dropped, and
+  open work.
+- `experiments/EXPERIMENTS.md` — round-by-round experiment log with
+  per-round detail.
+- `experiments/lab_results.jsonl` — raw per-seed result rows.
 
 ## References
 
