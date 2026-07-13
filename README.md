@@ -49,38 +49,62 @@ training length (n=6, worst seed 0.984), vs. 0.592 for the legacy
 (`mixer="rotation"`, one layer only; `minGRU-rotsnap` below) with the
 `CKPT=1` best-val@128 protocol described in "Rotation variant" — it reaches
 0.958 mean accuracy at 16x length (n=8), though only 1 of 8 seeds lands the
-exact solution, so budget for retries. The base `MinGRU` (log-space,
+exact solution, so budget for retries. If you only need behavior near the
+training length, `SignedMinGRU` fits S3-like composition in-distribution
+too (0.999 @64) — its shortcut just decays with length; rotation is what
+holds at 4x-16x. The base `MinGRU` (log-space,
 `mixer="log"`) stays at chance on both tasks regardless of depth — a
 parameterization limit, not a training one. A standard GRU remains the
-ceiling: state-dependent gating solves both tasks exactly at every tested
-length with a single layer.
+ceiling: state-dependent gating holds both tasks at 1.000 (to three
+decimals) at every tested length with a single layer.
 
 Numbers below are multi-seed means (torch 2.5.1, CPU; seed counts stated
 per row). Protocol: seq2seq tagging (dense supervision), T_train=64,
-d_model=64, batch 128, Adam lr 3e-3, budget ≤1600 steps, early-stop at
-99.9% train-length accuracy — **except** `minGRU-rotsnap`, which uses the
-best-val@128 protocol instead of early-stop.
+d_model=64, batch 128, Adam lr 3e-3, budget ≤1600 steps; the selection
+protocol is labeled per row. parity rows use early-stop at 99.9%
+train-length accuracy; every S3 minGRU-variant row uses the best-val@128
+checkpoint protocol ("Rotation variant," below), so the diagonal and
+rotation rows compare *mechanisms* under one selection procedure rather
+than mechanism-plus-protocol against mechanism. Base `minGRU` rows never
+reach the early-stop criterion and consume the full budget.
 
-| task | model | layers | seeds | acc@64 | acc@256 | acc@512 | acc@1024 |
-|---|---|---|---|---|---|---|---|
-| parity | `GRU` | 1 | 3 | 1.000 | 1.000 | 1.000 | 1.000 |
-| parity | `minGRU-signed` (`coupled=True`) | 1 | 3 | 1.000 | 0.866 | 0.687 | 0.592 |
-| parity | **`minGRU-signed-tanh` (default)** | 1 | 6 | 1.000 | 1.000 | 0.999 | 0.994 (worst seed 0.984) |
-| S3 | `GRU` | 1 | 3 | 1.000 | 1.000 | 1.000 | 1.000 |
-| S3 | `minGRU-signed` (`coupled=True`) | 1 | 3 | 0.419 | 0.337 | 0.270 | 0.220 |
-| S3 | `minGRU-signed` (`coupled=True`) | 4 | 3 | 0.938 | 0.649 | 0.471 | 0.347 |
-| S3 | **`minGRU-rotsnap` (best-val@128 protocol)** | 1 | 8 | 1.000 | 1.000 | 0.996 | 0.958 (exact-to-16x in 1/8 seeds) |
+| task | model | layers | seeds | protocol | acc@64 | acc@256 | acc@512 | acc@1024 |
+|---|---|---|---|---|---|---|---|---|
+| parity | `GRU` | 1 | 3 | early-stop | 1.000 | 1.000 | 1.000 | 1.000 |
+| parity | `minGRU` (base, log-space) | 1 | 3 | early-stop | 0.542 | 0.511 | 0.506 | 0.502 |
+| parity | `minGRU-signed` (`coupled=True`) | 1 | 3 | early-stop | 1.000 | 0.866 | 0.687 | 0.592 |
+| parity | **`minGRU-signed-tanh` (default)** | 1 | 6 | early-stop | 1.000 | 1.000 | 0.999 | 0.994 (worst seed 0.984) |
+| S3 | `GRU` | 1 | 3 | early-stop | 1.000 | 1.000 | 1.000 | 1.000 |
+| S3 | `minGRU` (base, log-space) | 1 | 3 | early-stop | 0.229 | 0.182 | 0.175 | 0.171 |
+| S3 | `minGRU-signed` (`coupled=True`) | 1 | 3 | best-val@128 | 0.470 | 0.344 | 0.277 | 0.226 |
+| S3 | `minGRU-signed` (`coupled=True`) | 4 | 3 | best-val@128 | 0.994 | 0.713 | 0.506 | 0.368 |
+| S3 | `minGRU-signed-tanh` (default) | 1 | 3 | best-val@128 | 0.999 | 0.943 | 0.864 | 0.732 |
+| S3 | `minGRU-signed-tanh` (default) | 4 | 3 | best-val@128 | 0.997 | 0.908 | 0.769 | 0.574 |
+| S3 | **`minGRU-rotsnap`** | 1 | 8 | best-val@128 | 1.000 | 1.000 | 0.996 | 0.958 (exact-to-16x in 1/8 seeds) |
 
-The S3/`coupled=True`/L=4 cell has high seed-to-seed variance (per-seed
-acc@256 spans ~0.47-0.76 in the current 3-seed run), so treat its mean
-above as indicative rather than tight. Run history for this cell and
-detail on a train/eval generator-seeding fix applied across this table
-(seed 0 unaffected) live in `experiments/EXPERIMENTS.md`.
+The S3 diagonal rows tell a sharper story than "can't fit": the
+decoupled `signed-tanh` fits S3 in-distribution (0.999 @64) through a
+bounded-depth shortcut and decays steadily with length — 0.732 @1024 at
+L=1, and depth doesn't rescue it (0.574 @1024 at L=4) — while the
+rotation row holds near the exact automaton (0.958 @1024). The coupled
+legacy form fails to fit S3 at L=1 even under checkpoint selection. So
+the diagonal/rotation separation lives at length generalization, not
+training fit — exactly where the representability argument
+("Expressivity limits," below) predicts it.
 
-Base `MinGRU` (log-space) isn't re-tabulated multi-seed above: it cannot
-represent a −1 transition or a non-commuting one at any width, so it
-stays at chance on both tasks regardless of seed or depth — a
-parameterization failure, not a training one.
+The deeper S3 diagonal cells carry high seed-to-seed variance (per-seed
+acc@256 spans 0.66-0.76 for `coupled=True` L=4 and 0.83-0.95 for
+`signed-tanh` L=4), so treat those means as indicative rather than
+tight. Earlier early-stop records for the coupled S3 rows, and detail
+on a train/eval generator-seeding fix applied across this table (seed 0
+unaffected), live in `experiments/EXPERIMENTS.md`.
+
+Base `MinGRU` (log-space) is measured at chance on both tasks, and
+depth doesn't move it: L=4 rows (3 seeds, round `base-mingru` in
+`experiments/lab_results.jsonl`) match the L=1 rows above — parity
+0.516 @64 falling to 0.501 @1024, S3 0.222 @64 falling to 0.170 @1024.
+It cannot represent a −1 transition or a non-commuting one at any
+width, so this is a parameterization failure, not a training one.
 
 A few caveats apply to every number above: all runs use one learning
 rate, and null/partial results are budget-relative ("didn't land the
@@ -88,7 +112,13 @@ exact solution in 1600 steps" ≠ "cannot"). The minGRU wrappers also
 include a block MLP that the `GRU` baseline lacks, which favors the
 minGRU variants — this strengthens their negative results (chance-level
 despite the extra capacity) and mildly weakens attribution of their
-positive ones.
+positive ones. Finally, every comparison here is internal — against the
+repo's own floor (base `MinGRU`), its prior parameterization
+(`coupled=True`), or its ceiling (`torch.nn.GRU`). None of the published
+mechanisms these variants reimplement (a Grazzi-style negative-eigenvalue
+scan, DeltaNet/DeltaProduct) is run as a baseline, so the positive
+results establish "reproduces the predicted behavior, minGRU-natively,"
+not "competitive with the incumbents."
 
 ## Model
 
@@ -512,7 +542,11 @@ multi-seed means:
 
 All three depth-2 configurations land close to the L=1 reference;
 rotation×2 (two rotation blocks) still emits the multi-rotation
-warning below. Deeper homogeneous rotation stacks (L=4) are untested
+warning below. Seed caveat: these are n=3 cells on a variant whose own
+n=8 run spans 0.859–1.000 @1024, so three seeds sit inside the
+demonstrated seed-noise band — read the table as "depth-2 stacks train
+and stay in the L=1 reference's range," not as a ranking of the three
+configurations. Deeper homogeneous rotation stacks (L=4) are untested
 under this protocol and remain open. (Run history:
 `experiments/EXPERIMENTS.md`.)
 
@@ -540,6 +574,10 @@ shows the same length decay documented for `SignedMinGRU` above: a
 diagonal-scan approximation to a genuinely non-commutative
 composition, not the exact automaton. The extract-then-compose hetero
 stack (signed → rotation) sits near chance at the standard budget.
+Every `S3-hier` row is n=3, and rotation-bearing configurations show a
+0.86–1.0 per-seed spread at n=8 on plain `S3` — so the large gaps here
+(fit vs. chance) are the trustworthy signal, not small differences
+between adjacent rows.
 
 The 4x-budget row's mean hides a split: one of three seeds finds the
 exact solution and generalizes to 0.9834 @1024 (the best
@@ -554,17 +592,19 @@ Why the results split this way: composition destroys information for
 any layer above it, so the order is forced — a rotation layer fed raw
 sub-tokens composes a mixture nothing downstream can take apart,
 which is why rotation→signed wins on plain `S3` (where tokens *are*
-the operations) and sits at chance here. And the working order is
-hard to train because the two layers need each other: the feature
+the operations) and sits at chance here. Why the working order still
+trains poorly is less settled. The hypothesis consistent with the
+evidence — a single seed of three landing the exact solution, and only
+at 4x budget — is that the two layers need each other: the feature
 layer's learning signal passes through the composer's snapped,
 straight-through rotations, so until the extractor emits clean
 generators the composer has nothing exact to lock onto, and until the
-composer is meaningful the extractor gets noisy credit. Only some
-initializations escape that loop, and the escape is visible when it
-happens: best-val@128 hits 1.0 on the run that lands the exact
-automaton and flags the ones that don't. Treat it like rotation
-training generally — run seeds, keep flagged-clean runs, budget for
-retries.
+composer is meaningful the extractor gets noisy credit. That coupling
+story is inferred from one successful run, not established. What is
+measured is that the escape is visible when it happens: best-val@128
+hits 1.0 on the run that lands the exact automaton and flags the ones
+that don't. Treat it like rotation training generally — run seeds,
+keep flagged-clean runs, budget for retries.
 
 L=1 rotation alone, rotation×2, rotation→signed, and an unconstrained
 `GRU` all sit at or near chance on `S3-hier`: no single capability
@@ -642,11 +682,13 @@ and `RotationMinGRU` alike, and threaded through `MinGRUBlock` /
 
 What follows works mechanism-first: the transition math and the
 `delta_t` contract below, then two experiments — a channel ablation
-showing what the mechanism adds beyond just handing a model the raw
+asking what the mechanism adds beyond just handing a model the raw
 time gaps as an input feature ("Does the decay mechanism add anything
-beyond a `delta_t` feature?"), and a recovery check showing what an
-unhelpful decay rate costs ("Recovery check"). Skip ahead to either if
-you want the evidence before the mechanism.
+beyond a `delta_t` feature?" — short answer: the feature does most of
+the work; the mechanism adds a smaller, separately-measurable margin
+on top), and a recovery check showing what an unhelpful decay rate
+costs ("Recovery check"). Skip ahead to either if you want the
+evidence before the mechanism.
 
 **Mechanism.** Each step's transition coefficient is scaled by
 `gamma = exp(-lambda * f(delta_t))`, where `lambda >= 0` is a per-
@@ -760,39 +802,40 @@ other signed-tanh rows), 3 seeds (0, 1, 2), `decay="learnable"` at
 
 | task | model (channel) | seeds | acc@64 | acc@256 | steps to early-stop |
 |---|---|---|---|---|---|
-| session-parity | both channels (`minGRU-signed-tanh-tdecay`) | 3 | 1.0000 | 0.9979 | 233 (avg) |
-| session-parity | feature channel only (`minGRU-signed-tanh`) | 3 | 0.9980 | 0.9929 | 600 (avg) |
-| session-parity | mechanism channel only (`minGRU-signed-tanh-tdecay-mech`) | 3 | 0.9713 | 0.9470 | never (full 1500-step budget, every seed) |
+| session-parity | both channels (`minGRU-signed-tanh-tdecay`) | 3 | 1.000 | 0.998 | 233 (avg) |
+| session-parity | feature channel only (`minGRU-signed-tanh`) | 3 | 0.998 | 0.993 | 600 (avg) |
+| session-parity | mechanism channel only (`minGRU-signed-tanh-tdecay-mech`) | 3 | 0.971 | 0.947 | never (full 1500-step budget, every seed) |
 
-**Both channels beats feature-only cleanly and consistently**: acc@256
-is non-overlapping across every seed pairing (both-channels range
-[0.9975, 0.9985] vs. feature-only's [0.9903, 0.9967]), converges to
-the early-stop threshold ~2.6x faster on average (233 vs. 600 steps),
-and reaches a ~3.4x lower error rate (0.21% vs. 0.71%). The learned
-rate also lands in a consistent, narrow band across seeds (mean
-0.0524-0.0534) — the mechanism settles on a timescale that separates
-the within-session gap range (`[0.1, 1.0]`) from the boundary range
-(`[50, 100]`) rather than drifting seed-to-seed. Read the accuracy gap
-as the decay mechanism adding value **on top of** the `delta_t`
-feature — the both-channels row also carries extra per-channel rate
-parameters, so this isn't the mechanism in isolation.
+**The feature channel does most of the work.** Isolating the mechanism
+channel alone shows this directly: it loses to feature-only on both
+accuracy axes (acc@64 0.971 vs. 0.998, acc@256 0.947 vs. 0.993) and
+never reaches the early-stop threshold within the standard 1500-step
+budget. A 4x-budget check (6000 steps, same 3 seeds) narrows the gap —
+acc@256 rises to a 0.975 mean — but doesn't close it and still never
+early-stops; the deficit looks structural, not simply an artifact of
+under-training. Removing the feature channel doesn't change the
+qualitative recovery-check picture either (below) — the mechanism-only
+row's behavior there tracks the both-channels row closely.
 
-**Isolating the mechanism channel alone tells the opposite story**: it
-loses to the feature-only channel on both accuracy axes (acc@64 0.9713
-vs. 0.9980, acc@256 0.9470 vs. 0.9929) and never reaches the
-early-stop threshold within the standard 1500-step budget. A 4x-budget
-check (6000 steps, same 3 seeds) narrows the gap — acc@256 rises to a
-0.9750 mean — but doesn't close it and still never early-stops; the
-deficit looks structural, not simply an artifact of under-training.
-Removing the feature channel doesn't change the qualitative recovery-
-check picture either (below) — the mechanism-only row's behavior there
-tracks the both-channels row closely.
+**Both channels together beats feature-only, modestly and with a
+disclosed confound**: it wins acc@256 on every matched seed (0.997 vs.
+0.990, 0.999 vs. 0.997, 0.998 vs. 0.992 — though the ranges touch:
+both-channels' worst seed equals feature-only's best at the ledger's
+precision), converges to the early-stop threshold ~2.6x faster on
+average (233 vs. 600 steps), and reaches a ~3x lower error rate (0.2%
+vs. 0.7%). The learned rate also lands in a consistent, narrow band
+across seeds (mean 0.052-0.053) — the mechanism settles on a timescale
+that separates the within-session gap range (`[0.1, 1.0]`) from the
+boundary range (`[50, 100]`) rather than drifting seed-to-seed. The
+both-channels row also carries extra per-channel rate parameters the
+feature-only row lacks, so its win is not the mechanism in isolation.
 
 Read the two comparisons together: **the feature and mechanism
-channels are complementary, not substitutable.** The feature channel
-does most of the work in the both-channels win; the mechanism channel
-adds a separately-measurable, smaller improvement on top of it, rather
-than standing in for it.
+channels are complementary, not substitutable** — but asymmetrically
+so. The feature channel carries the both-channels win; the mechanism
+channel underperforms on its own and adds a separately-measurable,
+smaller improvement on top of the feature, rather than standing in
+for it.
 
 ### Recovery check: does an unhelpful decay rate anneal away?
 
@@ -805,13 +848,13 @@ since both rows converge in <=100 steps):
 
 | task | model | seeds | acc@64 | acc@256 | lambda mean |
 |---|---|---|---|---|---|
-| parity-timestamped | both channels (`minGRU-signed-tanh-tdecay`) | 3 | 0.9996 | 0.7855 | 0.0499 |
-| parity | non-decay comparison (`minGRU-signed-tanh`) | 3 | 1.0000 | 1.0000 | n/a |
+| parity-timestamped | both channels (`minGRU-signed-tanh-tdecay`) | 3 | 1.000 | 0.786 | 0.0499 |
+| parity | non-decay comparison (`minGRU-signed-tanh`) | 3 | 1.000 | 1.000 | n/a |
 
 The learned rate does stay near its low `0.05` init (mean 0.0499, not
 drifting toward heavier decay) — the qualitative half of the recovery
 check holds. Accuracy does **not** fully recover: a ~21-point acc@256
-gap remains (0.7855 vs. 1.0000). Cause: `log1p` of a boundary-scale gap
+gap remains (0.786 vs. 1.000). Cause: `log1p` of a boundary-scale gap
 (`delta_t` in `[50, 100]`) is already ~4-4.6, so even at
 `lambda ≈ 0.05`, `gamma ≈ exp(-0.05 * 4.3) ≈ 0.81` per boundary-scale
 event — and session-parity's distribution puts roughly a dozen such
@@ -827,20 +870,21 @@ rows are the tables above) makes the tradeoff explicit:
 
 | `decay_rate` init | session-parity acc@256 | steps to early-stop (avg) | recovery acc@256 |
 |---|---|---|---|
-| 0.005 | 0.9968 | 633 | 0.9967 |
-| 0.01 | 0.9949 | 533 | 0.9856 |
-| 0.02 | 0.9965 | 467 | 0.8954 |
-| 0.05 | 0.9979 | 233 | 0.7855 |
-| *reference* | *feature-only: 0.9929* | *600* | *non-decay: 1.0000* |
+| 0.005 | 0.997 | 633 | 0.997 |
+| 0.01 | 0.995 | 533 | 0.986 |
+| 0.02 | 0.997 | 467 | 0.895 |
+| 0.05 | 0.998 | 233 | 0.786 |
+| *reference* | *feature-only: 0.993* | *600* | *non-decay: 1.000* |
 
 Three things move monotonically and in lockstep with the per-boundary
 `gamma = exp(-R * ~4.3)` (0.98 at `R=0.005` down to 0.81 at
 `R=0.05`). The recovery gap closes as the init drops — essentially
-gone (0.33pp) at `0.005`. The session-parity advantage thins in the
-other direction: every init beats the feature-only baseline *at the
-mean*, but only `0.05` gives the seed-consistent, non-overlapping win,
-and convergence slows from 233 steps to 633 (slower than the
-baseline's 600) at the smallest init. No single init gets both ends.
+gone (~0.3pp) at `0.005`. The session-parity advantage thins in the
+other direction: every init beats the feature-only baseline at the
+mean, but the accuracy differences between inits sit within seed
+noise; what cleanly separates `0.05` is convergence speed (233 steps,
+vs. 467-633 at the smaller inits — the smallest init is slower than
+the baseline's 600). No single init gets both ends.
 
 The sweep also sharpens *why* training won't fix this for you: the
 learned rate moves **up but never down**. On session-parity, `lambda`

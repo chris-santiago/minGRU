@@ -679,3 +679,86 @@ reconstructed as faithfully as the source logs allow. See README's
 "Time-aware decay" section for the recorded means and protocol
 narrative; the per-seed rows here are the durable evidence trail behind
 those numbers.
+
+## Round: research-review remediation (s3-diag-ckpt / base-mingru)
+
+An adversarial results/methods audit of the README flagged three
+evidence gaps in the "What this shows" S3 table: (1) the only diagonal
+comparator shown was the weak legacy `coupled=True` form — the repo's
+recommended decoupled `signed-tanh` had just a single-seed round-2 S3
+record, which the >=3-seed README policy kept out of the table, leaving
+the misleading impression that diagonals cannot fit S3 at all; (2) the
+`minGRU-rotsnap` row was recorded under best-val@128 checkpoint
+selection while the diagonal rows used early-stop, so rotation's win
+was confounded with the selection procedure; (3) the "base `MinGRU`
+stays at chance regardless of depth" sentence had zero logged rows
+behind it (entailed for parity, asserted for S3).
+
+Two rounds close all three (torch 2.5.1, CPU, standard probes protocol:
+T_train=64, d_model=64, batch 128, Adam lr 3e-3, budget 1600 steps,
+seeds 0/1/2, eval lengths 64/256/512/1024 via `experiments/variants.py`):
+
+- `s3-diag-ckpt` (12 rows): S3 x {`signed-tanh` L1/L4,
+  `signed-coupled` L1/L4} under `EXP_CKPT=1` — best-val@128 selection
+  over the full budget, the same protocol as the recorded
+  `minGRU-rotsnap` rows.
+- `base-mingru` (12 rows): {parity, S3} x base minGRU x {L1, L4}. The
+  `log` entry was added to `variants.py`'s `VARIANTS` (importing
+  `min_gru.MinGRU`) so these rows have a runnable public path.
+  Early-stop is armed but never triggers on at-chance runs; every cell
+  consumes the full 1600 steps.
+
+Per-seed results (acc@64 / acc@256 / acc@512 / acc@1024):
+
+| round | task | variant | L | seed | @64 | @256 | @512 | @1024 |
+|---|---|---|---|---|---|---|---|---|
+| s3-diag-ckpt | S3 | signed-tanh | 1 | 0 | 0.9996 | 0.9541 | 0.8778 | 0.7523 |
+| s3-diag-ckpt | S3 | signed-tanh | 1 | 1 | 0.9991 | 0.9440 | 0.8648 | 0.7443 |
+| s3-diag-ckpt | S3 | signed-tanh | 1 | 2 | 0.9986 | 0.9324 | 0.8503 | 0.7002 |
+| s3-diag-ckpt | S3 | signed-tanh | 4 | 0 | 0.9998 | 0.9531 | 0.8403 | 0.6504 |
+| s3-diag-ckpt | S3 | signed-tanh | 4 | 1 | 0.9913 | 0.8326 | 0.6382 | 0.4437 |
+| s3-diag-ckpt | S3 | signed-tanh | 4 | 2 | 0.9993 | 0.9375 | 0.8290 | 0.6281 |
+| s3-diag-ckpt | S3 | signed-coupled | 1 | 0 | 0.4813 | 0.3437 | 0.2721 | 0.2231 |
+| s3-diag-ckpt | S3 | signed-coupled | 1 | 1 | 0.4593 | 0.3505 | 0.2910 | 0.2334 |
+| s3-diag-ckpt | S3 | signed-coupled | 1 | 2 | 0.4680 | 0.3374 | 0.2691 | 0.2222 |
+| s3-diag-ckpt | S3 | signed-coupled | 4 | 0 | 0.9892 | 0.6622 | 0.4637 | 0.3311 |
+| s3-diag-ckpt | S3 | signed-coupled | 4 | 1 | 0.9978 | 0.7109 | 0.5100 | 0.3990 |
+| s3-diag-ckpt | S3 | signed-coupled | 4 | 2 | 0.9958 | 0.7645 | 0.5439 | 0.3740 |
+| base-mingru | parity | log | 1 | 0 | 0.5163 | 0.5041 | 0.5032 | 0.5007 |
+| base-mingru | parity | log | 1 | 1 | 0.5484 | 0.5122 | 0.5070 | 0.5026 |
+| base-mingru | parity | log | 1 | 2 | 0.5622 | 0.5172 | 0.5065 | 0.5040 |
+| base-mingru | parity | log | 4 | 0 | 0.5163 | 0.5041 | 0.5032 | 0.5007 |
+| base-mingru | parity | log | 4 | 1 | 0.5204 | 0.5051 | 0.5037 | 0.5010 |
+| base-mingru | parity | log | 4 | 2 | 0.5125 | 0.5036 | 0.5004 | 0.5010 |
+| base-mingru | S3 | log | 1 | 0 | 0.2243 | 0.1822 | 0.1744 | 0.1711 |
+| base-mingru | S3 | log | 1 | 1 | 0.2296 | 0.1819 | 0.1742 | 0.1706 |
+| base-mingru | S3 | log | 1 | 2 | 0.2334 | 0.1832 | 0.1758 | 0.1704 |
+| base-mingru | S3 | log | 4 | 0 | 0.2093 | 0.1806 | 0.1721 | 0.1697 |
+| base-mingru | S3 | log | 4 | 1 | 0.2003 | 0.1748 | 0.1712 | 0.1686 |
+| base-mingru | S3 | log | 4 | 2 | 0.2549 | 0.1886 | 0.1783 | 0.1717 |
+
+Conclusions:
+
+1. The decoupled diagonal **fits S3 in-distribution and decays with
+   length**: signed-tanh L1 means 0.999 @64 -> 0.943/0.864/0.732
+   @256/512/1024. Depth does not rescue the shortcut (L4 mean 0.574
+   @1024, with high seed variance: 0.44-0.65). The old table's
+   "diagonals can't even fit S3" impression was an artifact of showing
+   only the coupled baseline.
+2. **Checkpoint selection does not rescue the coupled form at L=1**
+   (0.470 @64 mean): its fit failure is the parameterization, not the
+   protocol. Coupled L4 improves modestly over its early-stop record
+   (0.368 vs 0.347 @1024) without changing any conclusion.
+3. **Same-protocol control (the review's kill-shot check): rotation's
+   S3 win survives.** With every S3 minGRU row under best-val@128, the
+   best diagonal reaches 0.732 @1024 vs rotation's 0.958 — the win
+   attributes to the mechanism, not to checkpoint selection.
+4. **Base minGRU is measured at chance at L1 and L4 on both tasks**
+   (parity 0.516-0.542 @64 falling to ~0.50; S3 0.222-0.229 @64 falling
+   to ~0.17), closing the previously-unlogged "regardless of depth"
+   claim.
+
+The README's "What this shows" S3 table now quotes the `s3-diag-ckpt`
+rows with a per-row protocol column; the earlier early-stop coupled S3
+records (rounds 2 / `reseed-fix`) stay in `lab_results.jsonl` unchanged
+and are superseded in the README table by these same-protocol rows.

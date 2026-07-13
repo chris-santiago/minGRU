@@ -1107,10 +1107,13 @@ class RotationMinGRU(DecayMixin, nn.Module):
     training length (e.g. T=128 when training at T=64; not one of the
     eventual test lengths), evaluated over the full step budget instead
     of early-stopping, plus a retry-on-flag rule: a best validation
-    score at that checkpoint length below 1.0 flags the run as failed
-    (this perfectly separated good from bad seeds in the recorded
-    evidence). See ``experiments/SUMMARY.md`` for the full protocol,
-    per-seed success rate, and mechanism verification.
+    score at that checkpoint length below 1.0 flags the run as failed.
+    The flag is one-directional: a sub-1.0 score reliably marks a bad
+    run, but a perfect checkpoint score does not guarantee exact length
+    generalization (in the recorded evidence every seed passed the
+    checkpoint yet most still decayed at the longest lengths). See
+    ``experiments/SUMMARY.md`` for the full protocol, per-seed success
+    rate, and mechanism verification.
 
     Excludes refuted experiment-loop mechanisms: no full orthogonality
     constraint (``ortho``), no grid-attraction regularizer (``reg``),

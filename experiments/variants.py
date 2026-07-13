@@ -27,7 +27,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from min_gru import linear_scan
+from min_gru import MinGRU, linear_scan
 from probes import (
     BATCH,
     D_MODEL,
@@ -277,6 +277,10 @@ class VariantTagger(nn.Module):
 
 # -------------------------------------------------------------- registry
 VARIANTS = {
+    # Base minGRU (log-space, positive eigenvalues): the expressivity
+    # floor quoted in the README. Imported from the promoted module
+    # rather than re-implemented here.
+    "log": lambda d_in, d_h: MinGRU(d_in, d_h),
     "signed-coupled": lambda d_in, d_h: VariantSignedMinGRU(d_in, d_h, "coupled"),
     "signed-tanh": lambda d_in, d_h: VariantSignedMinGRU(d_in, d_h, "tanh"),
     "signed-hardtanh": lambda d_in, d_h: VariantSignedMinGRU(d_in, d_h, "hardtanh"),
