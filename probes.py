@@ -10,6 +10,19 @@ Tasks (seq2seq tagging, dense supervision as in Merrill et al. 2024):
                          commutative (diagonal) scans of ANY sign should
                          fail at one layer, while a GRU encodes the
                          6-state automaton directly.
+  S3-hier             : like S3, but the running product is over
+                         GENERATORS PER PAIR of sub-tokens rather than
+                         per sub-token: neither sub-token in a pair
+                         determines the generator alone (a fixed
+                         non-additive Latin-square lookup gives uniform
+                         marginals over both), so a single-layer mixer
+                         must both extract the pair's generator AND
+                         compose it non-commutatively. Tests whether
+                         depth buys the hierarchical (pair -> generator)
+                         feature a single-layer mixer of any kind lacks,
+                         via a heterogeneous stack (signed feature layer
+                         extracting the pair, rotation layer composing
+                         it); see minGRU-hetero-sr/-rs in MIXER_REGISTRY.
   session-parity      : running XOR that RESETS at session boundaries
                          (an inter-event gap exceeding
                          SESSION_GAP_THRESHOLD). Demonstrates the decay
@@ -36,17 +49,26 @@ Tasks (seq2seq tagging, dense supervision as in Merrill et al. 2024):
 Train at T=64; evaluate at T=64 (in-dist) and T=256 (length gen).
 
 Usage: python probes.py TASK MODEL [N_LAYERS]
-       TASK in {parity, S3, session-parity, parity-timestamped}; MODEL
-       in {GRU, minGRU, minGRU-signed, minGRU-signed-tanh,
+       TASK in {parity, S3, S3-hier, session-parity, parity-timestamped};
+       MODEL in {GRU, minGRU, minGRU-signed, minGRU-signed-tanh,
        minGRU-signed-tanh-tdecay, minGRU-signed-tanh-tdecay-mech,
-       minGRU-rotsnap} (GRU is not valid for the two timestamped tasks:
-       it has no delta_t input path); N_LAYERS defaults to 1 (applies to
-       all models).
+       minGRU-rotsnap, minGRU-hetero-sr, minGRU-hetero-rs,
+       minGRU-rotation2} (GRU is not valid for the two timestamped tasks:
+       it has no delta_t input path); N_LAYERS defaults to 1 for
+       single-mixer models. The three list-mixer models
+       (minGRU-hetero-sr/-rs, minGRU-rotation2) fix N_LAYERS to their
+       mixer list's length (2); omit N_LAYERS for those or pass the
+       matching value -- an explicit conflicting value raises
+       ValueError. minGRU-rotation2 (two rotation blocks) is the known
+       STE-compounding broken baseline -- constructing it emits exactly
+       one UserWarning (see MinGRUStack).
        MAX_STEPS env var overrides the training budget (default 1600).
        CKPT=1 replaces early-stop with best-checkpoint selection by
        validation accuracy at T=128 (seed 5, n_batches=2), evaluated
        every EVAL_EVERY steps over the full step budget; off by default
-       so legacy early-stop rows stay reproducible.
+       so legacy early-stop rows stay reproducible. Rows containing a
+       rotation block (minGRU-rotsnap, minGRU-hetero-sr, minGRU-hetero-rs,
+       minGRU-rotation2) are validated only under this protocol.
 """
 
 import os
@@ -102,6 +124,27 @@ MIXER_REGISTRY = {
         {"decay": "learnable", "log1p_delta": True, "decay_rate": 0.05},
     ),
     "minGRU-rotsnap": ("rotation", {}),
+    # Heterogeneous stacks (spec section 6, Task 1's MinGRUStack list-mixer
+    # contract): one signed (decoupled tanh, default kwargs -- same config
+    # as minGRU-signed-tanh) block and one rotation block (default snap
+    # grid, mirroring minGRU-rotsnap's config) in a 2-layer stack, in each
+    # order. mixer_kwargs=None: the list-mixer schema applies every type's
+    # default kwargs (no per-type overrides needed here). Layer count is
+    # fixed to len(mixer) == 2 by the list-mixer N_LAYERS rule (see
+    # _resolve_n_layers) -- omit N_LAYERS or pass 2 explicitly.
+    "minGRU-hetero-sr": (["signed", "rotation"], None),
+    "minGRU-hetero-rs": (["rotation", "signed"], None),
+    # Broken-baseline reference for the hetero rows above: two rotation
+    # blocks, no signed block. Deliberate addition beyond spec section 6's
+    # two listed hetero rows (which does not name this row) -- added so
+    # the leg-A rotation x2 evidence cell quoted in the README has a
+    # runnable public path through the committed registry, rather than
+    # only existing via a scratch script's temporary MIXER_REGISTRY entry.
+    # mixer_kwargs=None mirrors the hetero rows' rotation entry (default
+    # snap grid, same as minGRU-rotsnap); constructing this row emits the
+    # multi-rotation UserWarning by design (Task 1's MinGRUStack contract)
+    # -- expected, not suppressed.
+    "minGRU-rotation2": (["rotation", "rotation"], None),
 }
 
 # Model names whose TimestampedMinGRUTagger skips the fairness-rule
@@ -154,6 +197,129 @@ def make_s3(batch, T, gen):
     state = torch.zeros(batch, dtype=torch.long)  # identity
     for t in range(T):
         state = COMPOSE[x[:, t], state]  # g_t o r_{t-1}
+        y[:, t] = state
+    return x, y
+
+# ------------------------------------------------------------- S3-hier
+# S3-hier (spec section 6): each token is one of 6 sub-tokens ({0..5});
+# consecutive sub-token PAIRS each select a generator via a fixed 6x6
+# Latin-square lookup, which is then composed onto the running S3
+# product -- so, unlike S3 above (one sub-token = one generator), a
+# single sub-token never determines the generator alone. Dense labels
+# update only when a pair completes (odd position); even positions (mid-
+# pair, no completed pair yet) carry the previous composition, identity
+# before the first completed pair. Chance level ~= 1/6.
+#
+# LATIN is a fixed, hard-coded Latin square -- NOT COMPOSE (S3's own
+# Cayley table), and not isotopic to ANY group's Cayley table.
+#
+# An earlier version of this constant reused COMPOSE directly. That was
+# insufficient: COMPOSE is (trivially) isotopic to S3 itself, and a
+# rotation layer's per-token angle assignment (linear_theta is a LEARNED
+# linear map of the input embedding, i.e. a free relabeling of which
+# sub-token maps to which angle) gives it exactly the relabeling freedom
+# an isotopy allows -- row permutation (relabel row-sub-tokens),
+# column permutation (relabel column-sub-tokens), and symbol permutation
+# (relabel which S3 element each snap angle represents). So a pair
+# function isotopic to ANY group of the state-tracking task's order is
+# partially representable by one rotation layer via that relabeling, not
+# just a literal-index additive one (the narrower condition
+# `_has_additive_violation` below checks). This was confirmed
+# empirically: LATIN = COMPOSE let L=1 rotsnap reach 0.377 accuracy on
+# S3-hier, well above chance (1/6 ~= 0.167).
+#
+# Order 6 has exactly two groups up to isomorphism (Z6, the cyclic
+# group, and S3 ~= D3, the symmetric/dihedral group -- the standard
+# classification of small groups), and RotationMinGRU's snap grid
+# (2, 3, 4, 6) realizes both cyclic (Z_K) and dihedral (D_K, including
+# D3 ~= S3) subgroups of O(2) -- see RotationMinGRU's docstring. So the
+# correct diagnostic requirement is that LATIN be isotopic to NEITHER
+# group: no row permutation f, column permutation g, symbol permutation
+# h with LATIN[i][j] == h(G[f(i)][g(j)]) for G in {Z6, S3}. This is
+# exactly the (informal) "quadrangle criterion" for Latin-square/group
+# isotopy, specialized to order 6 where only two group isomorphism
+# classes exist to rule out.
+#
+# Verified OFFLINE (not at import time -- an exhaustive isotopy search
+# is O(6!^2) per candidate group, too expensive to repeat on every
+# import): generated via 300 random "intercalate swaps" from the Z6
+# addition table (a swap of the two values in a 2x2 checkerboard
+# sub-block preserves the Latin property but is NOT an isotopy -- unlike
+# row/col/symbol relabeling, which by definition stays inside one
+# isotopy class, intercalate swaps can and typically do land outside the
+# two group-isotopy classes; order 6 has 22 Latin-square isotopy classes
+# total, only 2 of which are group-based). The resulting square was
+# confirmed NOT isotopic to Z6's table and NOT isotopic to COMPOSE (S3's
+# table) via brute-force isotopy search over all row/column permutations
+# with a consistency-checked symbol map (script:
+# generate_latin.py, kept out of the repo per this task's scratch-only
+# constraint). It also still violates the cheaper, narrower additive
+# check below (`_has_additive_violation`), which is retained as a fast
+# import-time sanity check but is not sufficient on its own (see above).
+LATIN = torch.tensor(
+    [
+        [3, 4, 5, 0, 1, 2],
+        [4, 2, 3, 1, 5, 0],
+        [2, 3, 4, 5, 0, 1],
+        [0, 1, 2, 3, 4, 5],
+        [1, 5, 0, 4, 2, 3],
+        [5, 0, 1, 2, 3, 4],
+    ]
+)
+
+
+def _is_latin_square(table):
+    """True iff every row and column of ``table`` is a permutation of
+    ``range(6)`` -- neither sub-token in a pair informs the selected
+    generator alone (uniform marginals)."""
+    six = list(range(6))
+    rows_ok = all(sorted(table[i].tolist()) == six for i in range(6))
+    cols_ok = all(sorted(table[:, j].tolist()) == six for j in range(6))
+    return rows_ok and cols_ok
+
+
+def _has_additive_violation(table):
+    """True iff some cell breaks ``table[i][j] == (table[i][0] +
+    table[0][j] - table[0][0]) % 6`` -- the additive form a single
+    rotation layer could represent exactly via angle addition. At least
+    one violation is required for S3-hier to be diagnostic of leg B
+    (spec section 6): an additive pair function would make the
+    hierarchical pair-composition task solvable by one rotation layer,
+    defeating the point of testing whether depth buys hierarchy."""
+    base = table[0][0].item()
+    return any(
+        table[i][j].item() != (table[i][0].item() + table[0][j].item() - base) % 6
+        for i in range(6)
+        for j in range(6)
+    )
+
+
+assert _is_latin_square(LATIN), (
+    "LATIN must be a Latin square (every row/column a permutation of "
+    "range(6)); S3-hier's diagnostic power depends on neither sub-token "
+    "informing the generator alone"
+)
+assert _has_additive_violation(LATIN), (
+    "LATIN must not be additively decomposable, or a single rotation "
+    "layer could solve the pair function by angle addition and S3-hier "
+    "would not be diagnostic of leg B"
+)
+
+
+def make_s3_hier(batch, T, gen):
+    """S3-hier generator (see module comment above): sub-tokens
+    ``x in {0..5}``; pair ``(x[2k], x[2k+1])`` selects generator
+    ``g = LATIN[x[2k], x[2k+1]]``, composed onto the running S3 product
+    once the pair completes. Dense labels: even ``t`` (mid-pair) carries
+    the previous composition (identity before the first completed
+    pair); odd ``t`` is the just-updated composition."""
+    x = torch.randint(0, 6, (batch, T), generator=gen)
+    y = torch.zeros(batch, T, dtype=torch.long)
+    state = torch.zeros(batch, dtype=torch.long)  # identity
+    for t in range(T):
+        if t % 2 == 1:
+            g = LATIN[x[:, t - 1], x[:, t]]
+            state = COMPOSE[g, state]  # g o state, mirroring make_s3
         y[:, t] = state
     return x, y
 
@@ -234,6 +400,7 @@ def make_parity_timestamped(batch, T, gen):
 TASKS = {
     "parity": (make_parity, 2, 2),
     "S3": (make_s3, 6, 6),
+    "S3-hier": (make_s3_hier, 6, 6),
     "session-parity": (make_session_parity, 2, 2),
     "parity-timestamped": (make_parity_timestamped, 2, 2),
 }
@@ -336,13 +503,60 @@ class TimestampedMinGRUTagger(nn.Module):
         return self.head(out)
 
 
-def build(task, name, vocab, n_cls, n_layers=1):
+def _resolve_n_layers(mixer, n_layers):
+    """Resolve a registry row's ``n_layers`` against its ``mixer`` spec
+    (spec section 4/section 6: list-mixer N_LAYERS conflict rule).
+
+    A list-mixer row (``minGRU-hetero-sr``/``-rs``) fixes the layer
+    count to ``len(mixer)``: omitting ``n_layers`` (``None``, the CLI
+    default) defers to that length; an explicit value that matches is a
+    no-op; an explicit value that conflicts raises ``ValueError``. A
+    single-mixer (``str``) row is unconstrained -- ``n_layers`` defaults
+    to 1 when omitted, any explicit value passes through unchanged
+    (prior behavior, bit-identical).
+
+    Parameters
+    ----------
+    mixer : str or list of str
+        The registry row's mixer spec (``MIXER_REGISTRY[name][0]``).
+    n_layers : int or None
+        Caller-supplied layer count, or ``None`` if omitted.
+
+    Returns
+    -------
+    int
+        The resolved layer count.
+
+    Raises
+    ------
+    ValueError
+        If ``mixer`` is a list and ``n_layers`` is given but does not
+        equal ``len(mixer)``.
+    """
+    if isinstance(mixer, list):
+        implied = len(mixer)
+        if n_layers is not None and n_layers != implied:
+            raise ValueError(
+                f"n_layers={n_layers} conflicts with list-mixer row "
+                f"mixer={mixer!r} (layer count is fixed at {implied}); "
+                f"omit n_layers or pass {implied} explicitly"
+            )
+        return implied
+    return 1 if n_layers is None else n_layers
+
+
+def build(task, name, vocab, n_cls, n_layers=None):
     """Construct a model for ``task``/``name`` (``vocab``/``n_cls`` from
     ``TASKS[task]``, ``n_layers`` blocks).
 
     ``timestamped = task in TIMESTAMPED_TASKS`` is derived internally
     (rather than taken as a caller-supplied bool) since ``task`` already
     determines it and every call site already has ``task`` in hand.
+
+    ``n_layers=None`` (the CLI default) defers to ``_resolve_n_layers``:
+    1 for single-mixer (``str``) rows and ``GRU``, the mixer list's
+    length for list-mixer rows; an explicit value that conflicts with a
+    list-mixer row's length raises ``ValueError``.
     """
     timestamped = task in TIMESTAMPED_TASKS
     if timestamped:
@@ -354,9 +568,10 @@ def build(task, name, vocab, n_cls, n_layers=1):
         if name not in MIXER_REGISTRY:
             raise ValueError(f"unknown model {name!r}; valid: {list(MIXER_REGISTRY)}")
         mixer, mixer_kwargs = MIXER_REGISTRY[name]
+        n_layers = _resolve_n_layers(mixer, n_layers)
         if name in MECHANICAL_ONLY_MODELS:
             delta_t_mode: DeltaTMode = "decay-only"
-        elif mixer_kwargs.get("decay") is not None:
+        elif (mixer_kwargs or {}).get("decay") is not None:
             delta_t_mode = "feature+decay"
         else:
             delta_t_mode = "feature"
@@ -369,11 +584,12 @@ def build(task, name, vocab, n_cls, n_layers=1):
             delta_t_mode=delta_t_mode,
         )
     if name == "GRU":
-        return GRUTagger(vocab, n_cls, n_layers)
+        return GRUTagger(vocab, n_cls, 1 if n_layers is None else n_layers)
     if name not in MIXER_REGISTRY:
         valid = ["GRU", *MIXER_REGISTRY]
         raise ValueError(f"unknown model {name!r}; valid: {valid}")
     mixer, mixer_kwargs = MIXER_REGISTRY[name]
+    n_layers = _resolve_n_layers(mixer, n_layers)
     return MinGRUTagger(vocab, n_cls, mixer, mixer_kwargs, n_layers=n_layers)
 
 
@@ -462,7 +678,7 @@ def lambda_summary(model):
     return LambdaSummary(max=all_lambda.max().item(), mean=all_lambda.mean().item())
 
 
-def run_one(task, name, n_layers=1, max_steps=MAX_STEPS, ckpt=None, seed=0):
+def run_one(task, name, n_layers=None, max_steps=MAX_STEPS, ckpt=None, seed=0):
     make, vocab, n_cls = TASKS[task]
     timestamped = task in TIMESTAMPED_TASKS
     # seed=0 reproduces the legacy manual_seed(0)/manual_seed(1) pair
@@ -479,6 +695,11 @@ def run_one(task, name, n_layers=1, max_steps=MAX_STEPS, ckpt=None, seed=0):
     torch.manual_seed(seed)
     gen = torch.Generator().manual_seed(1 + 10_000 * seed)
     model = build(task, name, vocab, n_cls, n_layers)
+    # Read back the model's actual layer count for logging: n_layers may
+    # have been None (CLI omitted) or a list-mixer row's implied value,
+    # either resolved inside build() -- this avoids re-deriving the same
+    # registry-lookup logic here just to print an accurate L=.
+    n_layers = model.rnn.num_layers if isinstance(model, GRUTagger) else len(model.stack.blocks)
     opt = torch.optim.Adam(model.parameters(), lr=LR)
     t0, steps_used = time.time(), max_steps
     # Checkpoint selection: rotation-snap's exact solution is reachable but
@@ -564,6 +785,18 @@ GRID = [
     ("session-parity", "minGRU-signed-tanh-tdecay-mech", 1, 1500, False),
     ("parity", "minGRU-rotsnap", 1, 1600, True),
     ("S3", "minGRU-rotsnap", 1, 1600, True),
+    # Heterogeneous stacks (leg A: does one rotation block survive depth
+    # inside a mixed stack, on the existing S3 task; leg B: does depth buy
+    # hierarchy, on the new S3-hier task). Rows containing a rotation
+    # block run CKPT (best-val@128); the pure-signed L=2 row and GRU keep
+    # early-stop. n_layers=2 matches both hetero rows' fixed list length.
+    ("S3", "minGRU-hetero-sr", 2, 1600, True),
+    ("S3", "minGRU-hetero-rs", 2, 1600, True),
+    ("S3", "minGRU-rotation2", 2, 1600, True),
+    ("S3-hier", "GRU", 1, 1600, False),
+    ("S3-hier", "minGRU-signed-tanh", 2, 1600, False),
+    ("S3-hier", "minGRU-rotsnap", 1, 1600, True),
+    ("S3-hier", "minGRU-hetero-sr", 2, 1600, True),
 ]
 
 
@@ -586,4 +819,4 @@ if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "all":
         run_grid()
     else:
-        run_one(sys.argv[1], sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else 1)
+        run_one(sys.argv[1], sys.argv[2], int(sys.argv[3]) if len(sys.argv) > 3 else None)
