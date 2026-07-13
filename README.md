@@ -511,16 +511,10 @@ best-seed headline. Per the mechanism verification in
 contains a D3 representation readable off its weights; failed seeds
 are simply less exact, not missing the mechanism.
 
-An earlier run of this evidence (before a train/eval generator-seeding
-fix in `experiments/variants.py` — see `experiments/EXPERIMENTS.md`)
-reported 2 of 8 seeds exact, with every non-exact seed also flagged by
-best-val@128 < 1.0 ("perfectly separated good from bad seeds"). That
-flagging property does not replicate under the corrected seeding: all
-8 seeds above reach val@128 = 1.0, including the 7 that are not exact
-at length. Best-val@128 < 1.0 is still worth retrying when it occurs,
-but — per this re-validation — it is not a sufficient pass/fail check
-on its own; confirm length generalization directly rather than relying
-on the flag alone. Budget for retries when reproducing this variant.
+The flag is therefore one-directional: best-val@128 < 1.0 reliably
+means retry, but the flag passing does **not** certify exactness at
+length — confirm length generalization directly rather than relying on
+the flag alone, and budget for retries when reproducing this variant.
 
 **Alternatives tried and dropped.** Three other fixes were tested and
 abandoned: a full orthogonality constraint on the transition matrices,
