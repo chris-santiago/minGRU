@@ -113,13 +113,13 @@ the "vanilla" minGRU in the paper's Appendix A.
 
 | class / fn | role |
 |---|---|
-| `MinGRU` | one scan layer (log-space, positive states, `a_t ∈ (0,1)`); parallel `forward`, recurrent `step` |
-| `SignedMinGRU` | signed diagonal transitions (linear-space scan, `a_t ∈ (−1,1)`, unconstrained states); `coupled=False` (default, decoupled eigenvalue) or `coupled=True` (legacy reproduction); same API |
-| `RotationMinGRU` | 2x2 block rotation transitions (non-diagonal, matrix scan); `snap` grid manufactures exact-angle attractors; validated at `L=1` only; same API |
+| `MinGRU` | one scan layer (log-space, positive states, `a_t ∈ (0,1)`); parallel `forward`, recurrent `step`; optional time-decay (`decay=`, `decay_rate=`, `log1p_delta=`) scales `a_t` only — see "Time-aware decay" |
+| `SignedMinGRU` | signed diagonal transitions (linear-space scan, `a_t ∈ (−1,1)`, unconstrained states); `coupled=False` (default, decoupled eigenvalue) or `coupled=True` (legacy reproduction); same API; same time-decay kwargs as `MinGRU` |
+| `RotationMinGRU` | 2x2 block rotation transitions (non-diagonal, matrix scan); `snap` grid manufactures exact-angle attractors; validated at `L=1` only; same API; same time-decay kwargs, scaling the whole 2x2 block (direction unaffected) |
 | `linear_scan` | Hillis–Steele associative scan for `h_t = a_t·h_{t−1} + b_t` with signed scalar coefficients |
 | `matrix_scan` | Hillis–Steele associative scan for `h_t = M_t @ h_{t−1} + b_t` with 2x2 matrix coefficients (non-commutative composition) |
-| `MinGRUBlock` | pre-norm residual block: LN → mixer → +x, LN → MLP → +x (`mixer` selects `"log"`, `"signed"`, or `"rotation"`; `mixer_kwargs` forwarded to its constructor) |
-| `MinGRUStack` | input projection → N blocks → final LN; full state threading; same `mixer=`/`mixer_kwargs` applied to every block |
+| `MinGRUBlock` | pre-norm residual block: LN → mixer → +x, LN → MLP → +x (`mixer` selects `"log"`, `"signed"`, or `"rotation"`; `mixer_kwargs` forwarded to its constructor); `forward`/`step` take an optional `delta_t`, forwarded to the block's mixer unchanged |
+| `MinGRUStack` | input projection → N blocks → final LN; full state threading; same `mixer=`/`mixer_kwargs` applied to every block; `decay_layers="all"` (default) or `"last"` selects which blocks receive the mixer_kwargs' decay keys; `forward`/`step` take an optional `delta_t`, routed only to blocks whose mixer has decay enabled |
 
 `MinGRU` is deliberately atomic. A single layer's gates cannot condition on
 accumulated state (that is the parallelism trade); stacking recovers
@@ -256,7 +256,12 @@ parity at any depth.
 go negative: multiply the memory by −1 and it flips sign.
 Even-versus-odd is now trivial — flip on every 1, hold on every 0,
 read the sign at the end. The new capability is alternation: state
-that oscillates and cancels instead of only decaying. The subtlety the
+that oscillates and cancels instead of only decaying. ("Time-aware
+decay," below, is a different axis entirely: it makes the fading of
+rung 1 time-continuous — gated by the real-world gap between events
+rather than by token count — and it composes with every rung above,
+scaling how fast existing memory fades between events without adding
+a new capability of its own.) The subtlety the
 experiments surfaced is that *reachable in principle* isn't enough —
 the −1 has to be a place training naturally settles. That is why the
 default parameterization matters: `tanh` saturates at exactly −1,
@@ -500,6 +505,188 @@ depth in pure torch ops, same tradeoff as `linear_scan`. Numerical
 agreement vs. the sequential path is covered in "Implementation notes,"
 above.
 
+## Time-aware decay
+
+Every mixer above assumes evenly-spaced steps: one update per token,
+no notion of how much real time elapsed between events. `decay=` adds
+an optional per-event forgetting term so a gap between events shrinks
+whatever the recurrence was already going to keep, without touching
+how it injects new information. Available on `MinGRU`, `SignedMinGRU`,
+and `RotationMinGRU` alike, and threaded through `MinGRUBlock` /
+`MinGRUStack`.
+
+**Mechanism.** Each step's transition coefficient is scaled by
+`gamma = exp(-lambda * f(delta_t))`, where `lambda >= 0` is a per-
+channel (per-block, for `RotationMinGRU`) decay rate and `f` is
+identity or `log1p`. `gamma` multiplies the transition only —
+injection (`b_t`, the new information entering at this step) is never
+decayed, in every mixer:
+
+- `MinGRU` (log-space): additive in log-space —
+  `log(gamma * (1 - z_t)) = log(1 - z_t) - lambda * f(delta_t)` — no
+  new `exp`/`log` round-trip.
+- `SignedMinGRU`: `gamma * a_t` (the signed diagonal transition).
+- `RotationMinGRU`: `gamma * M_t` — decay scales the whole 2x2 block
+  by a positive scalar, so the snapped rotation angle is recovered
+  unchanged from the decayed matrix; only amplitude is affected
+  (direction/amplitude separation, unaffected by decay).
+
+Because `lambda >= 0` and `delta_t >= 0`, `gamma` is always in `(0,
+1]` — decay can only shrink the transition, never amplify it.
+
+**The `delta_t` contract.** `delta_t` is `(B, T)` or `(B, T, 1)` to
+`forward` (squeezed internally), `(B,)` or `(B, 1)` to `step`.
+`delta_t[:, t]` is the gap *preceding* event `t`. `delta_t = 0` gives
+`gamma = 1` exactly — no discount — and this holds at every position,
+**including `t = 0`**: there is no implicit "first event is exempt
+from decay" special case (see migration deviations, below); callers
+who want no decay at the start of a sequence pass `delta_t[:, 0] = 0`
+themselves. Negative entries are clamped to `0` with a
+once-per-module-instance warning (a data-quality event, not a hard
+error). `log1p_delta=True` applies `log1p` before scaling by `lambda`
+— useful when raw gaps span orders of magnitude, compressing the
+range `lambda` needs to operate over. Passing `delta_t` with decay
+disabled, or enabling decay without passing `delta_t`, both raise
+`ValueError` at call time.
+
+**Two modes**, set via `decay=`:
+
+- `"fixed"`: `lambda = decay_rate`, a scalar buffer, uniform across
+  channels/blocks — not learned.
+- `"learnable"`: `lambda = softplus(rho)`, one `rho` per hidden
+  channel (`MinGRU`/`SignedMinGRU`) or per block (`RotationMinGRU`);
+  `rho` is initialized so `lambda == decay_rate` exactly at
+  construction (`decay_rate` is then an *init* value, not a fixed
+  constant).
+
+**`decay_layers`** (stack-level, `MinGRUStack(..., decay_layers=...)`):
+`"all"` (default) applies the decay keys in `mixer_kwargs` to every
+block uniformly; `"last"` strips them from every block but the final
+one, reproducing the reference `TimeAwareGRU`'s last-layer-only
+default. Any other string raises `ValueError` at construction.
+`delta_t` passed to a stack's `forward`/`step` is routed only to
+blocks whose mixer has decay enabled; if no block in the stack decays,
+passing `delta_t` raises `ValueError`.
+
+**Migration deviations from the reference `TimeAwareGRU` pattern**
+this was adapted from:
+
+1. **`softplus` on the rate parameter itself, not a `relu` projection
+   of `delta_t`.** The reference computes the rate as
+   `relu(decay_proj(delta_t))`. `softplus(decay_proj(0))` would be
+   strictly positive, decaying even at zero gap and violating the
+   `delta_t = 0 => gamma = 1` contract; `relu` has the module's own
+   documented dead-gradient problem (see `log_g` in "Implementation
+   notes"). Resolution: `softplus` on a plain learnable rate
+   (`lambda = softplus(rho)`), not on any function of `delta_t`.
+2. **No `t = 0` exemption.** The reference exempts the first event
+   from decay as a special case; this module doesn't need to — the
+   `delta_t[:, 0] = 0` convention already gives `gamma = 1` there for
+   a true sequence start, and *not* special-casing position 0 is what
+   keeps chunked-vs-full equivalence exact (an absolute-position
+   exemption would have to know which chunk is the first one).
+3. **`decay_layers` defaults to `"all"`,** decaying every block
+   uniformly, rather than the reference's last-layer-only default;
+   `"last"` reproduces that reference default when wanted.
+
+```python
+from min_gru import MinGRUStack
+import torch
+
+stack = MinGRUStack(
+    input_size=32, d_model=64, n_layers=2, mixer="signed",
+    mixer_kwargs={"decay": "learnable", "decay_rate": 0.05, "log1p_delta": True},
+)
+x = torch.randn(8, 100, 32)                    # (B, T, input_size)
+delta_t = torch.rand(8, 100).clamp(min=0.01)   # gap preceding each event
+delta_t[:, 0] = 0                              # true sequence start
+y, state = stack(x, delta_t=delta_t)           # (B, T, 64), per-block states
+```
+
+### Does the decay mechanism add anything beyond a `delta_t` feature?
+
+`delta_t` can reach a model two ways: as an appended input **feature**
+(`log1p(delta_t)` concatenated onto the token embedding, available to
+every model) or **mechanically** (consumed by a mixer's decay path,
+scaling its transition). `session-parity` (a running-XOR task that
+resets at session boundaries — gaps well above a threshold, vs. gaps
+well below it within a session) isolates the two channels under a
+fairness rule: every model gets the feature; only decay-enabled rows
+additionally get the mechanism. Three probe rows form a **channel
+ablation**, not a head-to-head model comparison: feature channel only
+(`minGRU-signed-tanh`), mechanism channel only
+(`minGRU-signed-tanh-tdecay-mech`), and both channels together
+(`minGRU-signed-tanh-tdecay`).
+
+Protocol: seq2seq tagging, `T_train=64`, budget <=1500 steps,
+early-stop at 99.9% train-length accuracy (the same protocol as the
+other signed-tanh rows), 3 seeds (0, 1, 2), `decay="learnable"` at
+`decay_rate=0.05` init, `log1p_delta=True`.
+
+| task | model (channel) | seeds | acc@64 | acc@256 | steps to early-stop |
+|---|---|---|---|---|---|
+| session-parity | both channels (`minGRU-signed-tanh-tdecay`) | 3 | 1.0000 | 0.9979 | 233 (avg) |
+| session-parity | feature channel only (`minGRU-signed-tanh`) | 3 | 0.9980 | 0.9929 | 600 (avg) |
+| session-parity | mechanism channel only (`minGRU-signed-tanh-tdecay-mech`) | 3 | 0.9713 | 0.9470 | never (full 1500-step budget, every seed) |
+
+**Both channels beats feature-only cleanly and consistently**: acc@256
+is non-overlapping across every seed pairing (both-channels range
+[0.9975, 0.9985] vs. feature-only's [0.9903, 0.9967]), converges to
+the early-stop threshold ~2.6x faster on average (233 vs. 600 steps),
+and reaches a ~3.4x lower error rate (0.21% vs. 0.71%). The learned
+rate also lands in a consistent, narrow band across seeds (mean
+0.0524-0.0534) — the mechanism settles on a timescale that separates
+the within-session gap range (`[0.1, 1.0]`) from the boundary range
+(`[50, 100]`) rather than drifting seed-to-seed. Read the accuracy gap
+as the decay mechanism adding value **on top of** the `delta_t`
+feature — the both-channels row also carries extra per-channel rate
+parameters, so this isn't the mechanism in isolation.
+
+**Isolating the mechanism channel alone tells the opposite story**: it
+loses to the feature-only channel on both accuracy axes (acc@64 0.9713
+vs. 0.9980, acc@256 0.9470 vs. 0.9929) and never reaches the
+early-stop threshold within the standard 1500-step budget. A 4x-budget
+check (6000 steps, same 3 seeds) narrows the gap — acc@256 rises to a
+0.9750 mean — but doesn't close it and still never early-stops; the
+deficit looks structural, not simply an artifact of under-training.
+Removing the feature channel doesn't change the qualitative recovery-
+check picture either (below) — the mechanism-only row's behavior there
+tracks the both-channels row closely.
+
+Read the two comparisons together: **the feature and mechanism
+channels are complementary, not substitutable.** The feature channel
+does most of the work in the both-channels win; the mechanism channel
+adds a separately-measurable, smaller improvement on top of it, rather
+than standing in for it.
+
+### Recovery check: does an unhelpful decay rate anneal away?
+
+On plain parity — a task that never needs a reset, but with the exact
+`delta_t` distribution from session-parity supplied anyway — a
+well-behaved decay mechanism should settle near "don't decay." This
+checks that half, plus whether accuracy actually recovers to the
+non-decay level (same protocol/seeds as above; `steps` omitted below
+since both rows converge in <=100 steps):
+
+| task | model | seeds | acc@64 | acc@256 | lambda mean |
+|---|---|---|---|---|---|
+| parity-timestamped | both channels (`minGRU-signed-tanh-tdecay`) | 3 | 0.9996 | 0.7855 | 0.0499 |
+| parity | non-decay comparison (`minGRU-signed-tanh`) | 3 | 1.0000 | 1.0000 | n/a |
+
+The learned rate does stay near its low `0.05` init (mean 0.0499, not
+drifting toward heavier decay) — the qualitative half of the recovery
+check holds. Accuracy does **not** fully recover: a ~21-point acc@256
+gap remains (0.7855 vs. 1.0000). Cause: `log1p` of a boundary-scale gap
+(`delta_t` in `[50, 100]`) is already ~4-4.6, so even at
+`lambda ≈ 0.05`, `gamma ≈ exp(-0.05 * 4.3) ≈ 0.81` per boundary-scale
+event — and session-parity's distribution puts roughly a dozen such
+gaps into a 256-step sequence, compounding to a large state loss by
+T=256 even though `lambda` looks small in isolation. Practical
+consequence: `decay_rate` (or its learnable init) is a real
+hyperparameter, not a knob training reliably anneals to zero on its
+own when a task doesn't need decay — pick it with the task's actual
+gap distribution in mind.
+
 ## Reproducing
 
 `probes.py` tests the ladder empirically on the two word problems
@@ -512,10 +699,16 @@ shortcut for the training length."
 
 ```
 python probes.py TASK MODEL [N_LAYERS]
-# TASK      in {parity, S3}
-# MODEL     in {GRU, minGRU, minGRU-signed, minGRU-signed-tanh, minGRU-rotsnap}
+# TASK      in {parity, S3, session-parity, parity-timestamped}
+#           (the last two supply delta_t -- see "Time-aware decay"; GRU has no
+#            delta_t input path and raises ValueError on them)
+# MODEL     in {GRU, minGRU, minGRU-signed, minGRU-signed-tanh,
+#            minGRU-signed-tanh-tdecay, minGRU-signed-tanh-tdecay-mech, minGRU-rotsnap}
 #           (minGRU-signed is pinned to coupled=True: the legacy parameterization,
-#            kept under its historical name so recorded rows keep their meaning)
+#            kept under its historical name so recorded rows keep their meaning;
+#            the two -tdecay rows are decay="learnable" at decay_rate=0.05,
+#            log1p_delta=True -- -mech skips the delta_t feature concat, see
+#            "Time-aware decay")
 # N_LAYERS  defaults to 1; RotationMinGRU (minGRU-rotsnap) is validated at L=1 only
 # MAX_STEPS env var overrides the training budget (default 1600)
 # CKPT=1    env var replaces early-stop with best-val@128 checkpoint selection --
@@ -528,6 +721,7 @@ Single-cell examples:
 ```
 MAX_STEPS=200 python probes.py parity minGRU-signed     # legacy coupled reproduction
 CKPT=1 python probes.py S3 minGRU-rotsnap                # protocol-correct rotation-snap run
+python probes.py session-parity minGRU-signed-tanh-tdecay   # time-aware decay channel ablation
 ```
 
 A smoke-test grid covering the ladder (single seed per cell — the
