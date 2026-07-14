@@ -53,6 +53,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from min_gru import RotationMinGRU
+from min_gru import GivensMinGRU as _PromotedGivensMinGRU
+from min_gru import matrix_affine_scan as _promoted_matrix_affine_scan
 from probes import (
     BATCH, CKPT_T, D_MODEL, EVAL_EVERY, LR, T_TRAIN, TASKS, accuracy, build,
 )
@@ -310,6 +312,57 @@ def _selftest_givens():
     for name, p in m.named_parameters():
         assert p.grad is not None and torch.isfinite(p.grad).all(), name
     print("givens shapes/grads ok")
+
+
+def _selftest_bridge():
+    """Bit-identity bridge: min_gru.GivensMinGRU (promoted, default flags
+    bias=True, block_size=8, rounds=3, decay=None) must be exactly this
+    module's frozen lab GivensMinGRU -- same seed gives identical
+    state_dict tensors and identical forward outputs (exact equality,
+    not tolerance). This is the provenance seam (intent ledger stmt 4)
+    that carries the recorded n=12 pooled evidence, gathered against the
+    lab class, onto the promoted class without rerunning the campaign.
+    """
+    seed = 23
+    B, T, d = 3, 13, 64
+    torch.manual_seed(seed)
+    lab = GivensMinGRU(d, d, block_size=8, rounds=3)
+    torch.manual_seed(seed)
+    promoted = _PromotedGivensMinGRU(d, d, block_size=8, rounds=3)
+
+    lab_sd, promoted_sd = lab.state_dict(), promoted.state_dict()
+    assert lab_sd.keys() == promoted_sd.keys(), (
+        f"state_dict key mismatch: lab-only={sorted(lab_sd.keys() - promoted_sd.keys())}, "
+        f"promoted-only={sorted(promoted_sd.keys() - lab_sd.keys())}"
+    )
+    for name, lab_tensor in lab_sd.items():
+        assert torch.equal(lab_tensor, promoted_sd[name]), (
+            f"state_dict tensor mismatch on {name!r}: same seed drew different "
+            "values -- RNG draw order/shape has diverged from the lab class"
+        )
+
+    torch.manual_seed(seed + 1)
+    x = torch.randn(B, T, d)
+    y_lab, y_promoted = lab(x), promoted(x)
+    assert torch.equal(y_lab, y_promoted), (
+        "forward outputs differ at default flags despite identical state_dict"
+    )
+
+    # matrix_affine_scan: the shared scan primitive underneath GivensMinGRU,
+    # checked directly on random inputs (not just indirectly via the class
+    # forward above).
+    n, k, v = 4, 8, 1
+    A = torch.randn(B, T, n, k, k)
+    Bm = torch.randn(B, T, n, k, v)
+    Abar_lab, Bbar_lab = matrix_affine_scan(A, Bm)
+    Abar_promoted, Bbar_promoted = _promoted_matrix_affine_scan(A, Bm)
+    assert torch.equal(Abar_lab, Abar_promoted), "matrix_affine_scan Abar mismatch"
+    assert torch.equal(Bbar_lab, Bbar_promoted), "matrix_affine_scan Bbar mismatch"
+
+    print(
+        "bridge: promoted min_gru.GivensMinGRU/matrix_affine_scan bit-identical "
+        "to the frozen lab class (state_dict + outputs + scan) ok"
+    )
 
 
 # variants.py factories plus this lab's parallel-scan mixers
@@ -642,6 +695,7 @@ def main():
     if args.selftest:
         _selftest_delta_scan()
         _selftest_givens()
+        _selftest_bridge()
         return
     if not args.round:
         p.error("--round is required (unless --selftest)")
