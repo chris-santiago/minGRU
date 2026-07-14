@@ -115,13 +115,19 @@ exact solution in 1600 steps" ≠ "cannot"). The minGRU wrappers also
 include a block MLP that the `GRU` baseline lacks, which favors the
 minGRU variants — this strengthens their negative results (chance-level
 despite the extra capacity) and mildly weakens attribution of their
-positive ones. Finally, every comparison here is internal — against the
-repo's own floor (base `MinGRU`), its prior parameterization
-(`coupled=True`), or its ceiling (`torch.nn.GRU`). None of the published
-mechanisms these variants reimplement (a Grazzi-style negative-eigenvalue
-scan, DeltaNet/DeltaProduct) is run as a baseline, so the positive
-results establish "reproduces the predicted behavior, minGRU-natively,"
-not "competitive with the incumbents."
+positive ones. Finally, every comparison in the table above is
+internal — against the repo's own floor (base `MinGRU`), its prior
+parameterization (`coupled=True`), or its ceiling (`torch.nn.GRU`). A
+Grazzi-style negative-eigenvalue scan is not run as a baseline anywhere
+in this repo. DeltaNet/DeltaProduct's transition rule is compared, but
+as a mechanism-level reimplementation under this repo's protocol, not
+their released code — see "Incumbent comparison (mechanism-level)"
+under "Rotation variant," below. So the table above establishes
+"reproduces the predicted behavior, minGRU-natively," not "competitive
+with the incumbents"; the incumbent-comparison subsection is the one
+place in this README that compares a published mechanism directly, and
+even there it is transition-rule-vs-transition-rule under one protocol,
+not a claim about the incumbents' released systems.
 
 ## Model
 
@@ -489,10 +495,12 @@ reflections compose to a rotation) and demonstrate group state
 tracking including dihedral tasks. What is specific to this variant is
 the fixed 2x2 planar-block parameterization with an explicit angle
 head, the STE snap grid that manufactures attractors at exact group
-angles, and the weights-level homomorphism certificate. No head-to-head
-comparison against DeltaProduct/DeltaNet has been run here (see
-`experiments/SUMMARY.md`, Open work) — treat this as a minGRU-native
-take on their mechanism, not a claimed improvement over it.
+angles, and the weights-level homomorphism certificate. Their
+transition rule is compared here at the mechanism level — see
+"Incumbent comparison (mechanism-level)," below — but no comparison
+against their released code or published numbers has been run; treat
+this variant as a minGRU-native take on their mechanism, not a claimed
+improvement over it.
 
 **Angle snapping (`snap`).** With `snap` set (default `(2, 3, 4, 6)`,
 cycled across blocks), `theta_t` is quantized per block to an exact
@@ -655,6 +663,70 @@ The flag is therefore one-directional: best-val@128 < 1.0 reliably
 means retry, but the flag passing does **not** certify exactness at
 length — confirm length generalization directly rather than relying on
 the flag alone, and budget for retries when reproducing this variant.
+
+**Incumbent comparison (mechanism-level).** The DeltaNet (Yang et al.)
+/ DeltaProduct (Siems et al., NeurIPS 2025) transition rule is
+reimplemented as a lab mixer, `DeltaNetMixer` in
+`experiments/variants.py`: `nh=1` (`"deltanet"`, a single Householder
+reflection per token) and `nh=2` (`"deltaproduct2"`, two reflections
+per token, composing to a rotation). This is a reimplementation of the
+transition rule, not their released code (Triton/CUDA, a different
+training stack that does not run in this repo's CPU-only environment),
+measured under the same protocol as the S3 table above (3 seeds,
+best-val@128 checkpoint selection, `MAX_STEPS=1600`):
+
+| task | model | seeds | protocol | acc@64 | acc@256 | acc@512 | acc@1024 |
+|---|---|---|---|---|---|---|---|
+| S3 | `deltanet` (`nh=1`), L=1 | 3 | best-val@128 | 0.419 | 0.356 | 0.345 | 0.339 |
+| S3 | `deltaproduct2` (`nh=2`), L=1 | 3 | best-val@128 | 1.000 | 1.000 | 1.000 | 0.989 |
+| S3 | *`minGRU-rotsnap`, L=1 (reference, above)* | *8* | *best-val@128* | *1.000* | *1.000* | *0.996* | *0.958* |
+
+`nh=1` cannot fit S3 (mean@64 = 0.419, in the diagonal/reflection chance
+band). A single reflection has determinant -1 on every application and
+cannot compose to the even-permutation elements S3 needs, matching
+DeltaProduct's own representability theory. `nh=2` fits S3 on every
+seed and trains reliably with no retry protocol: all three seeds reach
+best-val@128 = 1.000 by step 200-300 (against the 1600-step budget) and
+no seed raises the sub-1.0 flag that `minGRU-rotsnap` relies on to mark
+a run for retry. That is a materially better training profile than
+`minGRU-rotsnap` on this task at this budget: the snap grid's rotsnap
+reference lands the exact solution in only 1 of 8 seeds and still needs
+the retry-on-flag protocol to separate that seed from the other 7,
+while `deltaproduct2`'s 3 of 3 seeds all land near-exactly without any
+retries. On parity, both incumbent configurations show the same
+length-generalization inconsistency across seeds: `deltanet` mean@1024
+= 0.851 (per-seed range 0.730-1.000) and `deltaproduct2` mean@1024 =
+0.810 (per-seed range 0.692-1.000), both below this repo's recorded
+`signed-tanh` parity result (n=6, mean@1024 = 0.994, worst seed 0.984).
+Signed-tanh's tanh asymptote gives it a length-generalization
+attractor the delta rule's beta/k parameterization does not share
+under this protocol.
+
+What the snap mechanism still uniquely provides: an exact solution when
+a seed lands it (`minGRU-rotsnap`'s 1 exact-to-16x seed of 8, vs.
+`deltaproduct2`'s near-exact-but-not-exact 0.974-0.999 @1024 across all
+3 seeds) and the weights-level D3 homomorphism certificate (per-block
+matrices extracted from a trained model satisfy the D3 composition
+table to ~1e-4 — see above and `experiments/SUMMARY.md`).
+
+**Capacity disclosure.** At the shared `d_model=64`, parameter counts
+are `deltanet` 16,900 / `deltaproduct2` 25,480 vs. `RotationMinGRU`
+12,544 / `SignedMinGRU` 12,480. Both incumbent configurations carry
+more parameters than the minGRU variants they are compared against,
+and `deltaproduct2` carries roughly 2x `deltanet`'s own count. More
+materially, both incumbent configurations carry a per-token state of
+`n_heads * d_k * d_v` = 1,024 elements (4 heads x 16 x 16), against 64
+state elements per token for the minGRU variants. The incumbents
+carry roughly 16x more state per token at this `d_model`, which favors
+their fit and length-generalization numbers above. These are
+same-`d_model`, not same-capacity, comparisons.
+
+All of the above is budget-relative (1600-step budget, 3 seeds, this
+repo's harness and protocol only): it is not a claim about the
+incumbents' released systems, published training regimes, or published
+numbers, and it does not run in the other direction either: nothing
+here shows the minGRU variants would still lead at a larger budget or a
+different protocol. (Run history: `experiments/EXPERIMENTS.md`.)
 
 **Alternatives tried and dropped.** Three other fixes were tested and
 abandoned: a full orthogonality constraint on the transition matrices,
@@ -1025,6 +1097,10 @@ in State-Space Models.* ICML 2024. arXiv:2404.08819.
 
 Grazzi, R., et al. (2025). *Unlocking State-Tracking in Linear RNNs
 Through Negative Eigenvalues.* ICLR 2025.
+
+Yang, S., Wang, B., Zhang, Y., Shen, Y., & Kim, Y. (2024).
+*Parallelizing Linear Transformers with the Delta Rule over Sequence
+Length.* arXiv:2406.06484.
 
 Siems, J., Carstensen, T., Zela, A., Hutter, F., Pontil, M., &
 Grazzi, R. (2025). *DeltaProduct: Improving State-Tracking in Linear

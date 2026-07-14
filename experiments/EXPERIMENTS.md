@@ -825,7 +825,7 @@ blank where not applicable):
 2. **nh=2 (`deltaproduct2`) solves S3 near-exactly on every seed, and
    trains reliably with no retry protocol.** All three seeds hit
    val128 = 1.000 by step 200-300 (vs. a full 1600-step budget), and hold
-   0.999-1.000 through @512 and 0.974-0.994 @1024 — composing two
+   0.999-1.000 through @512 and 0.974-0.999 @1024 — composing two
    reflections per token realizes a rotation, which is state-tracking-
    complete for S3. This is a materially different training profile from
    this repo's `minGRU-rotsnap` (`RotationMinGRU`, L=1), whose recorded
