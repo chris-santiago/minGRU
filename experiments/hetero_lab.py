@@ -191,6 +191,11 @@ def _hard_mode_eval(model, rot, make, T, seed, n_batches):
 
 def run_arm(args):
     args.curriculum_p, args.curriculum_max = _parse_curriculum(args.curriculum)
+    if args.ckpt_t in GEN_LENGTHS or args.ckpt_t <= 0:
+        raise SystemExit(
+            f"--ckpt-t {args.ckpt_t} is a reported test length (or invalid); "
+            f"selection must not leak into the metric. Test lengths: {GEN_LENGTHS}"
+        )
     make, vocab, n_cls = TASKS[args.task]
     torch.manual_seed(args.seed)
     gen = torch.Generator().manual_seed(1 + 10_000 * args.seed)
@@ -275,7 +280,7 @@ def run_arm(args):
                         p.grad.add_(torch.randn(p.shape, generator=noise_gen) * sigma)
         opt.step()
         if step % EVAL_EVERY == 0:
-            val = _hard_mode_eval(model, rot, make, CKPT_T, seed=5, n_batches=2)
+            val = _hard_mode_eval(model, rot, make, args.ckpt_t, seed=5, n_batches=2)
             if val > best_val:
                 best_val, best_step = val, step
                 best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -299,6 +304,7 @@ def run_arm(args):
             "identity_warmup": args.identity_warmup,
             "curriculum_p": args.curriculum_p,
             "curriculum_max": args.curriculum_max if args.curriculum_p else 0,
+            "ckpt_t": args.ckpt_t if args.ckpt_t != CKPT_T else 0,
         }.items()
         if v
     }
@@ -314,7 +320,7 @@ def run_arm(args):
         "acc": accs,
         "secs": round(time.time() - t0, 1),
         "max_steps": args.steps,
-        "ckpt": {"step": best_step, "val128": round(best_val, 4)},
+        "ckpt": {"step": best_step, f"val{args.ckpt_t}": round(best_val, 4)},
         "config": config,
     }
     print(json.dumps(rec), flush=True)
@@ -340,6 +346,13 @@ def main():
     p.add_argument(
         "--curriculum", default="",
         help="P:MAX, e.g. 0.25:16 -- prob P of an even short length in [2, MAX]",
+    )
+    p.add_argument(
+        "--ckpt-t", type=int, default=CKPT_T,
+        help="checkpoint-selection eval length (default CKPT_T=128). Must "
+        "not be one of the reported test lengths (256/512/1024) or "
+        "selection leaks into the metric; use when val@128 saturates and "
+        "cannot discriminate (e.g. 384 for gen-consolidation arms).",
     )
     p.add_argument("--dry-run", action="store_true", help="print row, skip ledger append")
     run_arm(p.parse_args())
