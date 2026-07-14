@@ -567,26 +567,29 @@ fixed Latin-square lookup built to be non-representable by either group
 of order six. The generator for each pair must be *extracted* before it
 can be *composed*: a lone rotation layer can't absorb the lookup by
 relabeling angles the way it can for a plain group operation. Measured
-over 3 seeds each (0, 1, 2), `MAX_STEPS=1600` unless noted, multi-seed
+at `MAX_STEPS=1600` unless noted (seeds per row as listed), multi-seed
 means:
 
 | config (task `S3-hier`, chance ≈ 0.167) | seeds | acc@64 | acc@256 | acc@512 | acc@1024 |
 |---|---|---|---|---|---|
+| signed → deltaproduct2 (`hetero-sd2`, `experiments/hetero_lab.py`) | 6 | 1.000 | 0.987 | 0.814 | 0.530 |
 | signed-tanh, L=2 (homogeneous) | 3 | 0.985 | 0.866 | 0.754 | 0.620 |
-| signed → rotation (`minGRU-hetero-sr`) | 3 | 0.486 | 0.331 | 0.295 | 0.264 |
+| signed → rotation (`minGRU-hetero-sr`) | 6 | 0.572 | 0.442 | 0.375 | 0.309 |
 | rotation → signed (`minGRU-hetero-rs`) | 3 | 0.448 | 0.325 | 0.247 | 0.206 |
 | rotation × 2 (`minGRU-rotation2`) | 3 | 0.365 | 0.256 | 0.212 | 0.189 |
+| `deltaproduct2`, L=1 | 6 | 0.238 | 0.184 | 0.176 | 0.171 |
 | `GRU`, L=1 | 3 | 0.232 | 0.184 | 0.175 | 0.171 |
 | `minGRU-rotsnap`, L=1 | 3 | 0.225 | 0.183 | 0.174 | 0.170 |
 | signed → rotation at 4x budget (`MAX_STEPS=6400`) | 3 | 0.890 | 0.658 | 0.570 | 0.502 |
 
-Homogeneous 2-layer signed-tanh wins in-budget fit decisively but
-shows the same length decay documented for `SignedMinGRU` above: a
-diagonal-scan approximation to a genuinely non-commutative
-composition, not the exact automaton. The extract-then-compose hetero
-stack (signed → rotation) sits near chance at the standard budget.
-Every `S3-hier` row is n=3, and rotation-bearing configurations show a
-0.86–1.0 per-seed spread at n=8 on plain `S3` — so the large gaps here
+Homogeneous 2-layer signed-tanh wins in-budget fit among the
+rotation-family rows but shows the same length decay documented for
+`SignedMinGRU` above: a diagonal-scan approximation to a genuinely
+non-commutative composition, not the exact automaton. The
+extract-then-compose rotation stack (signed → rotation) fits on one
+seed in six at the standard budget (best-val@128 0.988 on that seed)
+and sits near chance on the rest. Rotation-bearing configurations show
+a 0.86–1.0 per-seed spread at n=8 on plain `S3` — the large gaps here
 (fit vs. chance) are the trustworthy signal, not small differences
 between adjacent rows.
 
@@ -604,30 +607,55 @@ any layer above it, so the order is forced — a rotation layer fed raw
 sub-tokens composes a mixture nothing downstream can take apart,
 which is why rotation→signed wins on plain `S3` (where tokens *are*
 the operations) and sits at chance here. Why the working order still
-trains poorly is less settled. The hypothesis consistent with the
-evidence — a single seed of three landing the exact solution, and only
-at 4x budget — is that the two layers need each other: the feature
-layer's learning signal passes through the composer's snapped,
-straight-through rotations, so until the extractor emits clean
-generators the composer has nothing exact to lock onto, and until the
-composer is meaningful the extractor gets noisy credit. That coupling
-story is inferred from one successful run, not established. What is
-measured is that the escape is visible when it happens: best-val@128
-hits 1.0 on the run that lands the exact automaton and flags the ones
-that don't. Treat it like rotation training generally — run seeds,
-keep flagged-clean runs, budget for retries.
+trains poorly is measured, not hypothesized: the extractor is never
+the bottleneck. On instrumented reruns of the recorded seeds, a linear
+probe decodes the pair's generator from layer-1 states at ≥0.95 within
+400–800 steps on every seed — including seeds that plateau
+permanently — while the composer's snapped angles keep oscillating
+between grid cells (7–24% of snapped indices flip between checkpoints
+on plateau seeds, collapsing to ~0.1–1% only on a run that locks). The
+failure is the composer's search for an exact discrete solution, and
+that solution's training basin is measurably tiny: retraining from the
+winning weights perturbed by 1% per-tensor noise recovers near-exact
+accuracy on 2 of 3 seeds but returns to the exact automaton on none,
+at any perturbation scale tested (round `hetero-loop-14-basin`).
+Auxiliary supervision or extractor-first schedules would target a
+coupling bottleneck that does not exist; best-val@128 remains the
+working tool — it hits 1.0 on runs that land the exact automaton and
+flags the ones that don't.
 
-L=1 rotation alone, rotation×2, rotation→signed, and an unconstrained
-`GRU` all sit at or near chance on `S3-hier`: no single capability
-(depth alone, or a rotation mechanism alone) is enough, extracting the
-pair and composing it non-commutatively both have to happen. Read
-together: homogeneous depth trains reliably and fits fast but decays
-with length, and the heterogeneous rotation stack trains unreliably
-in-budget: rare-but-exact at 4x budget when a run lands, with
-best-val@128 separating the runs that land from the ones to retry.
-Neither configuration "wins" outright and neither claim is
-budget-independent: every number above is relative to the stated step
-budget, not a claim that any configuration solves `S3-hier`.
+Swapping the composer mechanism makes the attribution causal. Keeping
+the signed extractor and replacing the snapped-rotation composer with
+a DeltaProduct-style nh=2 delta-rule layer (`hetero-sd2`, top table
+row) takes `S3-hier` fit from 1/6 seeds to 6/6 at the same budget
+(best-val@128 = 1.0 by step 500–1600, no retries, no seed lottery),
+while that same delta layer alone at L=1 sits at chance on all six
+seeds — the extract-then-compose depth split is still doing the work.
+The cost is exactness: the delta composer reaches 0.530 @1024 (n=6),
+rising to ≈0.60 at 4x budget (selected at val@384, a non-test length,
+since val@128 saturates once fit) and approaching an asymptote well
+below the 0.983 @1024 that the rotation composer's rare exact run
+holds. Diagnostics rule out amplitude decay, extractor feature drift,
+input non-stationarity, and per-class map noise as fixable causes of
+that drift — quantizing the composer's input preserves in-distribution
+fit and *worsens* generalization, so the composer's continuous code is
+functional, not noisy (per-seed evidence:
+`experiments/EXPERIMENTS.md`, hetero-loop rounds).
+
+A lone rotation layer, rotation×2, rotation→signed, a lone delta-rule
+layer (`deltaproduct2`, L=1), and an unconstrained `GRU` all sit at or
+near chance on `S3-hier`: no single capability (depth alone, or a
+composition mechanism alone) is enough — extracting the pair and
+composing it non-commutatively both have to happen. Read together, the
+three working configurations trace a mechanism-level trade measured
+from both sides: homogeneous signed depth trains reliably and decays
+with length; the rotation-composer stack is rare-but-exact (discrete
+maps — exact when training finds them, and training rarely finds
+them); the delta-composer stack is reliable-but-inexact (continuous
+maps — found by training every time, never exact). No configuration
+wins outright and no claim is budget-independent: every number above
+is relative to the stated step budget, not a claim that any
+configuration solves `S3-hier`.
 
 **Training protocol: best-val@128 selection + retry-on-flag.** The
 exact automaton is reachable but is **not** a stable attractor of

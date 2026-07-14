@@ -2,7 +2,8 @@
 
 One-document synthesis of the experiment loop (9 rounds + post-loop
 verification, 2026-07-12; incumbent-comparison and promotion status
-updated 2026-07-13). The chronological lab log with per-round
+updated 2026-07-13; hetero training-fix loop findings added
+2026-07-14). The chronological lab log with per-round
 detail is `EXPERIMENTS.md`; raw per-cell results are
 `lab_results.jsonl`; mechanism probe outputs are
 `mechanism_results.json`. This file is the curated view: what was
@@ -194,6 +195,34 @@ All cheap repairs tested and retired (`repair_probes.py`,
 retry-on-flag (best val < 1.0 flags a run as failed and it should be
 retried — though the `reseed-fix` round found this does not catch
 every non-exact run under clean seeding; see "Protocol," above).**
+
+## Hetero training-fix loop (2026-07-14, rounds `hetero-loop-01..14`)
+
+A 14-loop hypothesize→test→refine program on `minGRU-hetero-sr`'s
+S3-hier trainability (full record: `EXPERIMENTS.md` parts 1–3; driver:
+`experiments/hetero_lab.py`). What it settled:
+
+- **Coupling refuted.** Layer-1 generator extraction is linearly
+  decodable (≥0.95) by step 400–800 on every seed, including permanent
+  plateaus — supervision/curriculum/identity-warmup arms target a
+  bottleneck that does not exist.
+- **Trainability is a composer-mechanism property.** signed →
+  DeltaProduct-nh=2 (`hetero-sd2`) fits S3-hier 6/6 seeds at 1600
+  steps (baseline 1/6); `deltaproduct2` L=1 alone is chance (6/6), so
+  depth-buys-hierarchy survives its attribution control.
+- **The reliability↔exactness trade is mechanism-level, measured from
+  both sides.** Delta-composer drift (0.53→0.60 @1024 with budget,
+  asymptotic) survives a five-story refutation cascade (amplitude,
+  extraction drift, beta-orthogonality, input stationarity,
+  within-class map variance — the last causally); the rotation
+  composer's exact solution has a near-zero training basin (0/3 exact
+  re-attainment from 1% weight perturbation at any tested scale).
+- **Killed arms** (pre-registered rules): soft-warmup, Neelakantan
+  gradient noise under Adam, curriculum-as-fixer, budget-2x for the
+  rotation composer, VQ interface bottlenecks.
+- **Protocol lessons in the harness:** checkpoint selection scores the
+  deployment-mode model; `--ckpt-t` keeps selection discriminating
+  after val@128 saturates (guarded against test-length leakage).
 
 ## Open work, prioritized
 
