@@ -1192,17 +1192,33 @@ Two exact fits (with good gen when landed), one partial, three chance
 plateaus — shrinking the delta state to 64 loses most of its
 reliability (6/6 -> 2/6) and reintroduces the plateau failure mode.
 
-**Conclusion (completes the mechanism x capacity factorization).**
-With Loops 4/15: reliability tracks per-token map richness in BOTH
-mechanism families — 2D rotations 1/6 (snapped or continuous), 8D
-delta 2/6, 8D Givens 4/6-with-near-fits, 16D-big-state delta 6/6. The
-delta mechanism is not special; its original reliability owed much to
-its enlarged state. At honest matched capacity the richer-rotation
-family (GivensMinGRU) wins on both reliability and length
-generalization, is parallel-native (matrix_affine_scan; the O(k^3)
-scan cost that made the d_k=16 delta scan a 5-16x CPU loss is 8x
-smaller at k=8), and descends directly from the repo's existing
-rotation-mixer design vocabulary. It is the program's promotion
-candidate under the parallel-only constraint. Exactness at length
-remains unique to the snapped composer's rare winner (0.983 @1024,
-1/6-with-near-zero-basin); no continuous composer reached it.
+**Conclusion (mechanism x state-size factorization; n=6 rates, being
+extended to n=12 per external review).** With Loops 4/15: fit
+reliability rises with per-token map richness within the rotation
+family — 2D rotations 1/6 whether snapped or continuous, 8D Givens
+4/6 with near-fit misses — at nearly matched parameters (full-stack
+94,694 vs 92,614, +2.2%), so that within-family gradient is not a
+parameter effect. Across mechanism families the evidence is weaker
+and stated as such: 8D-state delta at 2/6 vs 8D Givens at 4/6 is a
+two-seed difference at n=6 (far from significant on its own), and the
+64-state delta composer also carries 4.4x fewer composer parameters
+(3,306 vs 14,624), so mechanism and parameter count are confounded in
+that cell. What IS well-powered: depth (6/6 vs 0/6) and within-delta
+state size (6/6 at 1,024 state vs 2/6 at 64 state). Composer
+parameter counts (d_model=64): deltaproduct2 25,480 / givens8 14,624
+/ rotation-2d 12,544 / deltamini 3,306; full stacks hetero-sd2
+105,550 / hetero-sg8 94,694 / hetero-sr 92,614 / hetero-sdm 83,376.
+
+Efficiency, measured (single-process microbenchmark, min of 3, all
+four configs timed in the same window; per-op FLOP arithmetic
+overstated these gaps and is not quoted): fwd+bwd at the training
+shape (B=128, T=64) — sequential delta16 0.54s, parallel-scan delta16
+2.53s, parallel-scan givens8 1.42s, parallel-scan deltamini 0.35s.
+The Givens scan is cheaper than the delta16 scan but still slower
+than the sequential delta on CPU; the small-state deltamini scan is
+the one parallel config that beats the sequential path outright. A
+promotion case for GivensMinGRU rests on the parallel-only design
+constraint plus reliability and length generalization, not on CPU
+cost. Exactness at length remains unique to the snapped composer's
+rare winner (0.983 @1024, 1/6 with a near-zero re-attainment basin);
+no continuous composer reached it.

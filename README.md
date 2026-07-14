@@ -654,23 +654,28 @@ fit and *worsens* generalization, so the composer's continuous code is
 functional, not noisy (per-seed evidence:
 `experiments/EXPERIMENTS.md`, hetero-loop rounds).
 
-What separates reliable composers from unreliable ones is per-token
-map richness, not the delta mechanism — measured by holding the
-per-token state at 64 elements (every promoted mixer's size) and
-varying the composer family. 2-dimensional rotation blocks fit 1/6
-seeds whether snapped or continuous; the delta rule shrunk to 64
-state elements fits 2/6 with chance plateaus (`hetero-sdm` above);
-8-dimensional rotation blocks (`givens8`: per-token transitions built
-from three rounds of Givens rotations, special-orthogonal by
-construction, continuous, trained through the same parallel
-associative scan) fit 4/6 with the misses near-fit (best-val@128
-0.94/0.98) rather than at chance. The full-size delta composer's 6/6
+Within the rotation family, per-token map richness separates reliable
+composers from unreliable ones — measured by holding the per-token
+state at 64 elements (every promoted mixer's size) and parameters
+nearly constant (+2.2% full-stack). 2-dimensional rotation blocks fit
+1/6 seeds whether snapped or continuous; 8-dimensional rotation
+blocks (`givens8`: per-token transitions built from three rounds of
+Givens rotations, special-orthogonal by construction, continuous,
+trained through the same parallel associative scan) fit 4/6 with the
+misses near-fit (best-val@128 0.94/0.98) rather than at chance. The
+delta rule shrunk to the same 64-element state fits 2/6 with chance
+plateaus (`hetero-sdm` above) — so the full-size delta composer's 6/6
 owes much of its reliability to its 16x-larger state (1,024 elements
-per token; capacity disclosure above). At matched capacity the
-Givens-8 composer also posts the best length generalization of any
-reliably trainable configuration (0.840 @512, 0.656 @1024 mean; best
-seed 0.956/0.812), above the full-size delta composer's — per-seed
-rows in `experiments/EXPERIMENTS.md`.
+per token; capacity disclosure above) — though the Givens-vs-small-
+delta comparison itself is a two-seed difference at n=6 with unmatched
+parameter counts (14,624 vs 3,306 composer parameters), suggestive
+rather than established. At matched state the Givens-8 composer also
+posts the best length generalization among the checkpoint-selected
+configurations that fit reliably (0.840 @512, 0.656 @1024 mean; best
+seed 0.956/0.812), above the full-size delta composer's; the
+homogeneous signed-tanh L=2 row (0.620 @1024) sits close behind under
+its different (early-stop) protocol — per-seed rows and parameter
+counts in `experiments/EXPERIMENTS.md`.
 
 A lone rotation layer, rotation×2, rotation→signed, a lone delta-rule
 layer (`deltaproduct2`, L=1), and an unconstrained `GRU` all sit at or
@@ -678,10 +683,10 @@ near chance on `S3-hier`: no single capability (depth alone, or a
 composition mechanism alone) is enough — extracting the pair and
 composing it non-commutatively both have to happen. Read together:
 homogeneous signed depth trains reliably and decays with length;
-composer reliability rises with per-token map richness in every
-mechanism family tested; and exactness at length remains unique to
-the snapped composer's rare winner (0.983 @1024) — no continuous
-composer reached it. No configuration wins outright and no claim is
+composer reliability rises with per-token map richness within the
+rotation family and with state size within the delta family; and
+exactness at length remains unique to the snapped composer's rare
+winner (0.983 @1024) — no continuous composer reached it. No configuration wins outright and no claim is
 budget-independent: every number above is relative to the stated step
 budget, not a claim that any configuration solves `S3-hier`.
 

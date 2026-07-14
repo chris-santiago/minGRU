@@ -202,10 +202,11 @@ A 14-loop hypothesize→test→refine program on `minGRU-hetero-sr`'s
 S3-hier trainability (full record: `EXPERIMENTS.md` parts 1–3; driver:
 `experiments/hetero_lab.py`). What it settled:
 
-- **Coupling refuted.** Layer-1 generator extraction is linearly
-  decodable (≥0.95) by step 400–800 on every seed, including permanent
-  plateaus — supervision/curriculum/identity-warmup arms target a
-  bottleneck that does not exist.
+- **Coupling refuted (as far as linear probes can see).** Layer-1
+  generator extraction is linearly decodable (≥0.95) by step 400–800
+  on every recorded seed, including permanent plateaus —
+  supervision/curriculum/identity-warmup arms target an extraction
+  bottleneck the probes rule out at this budget.
 - **Trainability is a composer-mechanism property.** signed →
   DeltaProduct-nh=2 (`hetero-sd2`) fits S3-hier 6/6 seeds at 1600
   steps (baseline 1/6); `deltaproduct2` L=1 alone is chance (6/6), so
@@ -217,16 +218,22 @@ S3-hier trainability (full record: `EXPERIMENTS.md` parts 1–3; driver:
   within-class map variance — the last causally); the rotation
   composer's exact solution has a near-zero training basin (0/3 exact
   re-attainment from 1% weight perturbation at any tested scale).
-- **Reliability = per-token map richness (mechanism x capacity
-  factorization, loops 15-18).** At matched 64-element state: 2D
-  rotations 1/6 (snapped or continuous), 64-state delta 2/6 with
-  chance plateaus, 8D Givens rotations (`GivensMinGRU`,
-  `hetero_lab.py`) 4/6 with near-fit misses and the best reliable
-  length gen recorded (0.840 @512 / 0.656 @1024 mean). The delta
-  mechanism is not special; its 6/6 owed much to 16x state. The
-  Givens-8 composer is parallel-native (matrix_affine_scan; the naive
-  delta-scan's 5-16x CPU penalty at d_k=16 shrinks 8x at k=8) and is
-  the promotion candidate under the parallel-only constraint.
+- **Reliability rises with per-token map richness (mechanism x
+  state-size factorization, loops 15-18; n=6 rates, extension to n=12
+  in progress).** At matched 64-element state: 2D rotations 1/6
+  (snapped or continuous), 64-state delta 2/6 with chance plateaus,
+  8D Givens rotations (`GivensMinGRU`, `hetero_lab.py`) 4/6 with
+  near-fit misses and the best length gen of any reliably-fitting
+  config under this protocol (0.840 @512 / 0.656 @1024 mean). The
+  within-rotation-family gradient (1/6 -> 4/6) comes at +2.2% total
+  params — not a parameter effect. The cross-mechanism comparison
+  (Givens vs 64-state delta) is a two-seed difference at n=6 and the
+  delta cell has 4.4x fewer composer params — suggestive, not
+  established. Well-powered: depth (6/6 vs 0/6) and within-delta
+  state size (6/6 at 1,024 vs 2/6 at 64). GivensMinGRU is the
+  promotion candidate under the parallel-only constraint on
+  reliability + gen + design fit; measured CPU cost still favors the
+  sequential delta (microbenchmark in EXPERIMENTS.md).
 - **Killed arms** (pre-registered rules): soft-warmup, Neelakantan
   gradient noise under Adam, curriculum-as-fixer, budget-2x for the
   rotation composer, VQ interface bottlenecks, distill-then-snap
