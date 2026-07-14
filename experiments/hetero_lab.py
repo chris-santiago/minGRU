@@ -171,6 +171,24 @@ def _parse_curriculum(spec):
     return p, mx
 
 
+def _hard_mode_eval(model, rot, make, T, seed, n_batches):
+    """accuracy() with every rotation mixer forced to hard/deployment
+    mode (full snap, no identity freeze), schedules restored afterward.
+
+    Checkpoint selection must score the DEPLOYABLE model: during a soft
+    or identity warmup the training-mode model can post val scores its
+    snapped counterpart cannot reproduce, and selecting on those keeps a
+    checkpoint that collapses at the final (hard-mode) eval.
+    """
+    saved = [(m.snap_alpha, m.identity_mode) for m in rot]
+    for m in rot:
+        m.snap_alpha, m.identity_mode = 1.0, False
+    acc = accuracy(model, make, T, seed=seed, n_batches=n_batches)
+    for m, (a, i) in zip(rot, saved):
+        m.snap_alpha, m.identity_mode = a, i
+    return acc
+
+
 def run_arm(args):
     args.curriculum_p, args.curriculum_max = _parse_curriculum(args.curriculum)
     make, vocab, n_cls = TASKS[args.task]
@@ -257,7 +275,7 @@ def run_arm(args):
                         p.grad.add_(torch.randn(p.shape, generator=noise_gen) * sigma)
         opt.step()
         if step % EVAL_EVERY == 0:
-            val = accuracy(model, make, CKPT_T, seed=5, n_batches=2)
+            val = _hard_mode_eval(model, rot, make, CKPT_T, seed=5, n_batches=2)
             if val > best_val:
                 best_val, best_step = val, step
                 best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
