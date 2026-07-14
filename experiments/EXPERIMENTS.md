@@ -1108,3 +1108,42 @@ Budget-relative: 1600-step retrains; longer budgets untested.
    (`_hard_mode_eval`), and must use a selection length that still
    discriminates once val@128 saturates (`--ckpt-t`, guarded against
    test-length leakage).
+
+## Round: parallel-only extension (hetero-loop-15..16)
+
+User constraint: mixers must remain parallel (associative scan); no
+sequential code promoted. Two arms:
+
+**Loop 15 — continuity is not the trainability driver, KILLED
+(`hetero-loop-15-nosnap`).** `signed -> rotation(snap=None)` (existing
+promoted mixers, continuous angles through `matrix_scan`), seeds 0-5 at
+1600: 1/6 fits (seed 4, val128 = 1.0, 0.669 @1024) — the same rate and
+the same lottery seed as the snapped baseline. Removing the STE snap
+does not confer the delta composer's 6/6 reliability, so the snap
+discontinuity was never the trainability blocker; the delta rule's
+higher-dimensional matrix state / rank-1 update structure is implicated
+instead.
+
+**Loop 16 — the delta composer as an exact associative scan
+(`hetero-loop-16-sd2par`).** `DeltaScanMixer`
+(`experiments/hetero_lab.py --selftest`) shares `DeltaNetMixer`'s
+parameters exactly and computes the same recurrence via a doubling scan
+over affine pairs (A_t = composed per-token Householders, B_t =
+accumulated injection). Outputs and gradients match the sequential
+forward to 5-7e-7 (nh = 1 and 2, non-power-of-two T). Training
+confirms: seed 0 fits at the same step as the sequential run (val128 =
+1.0 @ 500) with accs within float-reordering noise
+(1.0/0.981/0.798/0.517 vs 1.0/0.984/0.802/0.526). Wall-clock, however,
+is worse on CPU — 3637s vs 1581s for the run; micro-benchmark 5.5x
+slower at the training shape and 16x at T=1024 — because the scan
+materializes dense 16x16 transitions (O(dk^3) per compose, log T
+rounds) where the sequential path exploits the update's rank-1
+structure (O(dk*dv) per token). Seeds 1-2 were stopped as redundant
+(equivalence is proven; further seeds only re-confirm arithmetic).
+
+**Conclusion.** The winning composer mechanism is expressible as a
+parallel associative scan — the repo's design identity is satisfiable
+in kind — but an *efficient* parallel form requires the chunked WY
+representation from the DeltaNet literature, which is the actual
+engineering a promotion would need. Naive matrix-scan parallelism is a
+net loss on CPU at lab scale.
