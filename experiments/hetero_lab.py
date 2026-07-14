@@ -146,6 +146,61 @@ class _HeteroVariantTagger(nn.Module):
         return self.head(self.stack(self.emb(x)))
 
 
+class VQBottleneck(nn.Module):
+    """K-code vector quantizer on the residual stream, STE pass-through.
+
+    Motivation (loop 11): the composer's per-instance maps vary more
+    within a generator class than across classes -- the composer sees a
+    continuous feature cloud where plain S3's composer sees 6 discrete
+    embeddings. Quantizing the interface collapses within-class map
+    variance structurally.
+
+    Training penalty (VQ-VAE codebook + commitment terms) is stashed on
+    ``self._pen`` during training forwards; the driver adds it to the
+    loss (same collection convention as variants.aux_penalty). Eval
+    forwards quantize identically (deploy mode IS quantized) but skip
+    the penalty.
+    """
+
+    def __init__(self, d_model, n_codes=8, commit=0.25):
+        super().__init__()
+        self.codebook = nn.Parameter(torch.randn(n_codes, d_model))
+        self.commit = commit
+        self._pen = None
+
+    def forward(self, x):
+        d2 = (
+            x.pow(2).sum(-1, keepdim=True)
+            - 2 * x @ self.codebook.T
+            + self.codebook.pow(2).sum(-1)
+        )
+        e = self.codebook[d2.argmin(-1)]
+        if self.training:
+            self._pen = (x.detach() - e).pow(2).mean() + self.commit * (
+                x - e.detach()
+            ).pow(2).mean()
+        return x + (e - x).detach()
+
+
+class _VQHeteroTagger(nn.Module):
+    """_HeteroVariantTagger with a VQBottleneck between the two blocks."""
+
+    def __init__(self, vocab, n_cls, factory_names, n_codes=8):
+        super().__init__()
+        assert len(factory_names) == 2, "VQ interface expects a 2-block stack"
+        self.emb = nn.Embedding(vocab, D_MODEL)
+        self.stack = _ListVariantStack(D_MODEL, factory_names)
+        self.vq = VQBottleneck(D_MODEL, n_codes=n_codes)
+        self.head = nn.Linear(D_MODEL, n_cls)
+
+    def forward(self, x):
+        x = self.emb(x)
+        x = self.stack.blocks[0](x)
+        x = self.vq(x)
+        x = self.stack.blocks[1](x)
+        return self.head(self.stack.norm_out(x))
+
+
 def _rotation_mixers(model):
     mixers = []
     for blk in model.stack.blocks:
@@ -199,7 +254,11 @@ def run_arm(args):
     make, vocab, n_cls = TASKS[args.task]
     torch.manual_seed(args.seed)
     gen = torch.Generator().manual_seed(1 + 10_000 * args.seed)
-    if args.model in HETERO_FACTORY_MODELS:
+    if args.model == "hetero-svq8-d2":
+        model = _VQHeteroTagger(
+            vocab, n_cls, HETERO_FACTORY_MODELS["hetero-sd2"], n_codes=8
+        )
+    elif args.model in HETERO_FACTORY_MODELS:
         model = _HeteroVariantTagger(vocab, n_cls, HETERO_FACTORY_MODELS[args.model])
     else:
         model = build(args.task, args.model, vocab, n_cls, None)
@@ -260,6 +319,13 @@ def run_arm(args):
             for m in rot:
                 m._capture_theta = True
         loss = F.cross_entropy(model(x).reshape(-1, n_cls), y.reshape(-1))
+        # VQ-VAE codebook/commitment penalties from this forward, if any
+        # (VQBottleneck._pen; same collection idea as variants.aux_penalty)
+        for m in model.modules():
+            pen = getattr(m, "_pen", None)
+            if pen is not None:
+                loss = loss + pen
+                m._pen = None
         if args.commit_lambda > 0.0:
             lam = args.commit_lambda * min(1.0, step / max(args.commit_ramp, 1))
             for m in rot:
