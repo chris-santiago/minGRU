@@ -1050,3 +1050,61 @@ them but training rarely finds them; continuous-map composers
 (DeltaProduct nh=2) are found by training every time but are never
 exact. Loop 14 (basin radius of the exact solution under near-solution
 init) reports in the close.
+
+## Round: hetero training-fix loop, part 3 + program conclusions (hetero-loop-14)
+
+**Loop 14 — basin radius of the exact rotation-composer solution
+(`hetero-loop-14-basin`).** The `hetero-legB-ceiling` seed-1 winner was
+regenerated deterministically (val128 1.0 @ 5100, matching the recorded
+row), then retrained for 1600 CKPT steps from perturbed inits
+`theta* + eps * std(tensor) * N(0,1)` with fresh data streams, 3 seeds
+per eps:
+
+| eps | val128 (3 seeds) | @1024 (3 seeds) | near-exact rate |
+|---|---|---|---|
+| 0.01 | 0.999 / 0.630 / 0.997 | 0.890 / 0.359 / 0.835 | 2/3 |
+| 0.03 | 0.915 / 0.999 / 0.618 | 0.483 / 0.822 / 0.256 | 1/3 |
+| 0.10 | 0.973 / 0.563 / 0.621 | 0.479 / 0.230 / 0.371 | 0/3 |
+| 0.30 | 0.554 / 0.458 / 0.472 | 0.228 / 0.202 / 0.249 | 0/3 |
+| 1.00 | 0.364 / 0.440 / 0.207 | 0.210 / 0.338 / 0.172 | 0/3 |
+
+No run at any eps — including 1% noise — returned to exact
+val128 = 1.0: the basin of exact re-attainment at this budget is
+effectively zero. Near-solution init rescues approximate accuracy
+(0.84-0.89 @1024 at eps=0.01) but not exactness; training orbits the
+exact point without re-entering it. This upgrades the Round-6
+"reachable but not a stable attractor" observation to a measurement.
+Budget-relative: 1600-step retrains; longer budgets untested.
+
+**Program conclusions (14 loops, rounds hetero-loop-01..14).**
+
+1. **Trainability is a composer-mechanism property.** Swapping the
+   snapped-rotation composer for DeltaProduct nh=2 inside the same
+   2-layer hetero stack takes S3-hier fit from 1/6 seeds to 6/6 with
+   no seed lottery; the L=1 control confirms the depth split
+   (extraction below, composition above) is still doing the work.
+2. **The coupling/supervision hypothesis family is refuted.** Layer-1
+   generator information is linearly decodable (>=0.95) by step
+   400-800 on every seed, including permanent plateaus; auxiliary
+   supervision and extractor-first schedules target a bottleneck that
+   does not exist.
+3. **The reliability<->exactness trade is mechanism-level, measured
+   from both sides.** Continuous-map composers train every time and
+   asymptote below exactness (drift mechanisms exhaustively ruled
+   out: amplitude, extraction drift, beta-orthogonality, input
+   stationarity, within-class map variance — the last causally, via
+   post-hoc quantization that preserves fit while worsening gen).
+   Discrete-map composers are exact when found but the exact solution
+   has a near-zero training basin even under informed initialization.
+4. **Killed training-side arms** (pre-registered rules): soft-warmup
+   schedules (soft progress does not survive snap-on), annealed
+   gradient noise (Neelakantan parameterization is Adam-incompatible
+   at this scale — all seeds to chance), length curriculum as a fixer
+   (floor-raiser, ceiling-lowerer), budget doubling for the rotation
+   composer (creep, no lock), VQ interface bottlenecks (from-scratch
+   breaks fit; post-hoc worsens gen).
+5. **Protocol lessons now encoded in the harness:** checkpoint
+   selection must score the deployment-mode model
+   (`_hard_mode_eval`), and must use a selection length that still
+   discriminates once val@128 saturates (`--ckpt-t`, guarded against
+   test-length leakage).
