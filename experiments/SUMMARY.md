@@ -1,7 +1,8 @@
 # Length-generalization investigation — summary & handoff
 
 One-document synthesis of the experiment loop (9 rounds + post-loop
-verification, 2026-07-12). The chronological lab log with per-round
+verification, 2026-07-12; incumbent-comparison and promotion status
+updated 2026-07-13). The chronological lab log with per-round
 detail is `EXPERIMENTS.md`; raw per-cell results are
 `lab_results.jsonl`; mechanism probe outputs are
 `mechanism_results.json`. This file is the curated view: what was
@@ -64,8 +65,14 @@ One saturation instead of two to reach a = -1; tanh's asymptote sits
 exactly at the needed eigenvalue, so saturation self-calibrates.
 Keeps contraction (can forget) — the general-purpose choice. NOTE:
 this is the Grazzi et al. (ICLR 2025) negative-eigenvalue mechanism
-instantiated in minGRU — a repo improvement, not a novelty claim,
-until the incumbent comparison runs (see Open work).
+instantiated in minGRU — a repo improvement, not a novelty claim.
+The delta-rule incumbent comparison has since run (round
+`incumbent-delta`, `EXPERIMENTS.md`): at matched d_model, signed-tanh's
+parity length profile (mean 0.994 @1024) beats both DeltaNet nh=1
+(0.851) and DeltaProduct nh=2 (0.810), while DeltaProduct nh=2 solves
+S3 reliably (val@128 = 1.0 by step 300, all seeds) where rotation-snap
+needs retries. The Grazzi-parameterized signed scan itself remains
+un-run (see Open work).
 
 **`rotation-snap`** — 2×2 block transitions on n = d/2 planar
 blocks:
@@ -196,14 +203,17 @@ every non-exact run under clean seeding; see "Protocol," above).**
    does not block promotion.
 2. **Probe gap:** readout-attribution weighting for block ranking.
 3. **Incumbent grid (external review rec 1, gates novelty claims):**
-   Grazzi-parameterized signed scan (near-free — a `_coeffs`
-   variant), GRU already done, DeltaNet n_h∈{1,2} (expensive:
-   faithful implementation is a day-plus; a sloppy one strawmans
-   the incumbent — either implement carefully or cite published
-   numbers as cross-paper).
-4. **Promotion** (separate decision): winners into `min_gru.py`
-   (need `step()` methods, docs, self-tests), `probes.py` wiring,
-   README ladder/results update with current-env numbers.
+   DeltaNet n_h∈{1,2} DONE (round `incumbent-delta`, 2026-07-13:
+   mechanism-level `DeltaNetMixer` in `experiments/variants.py` with
+   delta-rule self-tests; nh=2 solves S3 near-exactly at 1x budget,
+   nh=1 cannot fit it, both lose to signed-tanh on parity length
+   profile; capacity asymmetry disclosed in the README). GRU already
+   done. Remaining: Grazzi-parameterized signed scan (near-free — a
+   `_coeffs` variant).
+4. **Promotion** DONE (2026-07-12): SignedMinGRU/RotationMinGRU and
+   the mixer-selector stack in `min_gru.py` (step() methods, docs,
+   self-tests), `probes.py` registry + GRID wiring, README results
+   at current-env numbers.
 
 ## How to run
 
