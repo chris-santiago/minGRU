@@ -210,12 +210,112 @@ HETERO_FACTORY_MODELS = {
     "hetero-sd2": ("signed-tanh", "deltaproduct2"),
     "hetero-d2s": ("deltaproduct2", "signed-tanh"),
     "hetero-sd2-par": ("signed-tanh", "deltascan2"),
+    "hetero-sg8": ("signed-tanh", "givens8"),
 }
 
-# variants.py factories plus this lab's parallel-scan delta mixer
+class GivensMinGRU(nn.Module):
+    """P2: continuous k-dim block-rotation mixer at matched state size.
+
+    State is ``n_blocks = hidden_size / block_size`` blocks of ``k =
+    block_size`` dims (64 state elements total at the repo's d_model —
+    the same per-token state as every promoted mixer, unlike the delta
+    mixers' 1024). Per block and token the transition is a product of
+    ``rounds`` layers of Givens rotations on fixed brick-wall planes
+    (even rounds: (0,1),(2,3),...; odd rounds: (1,2),(3,4),...,(k-1,0))
+    with input-dependent angles — orthogonal by construction,
+    continuous (no snap): the k>2 generalization of RotationMinGRU's
+    snap=None regime. Tests whether richer non-abelian per-token maps
+    at MATCHED capacity buy the delta composer's training reliability,
+    or whether that reliability is specific to the delta mechanism.
+    Injection ``b = sigmoid(z) * Linear_h(x)``, learned h0; forward is
+    the parallel matrix_affine_scan (vector state as v=1).
+    """
+
+    def __init__(self, input_size, hidden_size, block_size=8, rounds=3):
+        super().__init__()
+        assert hidden_size % block_size == 0, "hidden_size % block_size != 0"
+        self.hidden_size = hidden_size
+        self.k = block_size
+        self.n_blocks = hidden_size // block_size
+        self.rounds = rounds
+        half = block_size // 2
+        self.linear_theta = nn.Linear(input_size, self.n_blocks * rounds * half)
+        self.linear_z = nn.Linear(input_size, hidden_size)
+        self.linear_h = nn.Linear(input_size, hidden_size)
+        self.h0 = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.5)
+        for r in range(rounds):
+            start = r % 2
+            i_idx = torch.arange(start, block_size, 2) % block_size
+            j_idx = (i_idx + 1) % block_size
+            self.register_buffer(f"_pi{r}", i_idx)
+            self.register_buffer(f"_pj{r}", j_idx)
+
+    def _coeffs(self, x):
+        """Per-block transition M (..., n, k, k) and injection b (..., n, k)."""
+        lead = x.shape[:-1]
+        half = self.k // 2
+        theta = self.linear_theta(x).view(*lead, self.n_blocks, self.rounds, half)
+        eye = torch.eye(self.k, dtype=x.dtype, device=x.device)
+        M = eye.expand(*lead, self.n_blocks, self.k, self.k).clone()
+        for r in range(self.rounds):
+            i_idx = getattr(self, f"_pi{r}")
+            j_idx = getattr(self, f"_pj{r}")
+            cos = torch.cos(theta[..., r, :]).unsqueeze(-1)  # (..., n, half, 1)
+            sin = torch.sin(theta[..., r, :]).unsqueeze(-1)
+            rows_i = M[..., i_idx, :]
+            rows_j = M[..., j_idx, :]
+            M = M.clone()
+            M[..., i_idx, :] = cos * rows_i - sin * rows_j
+            M[..., j_idx, :] = sin * rows_i + cos * rows_j
+        z = torch.sigmoid(self.linear_z(x))
+        b = (z * self.linear_h(x)).reshape(*lead, self.n_blocks, self.k)
+        return M, b
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        M, b = self._coeffs(x)
+        Abar, Bbar = matrix_affine_scan(M, b.unsqueeze(-1))
+        h0_blocks = self.h0.expand(B, 1, self.hidden_size).reshape(
+            B, self.n_blocks, self.k
+        )
+        h = torch.einsum("btnij,bnj->btni", Abar, h0_blocks) + Bbar.squeeze(-1)
+        return h.reshape(B, T, self.hidden_size)
+
+
+def _selftest_givens():
+    """GivensMinGRU: transitions orthogonal with det +1; parallel scan
+    forward matches an explicit sequential recurrence; finite grads."""
+    torch.manual_seed(11)
+    B, T, d = 3, 13, 64
+    x = torch.randn(B, T, d)
+    m = GivensMinGRU(d, d, block_size=8, rounds=3)
+    M, b = m._coeffs(x)
+    eye = torch.eye(8)
+    orth = (M @ M.transpose(-1, -2) - eye).abs().max().item()
+    det_err = (torch.linalg.det(M) - 1.0).abs().max().item()
+    print(f"givens orthogonality {orth:.3e}, det-1 {det_err:.3e}")
+    assert orth < 1e-5 and det_err < 1e-4, "Givens product not special-orthogonal"
+    y = m(x)
+    h = m.h0.expand(B, 1, d).reshape(B, m.n_blocks, m.k)
+    hs = []
+    for t in range(T):
+        h = torch.einsum("bnij,bnj->bni", M[:, t], h) + b[:, t]
+        hs.append(h.reshape(B, d))
+    y_seq = torch.stack(hs, dim=1)
+    err = (y - y_seq).abs().max().item()
+    print(f"givens scan vs sequential max abs diff: {err:.3e}")
+    assert err < 1e-4, "givens parallel scan does not match sequential recurrence"
+    y.sum().backward()
+    for name, p in m.named_parameters():
+        assert p.grad is not None and torch.isfinite(p.grad).all(), name
+    print("givens shapes/grads ok")
+
+
+# variants.py factories plus this lab's parallel-scan mixers
 LOCAL_FACTORIES = {
     **VARIANTS,
     "deltascan2": lambda d_in, d_h: DeltaScanMixer(d_in, d_h, nh=2),
+    "givens8": lambda d_in, d_h: GivensMinGRU(d_in, d_h, block_size=8, rounds=3),
 }
 
 
@@ -535,6 +635,7 @@ def main():
     args = p.parse_args()
     if args.selftest:
         _selftest_delta_scan()
+        _selftest_givens()
         return
     if not args.round:
         p.error("--round is required (unless --selftest)")
