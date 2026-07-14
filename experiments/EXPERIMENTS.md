@@ -1147,3 +1147,62 @@ in kind — but an *efficient* parallel form requires the chunked WY
 representation from the DeltaNet literature, which is the actual
 engineering a promotion would need. Naive matrix-scan parallelism is a
 net loss on CPU at lab scale.
+
+## Round: matched-capacity composers (hetero-loop-17..18)
+
+The parallel-only extension's discriminating pair: is the delta
+composer's 6/6 reliability a property of its mechanism (rank-1
+write-erase updates) or of its 16x-larger state? Two composers at the
+promoted mixers' 64-element per-token state, both trained through the
+parallel `matrix_affine_scan`, `signed ->` hetero stacks on S3-hier,
+seeds 0-5 at 1600, CKPT best-val@128:
+
+**Loop 17 — `hetero-sg8` (GivensMinGRU: 8 blocks x 8 dims, per-token
+transitions = 3 rounds of brick-wall Givens rotations,
+special-orthogonal by construction, continuous). HIT, 4/6.**
+
+| seed | best step | val128 | @64 | @256 | @512 | @1024 |
+|---|---|---|---|---|---|---|
+| 0 | 1100 | 1.000 | 1.000 | 0.9941 | 0.9105 | 0.6619 |
+| 1 | 1500 | 0.942 | 0.9901 | 0.7853 | 0.5839 | 0.4293 |
+| 2 | 1400 | 1.000 | 1.000 | 0.9953 | 0.9307 | 0.7447 |
+| 3 | 1600 | 0.997 | 1.000 | 0.9941 | 0.9436 | 0.7751 |
+| 4 | 1600 | 0.981 | 0.9989 | 0.8960 | 0.7137 | 0.5148 |
+| 5 | 1400 | 1.000 | 1.000 | 0.9972 | 0.9558 | 0.8120 |
+
+4/6 seeds at val128 >= 0.99; the two misses are near-fits (0.94/0.98,
+@64 0.990/0.999) — no chance plateaus. n=6 means
+0.998/0.944/0.840/0.656: the best @512 and @1024 of any reliably
+trainable configuration recorded on S3-hier, above `hetero-sd2`
+(0.987/0.815/0.530) at 16x less state.
+
+**Loop 18 — `hetero-sdm` (DeltaScanMixer, n_heads=1, d_k=d_v=8: the
+delta rule at 64 state elements, parallel scan). KILL, 2/6.**
+
+| seed | best step | val128 | @64 | @256 | @512 | @1024 |
+|---|---|---|---|---|---|---|
+| 0 | 1600 | 0.210 | 0.2515 | 0.1877 | 0.1783 | 0.1723 |
+| 1 | 1600 | 0.632 | 0.7979 | 0.4320 | 0.2999 | 0.2324 |
+| 2 | 1400 | 1.000 | 1.000 | 0.9954 | 0.8982 | 0.6200 |
+| 3 | 1100 | 1.000 | 1.000 | 0.9968 | 0.9576 | 0.7672 |
+| 4 | 1100 | 0.227 | 0.2769 | 0.1924 | 0.1820 | 0.1748 |
+| 5 | 1600 | 0.238 | 0.3132 | 0.2032 | 0.1845 | 0.1745 |
+
+Two exact fits (with good gen when landed), one partial, three chance
+plateaus — shrinking the delta state to 64 loses most of its
+reliability (6/6 -> 2/6) and reintroduces the plateau failure mode.
+
+**Conclusion (completes the mechanism x capacity factorization).**
+With Loops 4/15: reliability tracks per-token map richness in BOTH
+mechanism families — 2D rotations 1/6 (snapped or continuous), 8D
+delta 2/6, 8D Givens 4/6-with-near-fits, 16D-big-state delta 6/6. The
+delta mechanism is not special; its original reliability owed much to
+its enlarged state. At honest matched capacity the richer-rotation
+family (GivensMinGRU) wins on both reliability and length
+generalization, is parallel-native (matrix_affine_scan; the O(k^3)
+scan cost that made the d_k=16 delta scan a 5-16x CPU loss is 8x
+smaller at k=8), and descends directly from the repo's existing
+rotation-mixer design vocabulary. It is the program's promotion
+candidate under the parallel-only constraint. Exactness at length
+remains unique to the snapped composer's rare winner (0.983 @1024,
+1/6-with-near-zero-basin); no continuous composer reached it.
