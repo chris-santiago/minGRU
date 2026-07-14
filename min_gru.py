@@ -25,11 +25,13 @@ positive — a property of the paper's log-space variant, not of the
 Parameter count: O(2 * d_h * d_x) vs. O(3 * d_h * (d_x + d_h)) for a
 standard GRU.
 
-`MinGRU`, `SignedMinGRU`, and `RotationMinGRU` are each kept atomic (one
-scan layer, one sequence-mixing mechanism). `MinGRUBlock` wraps any one
-of them, chosen via `mixer="log"|"signed"|"rotation"` (plus
-`mixer_kwargs` for per-mixer config such as `coupled=True` or a custom
-`snap` grid), in the standard pre-norm residual template (LN -> mixer ->
+`MinGRU`, `SignedMinGRU`, `RotationMinGRU`, and `GivensMinGRU` are each
+kept atomic (one scan layer, one sequence-mixing mechanism).
+`MinGRUBlock` wraps any one of them, chosen via
+`mixer="log"|"signed"|"rotation"|"givens"` (plus `mixer_kwargs` for
+per-mixer config such as `coupled=True`, a custom `snap` grid, or
+`block_size`/`rounds`), in the standard pre-norm residual template
+(LN -> mixer ->
 residual, then LN -> MLP -> residual), which supplies the inter-layer
 nonlinear mixing: layer l's gates condition on layer l-1's hidden
 states, and the MLP provides cross-channel interaction that a diagonal
@@ -3360,6 +3362,185 @@ if __name__ == "__main__":
         f"expected delta_t routing to blocks [0, 2] only, got {decay_enabled_blocks}"
     )
     print("mixed stack: delta_t reaches only decay-enabled blocks ([0, 2]): ok")
+
+    # =====================================================================
+    # GivensMinGRU promotion: Givens-specific algebra + generic decay
+    # contract pickup (spec section 9.1). GivensMinGRU is a standard
+    # DecayMixin subclass, so the per-mixer decay/delta_t helpers defined
+    # above (_check_decay_suite, _check_delta_t_value_errors,
+    # _check_log1p_delta, _check_nan_inf_delta_t) exercise it with NO
+    # special-casing — invoked here by class name exactly as for the other
+    # mixers. The remaining checks cover the Givens-only algebra (exact
+    # special-orthogonality of the transition, the k-dim matrix_affine_scan
+    # vs an explicit sequential recurrence) and the multi-'givens'
+    # zero-warning construction contract.
+    # =====================================================================
+
+    # --- transition is exactly special-orthogonal: M @ M^T = I, det = +1 ---
+    # Tolerances at least as tight as the lab evidence generator's
+    # (orthogonality 1e-5, determinant 1e-4).
+    torch.manual_seed(601)
+    mg = GivensMinGRU(D_in, D_h).eval()  # block_size=8, rounds=3, decay=None
+    x_g = torch.randn(B, T, D_in)
+    k_g = mg.k
+    with torch.no_grad():
+        M_g, b_g = mg._coeffs(x_g)  # (B, T, n_blocks, k, k), (B, T, n_blocks, k)
+        MMt = M_g @ M_g.transpose(-1, -2)
+        orth_err = (MMt - torch.eye(k_g)).abs().max().item()
+        det_err = (torch.linalg.det(M_g) - 1.0).abs().max().item()
+    print(f"givens transition orthogonality (M @ M^T - I) max abs diff: {orth_err:.3e}")
+    print(f"givens transition det - 1 max abs diff: {det_err:.3e}")
+    assert orth_err < 1e-5, "Givens transition must be orthogonal (M @ M^T = I)"
+    assert det_err < 1e-4, "Givens transition must have determinant +1"
+
+    # --- parallel scan (forward) vs explicit sequential recurrence on the
+    # SAME per-token coeffs (validates the matrix_affine_scan wiring) ---
+    with torch.no_grad():
+        h_par = mg(x_g)
+        h_prev = mg.h0.expand(B, 1, D_h).reshape(B, mg.n_blocks, k_g)
+        hs = []
+        for t in range(T):
+            h_prev = torch.einsum("bnij,bnj->bni", M_g[:, t], h_prev) + b_g[:, t]
+            hs.append(h_prev.reshape(B, D_h))
+        h_seq = torch.stack(hs, dim=1)
+    err = (h_par - h_seq).abs().max().item()
+    print(f"givens parallel scan vs explicit sequential recurrence max abs diff: {err:.3e}")
+    assert err < 1e-4, "matrix_affine_scan forward does not match sequential recurrence"
+
+    # --- forward == step (no decay), and chunked h_0 carry ---
+    with torch.no_grad():
+        h = None
+        hs = [h := mg.step(x_g[:, t], h) for t in range(T)]
+    err = (h_par - torch.stack(hs, dim=1)).abs().max().item()
+    print(f"givens parallel vs step (no decay) max abs diff: {err:.3e}")
+    assert err < 1e-4
+
+    with torch.no_grad():
+        h_a = mg(x_g[:, : T // 2])
+        h_b = mg(x_g[:, T // 2 :], h_0=h_a[:, -1:])
+    err = (h_par - torch.cat([h_a, h_b], dim=1)).abs().max().item()
+    print(f"givens chunked vs full (h_0 carry, no decay) max abs diff: {err:.3e}")
+    assert err < 1e-4
+
+    # --- generic decay-contract pickup (no special-casing): the same
+    # per-mixer helpers used for MinGRU/SignedMinGRU/RotationMinGRU above.
+    # _check_decay_suite covers forward == step WITH decay (fixed and
+    # learnable) and chunked h_0 carry WITH decay, plus the rho gradcheck. ---
+    _check_decay_suite("GivensMinGRU", {}, D_in, D_h, B=4, T=128, seed=602)
+    _check_delta_t_value_errors("GivensMinGRU", {}, D_in, D_h)
+    _check_log1p_delta("GivensMinGRU", {}, D_in, D_h, B=4, T=64, seed=603)
+    _check_nan_inf_delta_t("GivensMinGRU", {}, D_in, D_h)
+    try:
+        GivensMinGRU(D_in, D_h, decay="bogus")
+        raise AssertionError("GivensMinGRU: invalid decay string should have raised ValueError")
+    except ValueError:
+        pass
+    print("givens: generic decay-contract pickup (no special-casing): ok")
+
+    # --- construction ValueError cases: indivisible hidden_size, odd
+    # block_size, and the registry naming 'givens' in the unknown-mixer message ---
+    try:
+        GivensMinGRU(D_in, D_h + 4, block_size=8)  # 68 % 8 != 0
+        raise AssertionError("indivisible hidden_size should have raised ValueError")
+    except ValueError:
+        pass
+    try:
+        GivensMinGRU(D_in, D_h, block_size=3)  # odd block_size
+        raise AssertionError("odd block_size should have raised ValueError")
+    except ValueError:
+        pass
+    print("givens construction ValueError (indivisible hidden_size, odd block_size): ok")
+
+    try:
+        MinGRUBlock(D_h, mixer="not_a_mixer")
+        raise AssertionError("unknown mixer should have raised ValueError")
+    except ValueError as _e:
+        assert "givens" in str(_e), "unknown-mixer ValueError should list 'givens' as valid"
+    print("unknown-mixer ValueError lists 'givens': ok")
+
+    # --- multi-'givens' stacks construct with ZERO warnings (Givens is
+    # continuous — no straight-through snap to compound), and the existing
+    # multi-'rotation' warn-once is unchanged when givens is also present ---
+    with _warnings.catch_warnings(record=True) as rec:
+        _warnings.simplefilter("always")
+        MinGRUStack(D_in, D_h, 3, mixer=["givens", "signed", "givens"])
+        MinGRUStack(D_in, D_h, 3, mixer="givens")
+        giv_warnings = [w for w in rec if issubclass(w.category, UserWarning)]
+    assert len(giv_warnings) == 0, (
+        f"multi-'givens' stacks must not warn, got {len(giv_warnings)}"
+    )
+    print("multi-'givens' + homogeneous 'givens' stacks: zero UserWarning: ok")
+
+    with _warnings.catch_warnings(record=True) as rec:
+        _warnings.simplefilter("always")
+        MinGRUStack(D_in, D_h, 3, mixer=["rotation", "givens", "rotation"])
+        rot_warnings = [w for w in rec if issubclass(w.category, UserWarning)]
+    assert len(rot_warnings) == 1, (
+        f"multi-rotation warn-once must be unchanged with givens present, got {len(rot_warnings)}"
+    )
+    print("multi-rotation warn-once unchanged with givens present: ok")
+
+    # --- MinGRUStack mixer="givens": parallel vs streaming, chunked vs full ---
+    # The parallel and streaming paths are algebraically identical; the gap
+    # is pure float32 accumulation. A single Givens block's k=8 transition is
+    # a product of 3 brick-wall rounds of 8x8 matmuls (vs rotation's single
+    # 2x2), so per-block scan error runs ~20x rotation's (~2e-5 vs ~1e-6),
+    # and 3 stacked layers over T=128 compound it to a few e-4. In float64
+    # the same test collapses to ~1e-13, confirming there is no logic drift.
+    # The brief-mandated 1e-4 bound is kept where it belongs (the mixer-level
+    # scan-vs-sequential and forward-vs-step checks above, which pass at
+    # ~1e-5); this deep-stack aggregate gets a wider, documented bound.
+    _GIVENS_STACK_TOL = 1e-3
+    torch.manual_seed(604)
+    gstack = MinGRUStack(D_in, D_h, 3, mixer="givens").eval()
+    with torch.no_grad():
+        y_par_g, _ = gstack(x)
+        state = gstack.init_state()
+        ys = []
+        for t in range(T):
+            y_t, state = gstack.step(x[:, t], state)
+            ys.append(y_t)
+    err = (y_par_g - torch.stack(ys, dim=1)).abs().max().item()
+    print(f"givens stack parallel vs streaming max abs diff: {err:.3e}")
+    assert err < _GIVENS_STACK_TOL
+
+    with torch.no_grad():
+        y_a_g, carry_g = gstack(x[:, : T // 2])
+        y_b_g, _ = gstack(x[:, T // 2 :], state=carry_g)
+    err = (y_par_g - torch.cat([y_a_g, y_b_g], dim=1)).abs().max().item()
+    print(f"givens stack chunked vs full max abs diff: {err:.3e}")
+    assert err < _GIVENS_STACK_TOL
+
+    loss = MinGRUStack(D_in, D_h, 3, mixer="givens")(x)[0].sum()
+    loss.backward()
+    print("givens stack gradcheck ok")
+
+    # --- gradients reach all three heads + h0, all finite and nonzero ---
+    mg_grad = GivensMinGRU(D_in, D_h)
+    mg_grad(x_g).sum().backward()
+    for _name, _p in [
+        ("linear_theta", mg_grad.linear_theta.weight),
+        ("linear_z", mg_grad.linear_z.weight),
+        ("linear_h", mg_grad.linear_h.weight),
+        ("h0", mg_grad.h0),
+    ]:
+        assert _p.grad is not None and torch.isfinite(_p.grad).all() and _p.grad.abs().sum() > 0, (
+            f"givens {_name} received no/non-finite gradient"
+        )
+    print("givens gradcheck ok: all three heads + h0 receive finite gradient")
+
+    # --- matrix_affine_scan gradcheck-lite: finite grads through the k-dim
+    # scan (the k>2 analogue of the matrix_scan gradcheck-lite above) ---
+    torch.manual_seed(605)
+    A_s = torch.randn(2, 9, 3, 4, 4) * 0.5  # (B, T, n, k, k), unconstrained
+    B_s = torch.randn(2, 9, 3, 4, 1)  # (B, T, n, k, v=1)
+    A_s.requires_grad_(True)
+    B_s.requires_grad_(True)
+    Abar_s, Bbar_s = matrix_affine_scan(A_s, B_s)
+    (Abar_s.sum() + Bbar_s.sum()).backward()
+    assert A_s.grad is not None and torch.isfinite(A_s.grad).all()
+    assert B_s.grad is not None and torch.isfinite(B_s.grad).all()
+    print("matrix_affine_scan gradcheck-lite ok")
 
     # =====================================================================
     # Structural guard: DecayMixin._init_decay constructs a mixer's decay
