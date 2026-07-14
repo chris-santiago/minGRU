@@ -254,7 +254,16 @@ def run_arm(args):
     make, vocab, n_cls = TASKS[args.task]
     torch.manual_seed(args.seed)
     gen = torch.Generator().manual_seed(1 + 10_000 * args.seed)
-    if args.model == "hetero-svq8-d2":
+    if args.model == "hetero-sr-nosnap":
+        # P3: signed -> continuous rotation (snap=None); existing promoted
+        # mixers only, parallel matrix_scan path, no new modules.
+        from probes import MinGRUTagger
+
+        model = MinGRUTagger(
+            vocab, n_cls, ["signed", "rotation"],
+            {"rotation": {"snap": None}}, n_layers=2,
+        )
+    elif args.model == "hetero-svq8-d2":
         model = _VQHeteroTagger(
             vocab, n_cls, HETERO_FACTORY_MODELS["hetero-sd2"], n_codes=8
         )
