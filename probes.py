@@ -53,12 +53,12 @@ Usage: python probes.py TASK MODEL [N_LAYERS]
        MODEL in {GRU, minGRU, minGRU-signed, minGRU-signed-tanh,
        minGRU-signed-tanh-tdecay, minGRU-signed-tanh-tdecay-mech,
        minGRU-rotsnap, minGRU-hetero-sr, minGRU-hetero-rs,
-       minGRU-rotation2} (GRU is not valid for the two timestamped tasks:
-       it has no delta_t input path); N_LAYERS defaults to 1 for
-       single-mixer models. The three list-mixer models
-       (minGRU-hetero-sr/-rs, minGRU-rotation2) fix N_LAYERS to their
-       mixer list's length (2); omit N_LAYERS for those or pass the
-       matching value -- an explicit conflicting value raises
+       minGRU-rotation2, minGRU-hetero-sg8} (GRU is not valid for the two
+       timestamped tasks: it has no delta_t input path); N_LAYERS defaults
+       to 1 for single-mixer models. The four list-mixer models
+       (minGRU-hetero-sr/-rs, minGRU-rotation2, minGRU-hetero-sg8) fix
+       N_LAYERS to their mixer list's length (2); omit N_LAYERS for those
+       or pass the matching value -- an explicit conflicting value raises
        ValueError. minGRU-rotation2 (two rotation blocks) is the known
        STE-compounding broken baseline -- constructing it emits exactly
        one UserWarning (see MinGRUStack).
@@ -67,8 +67,9 @@ Usage: python probes.py TASK MODEL [N_LAYERS]
        validation accuracy at T=128 (seed 5, n_batches=2), evaluated
        every EVAL_EVERY steps over the full step budget; off by default
        so legacy early-stop rows stay reproducible. Rows containing a
-       rotation block (minGRU-rotsnap, minGRU-hetero-sr, minGRU-hetero-rs,
-       minGRU-rotation2) are validated only under this protocol.
+       rotation-or-givens block (minGRU-rotsnap, minGRU-hetero-sr,
+       minGRU-hetero-rs, minGRU-rotation2, minGRU-hetero-sg8) are
+       validated only under this protocol.
 """
 
 import os
@@ -145,6 +146,18 @@ MIXER_REGISTRY = {
     # multi-rotation UserWarning by design (Task 1's MinGRUStack contract)
     # -- expected, not suppressed.
     "minGRU-rotation2": (["rotation", "rotation"], None),
+    # Signed -> Givens heterogeneous stack (spec section 6; ledger stmt 5):
+    # one signed (decoupled tanh, default kwargs -- same config as
+    # minGRU-signed-tanh) block and one givens block (default block_size=8,
+    # rounds=3 -- the hetero-loop-17-sg8 evidence configuration) in a
+    # 2-layer stack. mixer_kwargs=None: the list-mixer schema applies every
+    # type's default kwargs (no per-type overrides needed here). Layer
+    # count is fixed to len(mixer) == 2 by the list-mixer N_LAYERS rule
+    # (see _resolve_n_layers) -- omit N_LAYERS or pass 2 explicitly. Runs
+    # under the rotation-family CKPT protocol (best-val@128, full budget,
+    # no early stop), the same treatment as the other rotation/givens rows
+    # (spec section 6: "rotation-family CKPT treatment").
+    "minGRU-hetero-sg8": (["signed", "givens"], None),
 }
 
 # Model names whose TimestampedMinGRUTagger skips the fairness-rule
@@ -890,6 +903,7 @@ GRID = [
     ("S3-hier", "minGRU-signed-tanh", 2, 1600, False),
     ("S3-hier", "minGRU-rotsnap", 1, 1600, True),
     ("S3-hier", "minGRU-hetero-sr", 2, 1600, True),
+    ("S3-hier", "minGRU-hetero-sg8", 2, 1600, True),
 ]
 
 
