@@ -219,7 +219,7 @@ class DeltaNetMixer(nn.Module):
     """Generalized-Householder delta rule (DeltaNet nh=1; DeltaProduct
     nh>1) -- the incumbent-mechanism comparison point for
     RotationMinGRU's snap variant, reimplemented from Yang et al. /
-    Grazzi et al. as a plain-torch, sequential recurrence (no
+    Siems et al. as a plain-torch, sequential recurrence (no
     chunked/parallel form, no port of the official Triton kernels).
 
     Per head, state is a d_k x d_v matrix H (d_k = d_v = d_h / n_heads).
@@ -376,7 +376,7 @@ VARIANTS = {
         d_in, d_h, snap=(2, 3, 4, 6), reg=0.01
     ),
     # Incumbent-mechanism comparison (DeltaNet/DeltaProduct, Yang et al.
-    # / Grazzi et al.): generalized-Householder delta rule reimplemented
+    # / Siems et al.): generalized-Householder delta rule reimplemented
     # in this harness (mechanism only -- official Triton/CUDA code is
     # not run here). nh=1 is the single-reflection floor (DeltaNet);
     # nh=2 composes two reflections per token, the rotation-capable
