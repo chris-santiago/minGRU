@@ -217,9 +217,21 @@ S3-hier trainability (full record: `EXPERIMENTS.md` parts 1–3; driver:
   within-class map variance — the last causally); the rotation
   composer's exact solution has a near-zero training basin (0/3 exact
   re-attainment from 1% weight perturbation at any tested scale).
+- **Reliability = per-token map richness (mechanism x capacity
+  factorization, loops 15-18).** At matched 64-element state: 2D
+  rotations 1/6 (snapped or continuous), 64-state delta 2/6 with
+  chance plateaus, 8D Givens rotations (`GivensMinGRU`,
+  `hetero_lab.py`) 4/6 with near-fit misses and the best reliable
+  length gen recorded (0.840 @512 / 0.656 @1024 mean). The delta
+  mechanism is not special; its 6/6 owed much to 16x state. The
+  Givens-8 composer is parallel-native (matrix_affine_scan; the naive
+  delta-scan's 5-16x CPU penalty at d_k=16 shrinks 8x at k=8) and is
+  the promotion candidate under the parallel-only constraint.
 - **Killed arms** (pre-registered rules): soft-warmup, Neelakantan
   gradient noise under Adam, curriculum-as-fixer, budget-2x for the
-  rotation composer, VQ interface bottlenecks.
+  rotation composer, VQ interface bottlenecks, distill-then-snap
+  (sequential teacher in the training path), matched-capacity delta
+  as a reliability route.
 - **Protocol lessons in the harness:** checkpoint selection scores the
   deployment-mode model; `--ckpt-t` keeps selection discriminating
   after val@128 saturates (guarded against test-length leakage).

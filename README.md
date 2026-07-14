@@ -577,7 +577,9 @@ recorded under. The n=6 `minGRU-hetero-sr` row pools rounds
 
 | config (task `S3-hier`, chance ≈ 0.167) | seeds | acc@64 | acc@256 | acc@512 | acc@1024 |
 |---|---|---|---|---|---|
+| signed → givens8 (`hetero-sg8`, `experiments/hetero_lab.py`) | 6 | 0.998 | 0.944 | 0.840 | 0.656 |
 | signed → deltaproduct2 (`hetero-sd2`, `experiments/hetero_lab.py`) | 6 | 1.000 | 0.987 | 0.814 | 0.530 |
+| signed → 64-state delta (`hetero-sdm`) | 6 | 0.607 | 0.501 | 0.450 | 0.357 |
 | signed-tanh, L=2 (homogeneous) | 3 | 0.985 | 0.866 | 0.754 | 0.620 |
 | signed → rotation (`minGRU-hetero-sr`) | 6 | 0.572 | 0.442 | 0.375 | 0.309 |
 | rotation → signed (`minGRU-hetero-rs`) | 3 | 0.448 | 0.325 | 0.247 | 0.206 |
@@ -652,20 +654,36 @@ fit and *worsens* generalization, so the composer's continuous code is
 functional, not noisy (per-seed evidence:
 `experiments/EXPERIMENTS.md`, hetero-loop rounds).
 
+What separates reliable composers from unreliable ones is per-token
+map richness, not the delta mechanism — measured by holding the
+per-token state at 64 elements (every promoted mixer's size) and
+varying the composer family. 2-dimensional rotation blocks fit 1/6
+seeds whether snapped or continuous; the delta rule shrunk to 64
+state elements fits 2/6 with chance plateaus (`hetero-sdm` above);
+8-dimensional rotation blocks (`givens8`: per-token transitions built
+from three rounds of Givens rotations, special-orthogonal by
+construction, continuous, trained through the same parallel
+associative scan) fit 4/6 with the misses near-fit (best-val@128
+0.94/0.98) rather than at chance. The full-size delta composer's 6/6
+owes much of its reliability to its 16x-larger state (1,024 elements
+per token; capacity disclosure above). At matched capacity the
+Givens-8 composer also posts the best length generalization of any
+reliably trainable configuration (0.840 @512, 0.656 @1024 mean; best
+seed 0.956/0.812), above the full-size delta composer's — per-seed
+rows in `experiments/EXPERIMENTS.md`.
+
 A lone rotation layer, rotation×2, rotation→signed, a lone delta-rule
 layer (`deltaproduct2`, L=1), and an unconstrained `GRU` all sit at or
 near chance on `S3-hier`: no single capability (depth alone, or a
 composition mechanism alone) is enough — extracting the pair and
-composing it non-commutatively both have to happen. Read together, the
-three working configurations trace a mechanism-level trade measured
-from both sides: homogeneous signed depth trains reliably and decays
-with length; the rotation-composer stack is rare-but-exact (discrete
-maps — exact when training finds them, and training rarely finds
-them); the delta-composer stack is reliable-but-inexact (continuous
-maps — found by training every time, never exact). No configuration
-wins outright and no claim is budget-independent: every number above
-is relative to the stated step budget, not a claim that any
-configuration solves `S3-hier`.
+composing it non-commutatively both have to happen. Read together:
+homogeneous signed depth trains reliably and decays with length;
+composer reliability rises with per-token map richness in every
+mechanism family tested; and exactness at length remains unique to
+the snapped composer's rare winner (0.983 @1024) — no continuous
+composer reached it. No configuration wins outright and no claim is
+budget-independent: every number above is relative to the stated step
+budget, not a claim that any configuration solves `S3-hier`.
 
 **Training protocol: best-val@128 selection + retry-on-flag.** The
 exact automaton is reachable but is **not** a stable attractor of
