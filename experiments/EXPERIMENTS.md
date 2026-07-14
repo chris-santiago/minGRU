@@ -870,3 +870,101 @@ that same state per token, not its size) and `hidden_size` per token for
 configurations carry a materially larger per-token state (1024 vs. 64)
 and, for nh=2, roughly 2x `deltanet`'s own parameter count (25480 vs.
 16900) — the comparisons above are same-`d_model`, not same-capacity.
+
+## Round: hetero training-fix loop, part 1 (hetero-loop-01..06)
+
+**Context.** The research synthesis
+(`.claude/output/research/2026-07-13-hetero-stack-hypotheses.md`) ranked
+training-side fixes for `minGRU-hetero-sr`'s S3-hier trainability
+problem (recorded: near chance at 1600; 1/3 seeds exact at 6400, round
+`hetero-legB-ceiling`). This round runs an autonomous hypothesize→test→
+refine loop over that ranking: every arm pre-registers a hit/kill rule
+before running, and every arm runs through
+`experiments/hetero_lab.py` — whose flags-off path was verified to
+reproduce the recorded `hetero-legB-v2` seed-0 row to 4 decimals
+(steps 1300, val128 0.3243, acc 0.457/0.2447/0.2043/0.1864) before any
+arm counted. Protocol per row: CKPT best-val@128 over the full budget,
+acc@64 seed 3, gen lengths seed 4, T_TRAIN=64, batch 128, Adam 3e-3.
+
+**Loop 1 — instrumented diagnostics (no new accuracy rows).**
+Deterministic reruns of the three `hetero-legB-ceiling` seeds (best
+val/step reproduced exactly: 0.5726@5100 / 1.0@5100 / 0.7626@5200) with
+per-eval instrumentation on a fixed diagnostic batch:
+
+1. *Coupling refuted.* A linear probe decodes the pair's Latin-square
+   generator from layer-1 states at ≥0.95 by step 400–800 on every
+   seed (plateau seeds reach 0.999 while task accuracy is near
+   chance). Extraction is never the bottleneck. The winner's probe
+   accuracy *drops* to ~0.92 as it locks in.
+2. *The exact solution is not all-angles-on-grid.* The winner's mean
+   angle residual stays ~0.27 snap-steps at loss 0.0 — unused blocks
+   live off-grid. A global commitment penalty contradicts the observed
+   solution geometry.
+3. *Snap-flip oscillation is the lock-in signature.* Winner: flip rate
+   0.10–0.27 while wandering, 0.001–0.01 once locked (~step 4900),
+   with val128 bouncing 0.94→0.75→0.99→0.76 over steps 4400–4800
+   before sticking. Plateau seeds flip at 0.07–0.24 indefinitely.
+4. *Plateau seeds keep climbing at 6400* (seed 0 val128 0.35→0.53 over
+   the back half), motivating the budget diagnostic below.
+
+**Loop 2 — budget 2x (`hetero-loop-02-budget`).** Baseline flags-off at
+12800 steps on the two plateau seeds:
+
+| seed | best step | val128 | @64 | @256 | @512 | @1024 |
+|---|---|---|---|---|---|---|
+| 0 | 11500 | 0.657 | 0.885 | 0.421 | 0.294 | 0.232 |
+| 2 | 7100 | 0.782 | 0.968 | 0.564 | 0.392 | 0.279 |
+
+Neither locks at double budget (6400-budget bests: 0.573/0.763). The
+failure is basin search, not pure speed; acceleration-family arms
+demoted without spend.
+
+**Loop 3 — soft-warmup composer, KILLED
+(`hetero-loop-03-softwarmup`).** Tier-1 #1 (Guo soft-then-hard): 400
+soft steps + 100-step STE blend, seeds 0–5 at 1600. Worse than
+baseline on every matched seed — acc@64
+0.246/0.262/0.312/0.287/0.425/0.271 vs baseline
+0.457/0.533/0.469/0.442/0.999/0.534; best val128 0.373. Snapping at
+step 400–500 destroys the soft-phase progress and the run ends worse
+than training snapped from scratch: the soft solution's used angles
+are not near grid points (consistent with diagnostic finding 2).
+STE-from-scratch beats soft-then-hard here.
+*Protocol incident:* the first launch scored CKPT selection in
+training mode, letting a soft-phase val (0.367@400) win selection and
+collapse at the final hard eval; fixed to deployment-mode selection
+(`_hard_mode_eval`, commit e7c1cff), the one flawed row purged
+(backup `.git/lab_results.jsonl.bak`), all seeds relaunched clean.
+
+**Loop 3 bonus — baseline seed extension
+(`hetero-loop-03-base-ext`).** Flags-off seeds 3–5 at 1600:
+
+| seed | best step | val128 | @64 | @256 | @512 | @1024 |
+|---|---|---|---|---|---|---|
+| 3 | 1600 | 0.387 | 0.442 | 0.360 | 0.346 | 0.300 |
+| 4 | 1200 | 0.988 | 0.999 | 0.929 | 0.730 | 0.535 |
+| 5 | 1600 | 0.433 | 0.534 | 0.368 | 0.291 | 0.230 |
+
+Seed 4 near-fits at the 1600 budget: the baseline hit rate at 1600 is
+~1/6 (n=6 pooling `hetero-legB-v2` seeds 0–2), not 0/3 — screen
+verdicts in this round compare against that rate, and the seed
+lottery is wide (fit arrives by step 1200 when it arrives).
+
+**Loop 5 — annealed gradient noise, KILLED
+(`hetero-loop-05-gradnoise`).** Tier-1 #4 (Neelakantan):
+`sigma^2 = 0.01/(1+t)^0.55` added to `p.grad` pre-Adam, seeds 0–5 at
+1600. Unanimous catastrophic kill: every seed at chance (acc@64
+0.185–0.192, val128 0.177–0.183) — below every baseline seed. Through
+Adam the noise (sigma 0.1 at t=1, 0.013 at t=1600) swamps the raw CE
+gradients and training never gets a clean phase; the parameterization
+does not transplant from SGD-era setups onto Adam at this scale. Not
+re-parameterized: the family's escape-bad-minima mechanism mismatches
+the weak-attractor/long-wander diagnosis.
+
+**Rank state after part 1.** Killed: soft-warmup (this schedule),
+gradient noise (as parameterized). Demoted without spend:
+identity-composer warmup (its extractor-first rationale died with
+diagnostic finding 1), acceleration family (Loop 2). Live: composer
+swap `signed→deltaproduct2` (Loop 4, `hetero-loop-04-sd2`), length
+curriculum under the composer-credit rationale (Loop 6,
+`hetero-loop-06-curriculum`), near-solution init epsilon-sweep,
+wd x init-norm grid. Loops 4/6 report in part 2.
