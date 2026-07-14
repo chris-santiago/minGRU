@@ -49,12 +49,16 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from min_gru import RotationMinGRU
 from probes import (
-    BATCH, CKPT_T, EVAL_EVERY, LR, T_TRAIN, TASKS, accuracy, build,
+    BATCH, CKPT_T, D_MODEL, EVAL_EVERY, LR, T_TRAIN, TASKS, accuracy, build,
 )
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from variants import VARIANTS, VariantBlock  # noqa: E402
 
 RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lab_results.jsonl")
 GEN_LENGTHS = (256, 512, 1024)
@@ -104,12 +108,51 @@ class _LabRotation(RotationMinGRU):
         return M, b
 
 
+# Hetero stacks over experiments/variants.py building blocks (Tier-2 #7:
+# swap the snapped-rotation composer for the DeltaProduct nh=2 mixer,
+# which solved plain S3 with no snap in round incumbent-delta). Built
+# from the same VariantBlock/final-LN shape as VariantStack, so rows are
+# protocol-comparable to both the hetero-sr rows and incumbent-delta.
+HETERO_FACTORY_MODELS = {
+    "hetero-sd2": ("signed-tanh", "deltaproduct2"),
+    "hetero-d2s": ("deltaproduct2", "signed-tanh"),
+}
+
+
+class _ListVariantStack(nn.Module):
+    """VariantStack with a per-layer factory tuple instead of one factory."""
+
+    def __init__(self, d_model, factory_names):
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            VariantBlock(d_model, VARIANTS[name]) for name in factory_names
+        )
+        self.norm_out = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        return self.norm_out(x)
+
+
+class _HeteroVariantTagger(nn.Module):
+    def __init__(self, vocab, n_cls, factory_names):
+        super().__init__()
+        self.emb = nn.Embedding(vocab, D_MODEL)
+        self.stack = _ListVariantStack(D_MODEL, factory_names)
+        self.head = nn.Linear(D_MODEL, n_cls)
+
+    def forward(self, x):
+        return self.head(self.stack(self.emb(x)))
+
+
 def _rotation_mixers(model):
-    return [
-        blk.mingru
-        for blk in model.stack.blocks
-        if isinstance(blk.mingru, RotationMinGRU)
-    ]
+    mixers = []
+    for blk in model.stack.blocks:
+        m = getattr(blk, "mingru", None) or getattr(blk, "mixer", None)
+        if isinstance(m, RotationMinGRU):
+            mixers.append(m)
+    return mixers
 
 
 def _parse_curriculum(spec):
@@ -133,7 +176,10 @@ def run_arm(args):
     make, vocab, n_cls = TASKS[args.task]
     torch.manual_seed(args.seed)
     gen = torch.Generator().manual_seed(1 + 10_000 * args.seed)
-    model = build(args.task, args.model, vocab, n_cls, None)
+    if args.model in HETERO_FACTORY_MODELS:
+        model = _HeteroVariantTagger(vocab, n_cls, HETERO_FACTORY_MODELS[args.model])
+    else:
+        model = build(args.task, args.model, vocab, n_cls, None)
     rot = _rotation_mixers(model)
     for m in rot:
         m.__class__ = _LabRotation
