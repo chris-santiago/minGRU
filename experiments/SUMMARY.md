@@ -219,21 +219,21 @@ S3-hier trainability (full record: `EXPERIMENTS.md` parts 1–3; driver:
   composer's exact solution has a near-zero training basin (0/3 exact
   re-attainment from 1% weight perturbation at any tested scale).
 - **Reliability rises with per-token map richness (mechanism x
-  state-size factorization, loops 15-18; n=6 rates, extension to n=12
-  in progress).** At matched 64-element state: 2D rotations 1/6
-  (snapped or continuous), 64-state delta 2/6 with chance plateaus,
-  8D Givens rotations (`GivensMinGRU`, `hetero_lab.py`) 4/6 with
-  near-fit misses and the best length gen of any reliably-fitting
-  config under this protocol (0.840 @512 / 0.656 @1024 mean). The
-  within-rotation-family gradient (1/6 -> 4/6) comes at +2.2% total
-  params — not a parameter effect. The cross-mechanism comparison
-  (Givens vs 64-state delta) is a two-seed difference at n=6 and the
-  delta cell has 4.4x fewer composer params — suggestive, not
-  established. Well-powered: depth (6/6 vs 0/6) and within-delta
-  state size (6/6 at 1,024 vs 2/6 at 64). GivensMinGRU is the
-  promotion candidate under the parallel-only constraint on
-  reliability + gen + design fit; measured CPU cost still favors the
-  sequential delta (microbenchmark in EXPERIMENTS.md).
+  state-size factorization, loops 15-18, n=12).** At matched
+  64-element state: 2D continuous rotations 1/12, 64-state delta 4/12
+  with chance-plateau misses, 8D Givens rotations (`GivensMinGRU`,
+  `hetero_lab.py`) 8/12 with mostly-near-fit misses. The
+  within-rotation-family gradient (1/12 -> 8/12, Fisher p = 0.0094)
+  comes at +2.2% total params — established, not a parameter effect.
+  Within-delta state size (6/6 at 1,024 vs 4/12 at 64, p = 0.0128) —
+  established. Cross-mechanism at matched state (8/12 vs 4/12,
+  p = 0.22, composer params unmatched 14,624 vs 3,306) — suggestive
+  only. Fit quality is mechanism-independent (fit-only @1024: 0.733
+  Givens vs 0.739 small-delta); mechanisms differ in fit RATE.
+  GivensMinGRU is the promotion candidate under the parallel-only
+  constraint on reliability + gen + design fit; measured CPU cost
+  still favors the sequential delta path (no parallel-scan config
+  beats it on CPU; microbenchmark in EXPERIMENTS.md).
 - **Killed arms** (pre-registered rules): soft-warmup, Neelakantan
   gradient noise under Adam, curriculum-as-fixer, budget-2x for the
   rotation composer, VQ interface bottlenecks, distill-then-snap

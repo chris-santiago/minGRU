@@ -577,9 +577,9 @@ recorded under. The n=6 `minGRU-hetero-sr` row pools rounds
 
 | config (task `S3-hier`, chance ≈ 0.167) | seeds | acc@64 | acc@256 | acc@512 | acc@1024 |
 |---|---|---|---|---|---|
-| signed → givens8 (`hetero-sg8`, `experiments/hetero_lab.py`) | 6 | 0.998 | 0.944 | 0.840 | 0.656 |
+| signed → givens8 (`hetero-sg8`, `experiments/hetero_lab.py`) | 12 | 0.949 | 0.885 | 0.787 | 0.613 |
 | signed → deltaproduct2 (`hetero-sd2`, `experiments/hetero_lab.py`) | 6 | 1.000 | 0.987 | 0.814 | 0.530 |
-| signed → 64-state delta (`hetero-sdm`) | 6 | 0.607 | 0.501 | 0.450 | 0.357 |
+| signed → 64-state delta (`hetero-sdm`) | 12 | 0.575 | 0.495 | 0.457 | 0.376 |
 | signed-tanh, L=2 (homogeneous) | 3 | 0.985 | 0.866 | 0.754 | 0.620 |
 | signed → rotation (`minGRU-hetero-sr`) | 6 | 0.572 | 0.442 | 0.375 | 0.309 |
 | rotation → signed (`minGRU-hetero-rs`) | 3 | 0.448 | 0.325 | 0.247 | 0.206 |
@@ -658,24 +658,29 @@ Within the rotation family, per-token map richness separates reliable
 composers from unreliable ones — measured by holding the per-token
 state at 64 elements (every promoted mixer's size) and parameters
 nearly constant (+2.2% full-stack). 2-dimensional rotation blocks fit
-1/6 seeds whether snapped or continuous; 8-dimensional rotation
-blocks (`givens8`: per-token transitions built from three rounds of
-Givens rotations, special-orthogonal by construction, continuous,
-trained through the same parallel associative scan) fit 4/6 with the
-misses near-fit (best-val@128 0.94/0.98) rather than at chance. The
-delta rule shrunk to the same 64-element state fits 2/6 with chance
-plateaus (`hetero-sdm` above) — so the full-size delta composer's 6/6
-owes much of its reliability to its 16x-larger state (1,024 elements
-per token; capacity disclosure above) — though the Givens-vs-small-
-delta comparison itself is a two-seed difference at n=6 with unmatched
-parameter counts (14,624 vs 3,306 composer parameters), suggestive
-rather than established. At matched state the Givens-8 composer also
-posts the best length generalization among the checkpoint-selected
-configurations that fit reliably (0.840 @512, 0.656 @1024 mean; best
-seed 0.956/0.812), above the full-size delta composer's; the
-homogeneous signed-tanh L=2 row (0.620 @1024) sits close behind under
-its different (early-stop) protocol — per-seed rows and parameter
-counts in `experiments/EXPERIMENTS.md`.
+1/12 seeds continuous (1/6 snapped); 8-dimensional rotation blocks
+(`givens8`: per-token transitions built from three rounds of Givens
+rotations, special-orthogonal by construction, continuous, trained
+through the same parallel associative scan) fit 8/12 (Fisher exact
+p ≈ 0.009 against the 2D rate), with three of the four misses
+near-fit (best-val@128 0.83–0.98) and one low seed. The delta rule
+shrunk to the same 64-element state fits 4/12 with chance plateaus on
+the misses (`hetero-sdm` above) — so the full-size delta composer's
+6/6 owes much of its reliability to its 16x-larger state (1,024
+elements per token, p ≈ 0.013 for the state-size effect; capacity
+disclosure above) — though the Givens-vs-small-delta comparison
+itself (8/12 vs 4/12, p ≈ 0.22, unmatched composer parameters: 14,624
+vs 3,306) is suggestive rather than established. Fit quality is
+mechanism-independent: seeds that fit generalize equally under either
+composer (0.733 vs 0.739 @1024 fit-only means) — the mechanisms
+differ in how often training finds a solution, not in how well the
+found solutions generalize. Among configurations that fit reliably,
+the Givens-8 composer's fit-only profile (0.927 @512, 0.733 @1024;
+best seed 0.956/0.812) leads the full-size delta composer's
+(0.815/0.530 across its 6/6 fits); the homogeneous signed-tanh L=2
+row (0.620 @1024) sits close behind under its different (early-stop)
+protocol — per-seed rows, parameter counts, and Fisher tests in
+`experiments/EXPERIMENTS.md`.
 
 A lone rotation layer, rotation×2, rotation→signed, a lone delta-rule
 layer (`deltaproduct2`, L=1), and an unconstrained `GRU` all sit at or

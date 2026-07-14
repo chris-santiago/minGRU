@@ -1209,16 +1209,48 @@ parameter counts (d_model=64): deltaproduct2 25,480 / givens8 14,624
 / rotation-2d 12,544 / deltamini 3,306; full stacks hetero-sd2
 105,550 / hetero-sg8 94,694 / hetero-sr 92,614 / hetero-sdm 83,376.
 
-Efficiency, measured (single-process microbenchmark, min of 3, all
-four configs timed in the same window; per-op FLOP arithmetic
-overstated these gaps and is not quoted): fwd+bwd at the training
-shape (B=128, T=64) — sequential delta16 0.54s, parallel-scan delta16
-2.53s, parallel-scan givens8 1.42s, parallel-scan deltamini 0.35s.
-The Givens scan is cheaper than the delta16 scan but still slower
-than the sequential delta on CPU; the small-state deltamini scan is
-the one parallel config that beats the sequential path outright. A
-promotion case for GivensMinGRU rests on the parallel-only design
-constraint plus reliability and length generalization, not on CPU
-cost. Exactness at length remains unique to the snapped composer's
+Efficiency, measured (single-process microbenchmark, min of 3,
+uncontended; per-op FLOP arithmetic overstated these gaps and is not
+quoted): fwd+bwd at the training shape (B=128, T=64) — sequential
+delta16 0.179s, parallel-scan delta16 1.955s, parallel-scan givens8
+0.961s, parallel-scan deltamini 0.268s. The Givens scan is ~2x
+cheaper than the delta16 scan but still slower than the sequential
+delta path on CPU, and even the small-state deltamini scan trails it
+(~1.5x) — no parallel-scan config beats the sequential rank-1
+implementation on CPU. A promotion case for GivensMinGRU rests on
+the parallel-only design constraint plus reliability and length
+generalization, not on CPU cost. Exactness at length remains unique to the snapped composer's
 rare winner (0.983 @1024, 1/6 with a near-zero re-attainment basin);
 no continuous composer reached it.
+
+**n=12 extension (external-review remediation, same rounds).** Seeds
+6-11 added to `hetero-loop-17-sg8`, `-18-sdm`, and `-15-nosnap` under
+the identical protocol. Pooled fit rates (val@128 >= 0.99) and n=12
+means:
+
+| config | fits | @64 | @256 | @512 | @1024 | fit-only @512 / @1024 |
+|---|---|---|---|---|---|---|
+| `hetero-sg8` | 8/12 | 0.949 | 0.885 | 0.787 | 0.613 | 0.927 / 0.733 |
+| `hetero-sdm` | 4/12 | 0.575 | 0.495 | 0.457 | 0.376 | 0.942 / 0.739 |
+| `hetero-sr-nosnap` | 1/12 | 0.515 | 0.404 | 0.352 | 0.293 | 0.902 / 0.669 |
+
+Fisher exact (two-sided) on fit rates: within the rotation family
+(8/12 vs 1/12) p = 0.0094 — the map-richness gradient is established;
+within the delta family (6/6 at 1,024 state vs 4/12 at 64 state)
+p = 0.0128 — the state-size effect is established; across mechanisms
+at matched state (8/12 vs 4/12) p = 0.22 — suggestive only, and still
+parameter-confounded (14,624 vs 3,306 composer params). sg8's four
+misses: three near-fits (val@128 0.83-0.98) and one low seed (0.384)
+— the extension surfaced one plateau-like miss, so "no chance
+plateaus" holds only as a tendency, not a rule. Notable: fit-only
+generalization is indistinguishable between sg8 and sdm fits (0.733
+vs 0.739 @1024) — the mechanisms differ in how OFTEN training finds a
+solution, not in how well the found solutions generalize.
+
+Efficiency, re-measured uncontended (min of 3, fwd+bwd at B=128,
+T=64): sequential delta16 0.179s; parallel-scan delta16 1.955s;
+parallel-scan givens8 0.961s; parallel-scan deltamini 0.268s. The
+earlier same-window numbers were CPU-contended; conclusions
+unchanged except one correction: the deltamini scan is ~1.5x SLOWER
+than the sequential delta16 path, not faster — no parallel-scan
+config beats the sequential rank-1 implementation on CPU.
