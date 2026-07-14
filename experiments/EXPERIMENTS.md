@@ -762,3 +762,111 @@ The README's "What this shows" S3 table now quotes the `s3-diag-ckpt`
 rows with a per-row protocol column; the earlier early-stop coupled S3
 records (rounds 2 / `reseed-fix`) stay in `lab_results.jsonl` unchanged
 and are superseded in the README table by these same-protocol rows.
+
+## Round: incumbent comparison (incumbent-delta)
+
+**Motivation:** closes the research review's MAJOR-3 scope gap at the
+mechanism level. `DeltaNetMixer` (`experiments/variants.py`) reimplements
+the DeltaNet (Yang et al.) / DeltaProduct (Siems et al., NeurIPS 2025)
+generalized-Householder delta rule as a plain-torch, sequential
+recurrence — nh=1 registered as `"deltanet"`, nh=2 (the rotation-capable
+configuration) as `"deltaproduct2"`. The official DeltaNet/DeltaProduct
+code is Triton/CUDA and trained under a different regime that cannot run
+in this repo's CPU-only environment, so this round compares **transition
+rules under this repo's protocol**, not the incumbents' released systems
+or published numbers.
+
+**Protocol:** `T_train=64`, `d_model=64`, batch 128, Adam lr 3e-3, budget
+1600 steps (`MAX_STEPS` default), seeds 0/1/2, `L=1`; parity uses
+early-stop (as the diagonal/rotation rows do), S3 uses best-val@128
+checkpoint selection (`EXP_CKPT=1`, matching `minGRU-rotsnap`'s recorded
+protocol); eval lengths 64/256/512/1024; `uv run --python 3.12 --with
+'torch==2.5.1' python experiments/variants.py`, torch 2.5.1, CPU.
+
+**Per-seed results** (all 12 `round: "incumbent-delta"` rows in
+`lab_results.jsonl`; `val128` is the S3 checkpoint-selection val-acc@128,
+blank where not applicable):
+
+| task | variant | seed | steps | @64 | @256 | @512 | @1024 | val128 |
+|---|---|---|---|---|---|---|---|---|
+| parity | deltanet | 0 | 100 | 1.0000 | 0.9994 | 0.9038 | 0.7301 | — |
+| parity | deltanet | 1 | 100 | 1.0000 | 1.0000 | 0.8989 | 0.8242 | — |
+| parity | deltanet | 2 | 100 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | — |
+| parity | deltaproduct2 | 0 | 100 | 1.0000 | 1.0000 | 0.9734 | 0.7389 | — |
+| parity | deltaproduct2 | 1 | 100 | 1.0000 | 1.0000 | 1.0000 | 1.0000 | — |
+| parity | deltaproduct2 | 2 | 100 | 1.0000 | 0.9999 | 0.8828 | 0.6924 | — |
+| S3 | deltanet | 0 | 1600 | 0.4145 | 0.3551 | 0.3447 | 0.3377 | 0.3846 |
+| S3 | deltanet | 1 | 1300 | 0.4197 | 0.3536 | 0.3449 | 0.3396 | 0.3830 |
+| S3 | deltanet | 2 | 700 | 0.4231 | 0.3581 | 0.3439 | 0.3393 | 0.3858 |
+| S3 | deltaproduct2 | 0 | 200 | 1.0000 | 1.0000 | 0.9999 | 0.9938 | 1.0000 |
+| S3 | deltaproduct2 | 1 | 300 | 1.0000 | 1.0000 | 0.9995 | 0.9741 | 1.0000 |
+| S3 | deltaproduct2 | 2 | 300 | 1.0000 | 1.0000 | 1.0000 | 0.9991 | 1.0000 |
+
+**Means (n=3 each):**
+
+| task | variant | mean @64 | mean @256 | mean @512 | mean @1024 |
+|---|---|---|---|---|---|
+| parity | deltanet | 1.0000 | 0.9998 | 0.9342 | 0.8514 |
+| parity | deltaproduct2 | 1.0000 | 1.0000 | 0.9521 | 0.8104 |
+| S3 | deltanet | 0.4191 | 0.3556 | 0.3445 | 0.3389 |
+| S3 | deltaproduct2 | 1.0000 | 1.0000 | 0.9998 | 0.9890 |
+
+**Conclusions:**
+
+1. **nh=1 (`deltanet`) fits parity instantly but cannot fit S3** — parity
+   mean@64 = 1.000 in 100 steps (same budget as every other parity row in
+   this file), while S3 mean@64 = 0.419 (near the ~0.37-0.42 diagonal
+   chance band recorded for other commutative/reflection-only mixers in
+   this file's "research-review remediation" round). A single Householder
+   reflection has determinant -1 on every application: it cannot compose
+   to the even-permutation elements S3/D3 needs, matching DeltaProduct's
+   own representability theory (single reflections are the paper's own
+   ablation floor, not a state-tracking-complete mechanism).
+2. **nh=2 (`deltaproduct2`) solves S3 near-exactly on every seed, and
+   trains reliably with no retry protocol.** All three seeds hit
+   val128 = 1.000 by step 200-300 (vs. a full 1600-step budget), and hold
+   0.999-1.000 through @512 and 0.974-0.994 @1024 — composing two
+   reflections per token realizes a rotation, which is state-tracking-
+   complete for S3. This is a materially different training profile from
+   this repo's `minGRU-rotsnap` (`RotationMinGRU`, L=1), whose recorded
+   n=8 result (`reseed-fix` round, above) is 1.000/1.000/0.996/0.958
+   @64/256/512/1024 with only 1/8 seeds landing the exact solution. The
+   documented retry-on-flag rule is one-directional there — a sub-1.0
+   val@128 reliably marks a bad run, but in that n=8 record every seed
+   passed the flag and 7/8 still decayed, so retries cannot select for
+   exactness on S3. `deltaproduct2` raised no flag and needed no retry
+   across its 3 seeds.
+3. **Parity length-generalization under early-stop is seed-inconsistent
+   for both incumbents.** `deltanet` @1024 ranges 0.730-1.000 (mean
+   0.851); `deltaproduct2` @1024 ranges 0.692-1.000 (mean 0.810). Both
+   are well below this repo's recorded `signed-tanh` parity result
+   (`reseed-fix` round, above), n=6: 1.000/1.000/0.999/0.994 (worst
+   0.984) — signed-tanh's tanh asymptote sits at the exact eigenvalue
+   parity needs, giving it an attractor the delta-rule's beta/k
+   parameterization does not share under this protocol.
+4. **All of the above is budget-relative** (1600-step budget, 3 seeds,
+   this repo's harness and protocol only) — it is not a claim about the
+   incumbents' released systems, published training regimes, or
+   published numbers.
+
+**Capacity disclosure (d_model=64):** parameter and per-token state-size
+counts, computed by constructing each module and summing
+`p.numel() for p in module.parameters()` (state size per the formulas
+noted); script run via `uv run --python 3.12 --with 'torch==2.5.1'
+python capacity_counts.py`, output quoted verbatim:
+
+```
+module                                      params   state/token
+DeltaNetMixer nh=1 (n_heads=4)               16900          1024
+DeltaNetMixer nh=2 (n_heads=4)               25480          1024
+RotationMinGRU (minGRU-rotsnap config)       12544            64
+SignedMinGRU (default, coupled=False)        12480            64
+```
+
+State size is `n_heads * d_k * d_v` per token for `DeltaNetMixer`
+(4 heads x 16 x 16 = 1024; nh only changes how many micro-steps update
+that same state per token, not its size) and `hidden_size` per token for
+`RotationMinGRU`/`SignedMinGRU` (64). At equal `d_model`, both delta-rule
+configurations carry a materially larger per-token state (1024 vs. 64)
+and, for nh=2, roughly 2x `deltanet`'s own parameter count (25480 vs.
+16900) — the comparisons above are same-`d_model`, not same-capacity.
