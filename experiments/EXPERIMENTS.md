@@ -1254,3 +1254,51 @@ earlier same-window numbers were CPU-contended; conclusions
 unchanged except one correction: the deltamini scan is ~1.5x SLOWER
 than the sequential delta16 path, not faster — no parallel-scan
 config beats the sequential rank-1 implementation on CPU.
+
+## Round: GivensMinGRU promotion evidence replication (`givens-promotion-replication-01`)
+
+Provenance-transfer gate for the promoted `min_gru.GivensMinGRU` /
+`matrix_affine_scan`: the bit-identity self-tests
+(`hetero_lab.py --selftest`) prove the promoted `GivensMinGRU` class and
+scan are byte-identical to the frozen lab class at default flags, but
+the pooled n=12 `hetero-loop-17-sg8` evidence was trained through
+`experiments/hetero_lab.py`'s `_HeteroVariantTagger`
+(`("signed-tanh", "givens8")` factories), not through `probes.py`'s
+`MinGRUStack`. This round closes that gap: one `probes.py` run of the
+promoted registry row `minGRU-hetero-sg8` (`S3-hier`, seed 0, CKPT
+best-val@128, `MAX_STEPS=1600`) reproduces the recorded
+`hetero-loop-17-sg8` seed-0 row exactly, showing the promoted path IS
+the evidence path.
+
+Command:
+
+```
+uv run --python 3.12 --with 'torch==2.5.1' python - <<'PY'
+import probes
+model = probes.run_one("S3-hier", "minGRU-hetero-sg8", ckpt=True, max_steps=1600, seed=0)
+make, _, _ = probes.TASKS["S3-hier"]
+for T, seed in [(64, 3), (256, 4), (512, 4), (1024, 4)]:
+    print(T, round(probes.accuracy(model, make, T, seed=seed), 4))
+PY
+```
+
+Recorded (`hetero-loop-17-sg8`, seed 0) vs replicated
+(`givens-promotion-replication-01`, seed 0):
+
+| field | recorded | replicated | match? |
+|---|---|---|---|
+| steps (best checkpoint step) | 1100 | 1100 | yes |
+| ckpt val128 | 1.0 | 1.0 | yes |
+| acc@64 (seed 3) | 1.0 | 1.0 | yes |
+| acc@256 (seed 4) | 0.9941 | 0.9941 | yes |
+| acc@512 (seed 4) | 0.9105 | 0.9105 | yes |
+| acc@1024 (seed 4) | 0.6619 | 0.6619 | yes |
+
+Exact match on every metric — no tolerance widening was needed. The
+replication row is appended to `lab_results.jsonl` under round
+`givens-promotion-replication-01`, `config.replicates` pointing back at
+`hetero-loop-17-sg8` and `config.commit` recording the promoted-code
+commit the run was executed against. This transfers the pooled n=12
+`hetero-loop-17-sg8`/`-18-sdm`/`-15-nosnap` evidence (README's Givens
+mechanism numbers) onto the promoted `min_gru.py` code path without
+rerunning the multi-seed campaign.
