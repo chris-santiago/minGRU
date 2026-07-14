@@ -693,7 +693,9 @@ a run for retry. That is a materially better training profile than
 reference lands the exact solution in only 1 of 8 seeds and still needs
 the retry-on-flag protocol to separate that seed from the other 7,
 while `deltaproduct2`'s 3 of 3 seeds all land near-exactly without any
-retries. On parity, both incumbent configurations show the same
+retries (an unequal-sample comparison — n=3 vs. n=8 — though the
+val@128-by-step-300 unanimity leaves little room for a seed-luck
+reading). On parity, both incumbent configurations show the same
 length-generalization inconsistency across seeds: `deltanet` mean@1024
 = 0.851 (per-seed range 0.730-1.000) and `deltaproduct2` mean@1024 =
 0.810 (per-seed range 0.692-1.000), both below this repo's recorded
