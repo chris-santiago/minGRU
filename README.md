@@ -6,11 +6,13 @@ layer whose gates depend only on the current input, so the whole sequence
 trains in one parallel scan instead of step-by-step backpropagation through
 time (BPTT). Single file, no dependencies beyond `torch`.
 
-This repo ships the base minGRU plus two variants that each fix a specific
+This repo ships the base minGRU plus three variants that each fix a specific
 gap in it: **`SignedMinGRU`** (state can flip sign, not just decay toward
-zero) and **`RotationMinGRU`** (state can track operations that don't
-commute, like composing permutations). All three share one `mixer=`
-interface on `MinGRUBlock`/`MinGRUStack`, and all three optionally accept
+zero), **`RotationMinGRU`** (state can track operations that don't
+commute, like composing permutations), and **`GivensMinGRU`** (richer
+non-commuting state via rotations across 8-dimensional blocks instead of
+2D planes). All four share one `mixer=`
+interface on `MinGRUBlock`/`MinGRUStack`, and all four optionally accept
 a time-aware decay term for irregularly-spaced sequences — a real-world
 gap between events, not just a token count (see "Time-aware decay,"
 below). What each variant actually buys you, in measured accuracy, is
@@ -159,10 +161,12 @@ the "vanilla" minGRU in the paper's Appendix A.
 | `MinGRU` | one scan layer (log-space, positive states, `a_t ∈ (0,1)`); parallel `forward`, recurrent `step`; optional time-decay (`decay=`, `decay_rate=`, `log1p_delta=`) scales `a_t` only — see "Time-aware decay" |
 | `SignedMinGRU` | signed diagonal transitions (linear-space scan, `a_t ∈ (−1,1)`, unconstrained states); `coupled=False` (default, decoupled eigenvalue) or `coupled=True` (legacy reproduction); same API; same time-decay kwargs as `MinGRU` |
 | `RotationMinGRU` | 2x2 block rotation transitions (non-diagonal, matrix scan); `snap` grid manufactures exact-angle attractors; depth is a measured tradeoff, not a fixed limit (see "Rotation variant"); same API; same time-decay kwargs, scaling the whole 2x2 block (direction unaffected) |
+| `GivensMinGRU` | k-dim block-rotation transitions (non-diagonal, `matrix_affine_scan`); each transition is a product of `rounds` brick-wall Givens layers per `block_size`-dim block, special-orthogonal and continuous (no snap) — richer per-token maps than `RotationMinGRU`'s 2x2 at the same per-token state (see "Givens variant"); same API; same time-decay kwargs, scaling the whole block by a scalar (rotation unaffected) |
 | `linear_scan` | Hillis–Steele associative scan for `h_t = a_t·h_{t−1} + b_t` with signed scalar coefficients |
 | `matrix_scan` | Hillis–Steele associative scan for `h_t = M_t @ h_{t−1} + b_t` with 2x2 matrix coefficients (non-commutative composition) |
-| `MinGRUBlock` | pre-norm residual block: LN → mixer → +x, LN → MLP → +x (`mixer` selects `"log"`, `"signed"`, or `"rotation"`; `mixer_kwargs` forwarded to its constructor); `forward`/`step` take an optional `delta_t`, forwarded to the block's mixer unchanged |
-| `MinGRUStack` | input projection → N blocks → final LN; full state threading; `mixer=` is a `str` (applied to every block, unchanged) or a `list[str]` of length `n_layers` mixing types per block (e.g. one rotation block inside a signed/log stack); `mixer_kwargs` is the current flat dict for a `str` mixer, or `None`/a dict keyed by mixer type for a `list` mixer, applied to every block of that type (two blocks of the same type share one config); more than one `"rotation"` entry warns once per construction (STE-compounding, doesn't block construction) and proceeds; `decay_layers="all"` (default) or `"last"` selects which blocks receive the resolved kwargs' decay keys, positionally, whatever each block's type; `forward`/`step` take an optional `delta_t`, routed only to blocks whose mixer has decay enabled |
+| `matrix_affine_scan` | Hillis–Steele associative scan for `h_t = M_t @ h_{t−1} + b_t` with k×k matrix coefficients (the `block_size` generalization of `matrix_scan`, used by `GivensMinGRU`) |
+| `MinGRUBlock` | pre-norm residual block: LN → mixer → +x, LN → MLP → +x (`mixer` selects `"log"`, `"signed"`, `"rotation"`, or `"givens"`; `mixer_kwargs` forwarded to its constructor); `forward`/`step` take an optional `delta_t`, forwarded to the block's mixer unchanged |
+| `MinGRUStack` | input projection → N blocks → final LN; full state threading; `mixer=` is a `str` (applied to every block, unchanged) or a `list[str]` of length `n_layers` mixing types per block (e.g. one rotation block inside a signed/log stack); `mixer_kwargs` is the current flat dict for a `str` mixer, or `None`/a dict keyed by mixer type for a `list` mixer, applied to every block of that type (two blocks of the same type share one config); more than one `"rotation"` entry warns once per construction (STE-compounding, doesn't block construction) and proceeds, while multiple `"givens"` entries do **not** warn (the continuous Givens transition has no straight-through snap to compound); `decay_layers="all"` (default) or `"last"` selects which blocks receive the resolved kwargs' decay keys, positionally, whatever each block's type; `forward`/`step` take an optional `delta_t`, routed only to blocks whose mixer has decay enabled |
 
 `MinGRU` is deliberately atomic. A single layer's gates cannot condition on
 accumulated state (that is the parallelism trade); stacking recovers
@@ -197,6 +201,11 @@ legacy_stack = MinGRUStack(
 rot_stack = MinGRUStack(32, 256, n_layers=1, mixer="rotation")
 # non-diagonal 2x2 rotation blocks; single-mixer use, and only under the
 # best-val@128 training protocol -- see "Rotation variant" below
+
+givens_stack = MinGRUStack(32, 256, n_layers=2, mixer="givens")
+# k-dim block-rotation transitions (default block_size=8, rounds=3);
+# richer non-commutative per-token maps than "rotation", continuous (no
+# snap); d_model must be a multiple of block_size -- see "Givens variant"
 ```
 
 Mixing mixer types across layers (`mixer=` as a `list[str]`, one name per
@@ -244,8 +253,9 @@ m = MinGRU(32, 64, learnable_h0=True)   # zero-init == fixed g(0)=0.5 default
 ```
 
 `learnable_h0` routes to the block/stack's mixer only when `mixer="log"` or
-`"signed"`; `RotationMinGRU` owns its `h_0` unconditionally (see "Rotation
-variant" below) and does not accept the flag.
+`"signed"`; `RotationMinGRU` and `GivensMinGRU` each own their `h_0`
+unconditionally (see "Rotation variant" and "Givens variant" below) and do
+not accept the flag.
 
 ## State conventions
 
@@ -255,7 +265,7 @@ All exposed state is **real hidden state** — an output of `forward()` or
 - `forward(h_0=...)` takes `(B, 1, d_h)`; `step(h_prev=...)` takes
   `(B, d_h)`. Crossing between streaming and chunked modes needs an
   explicit `unsqueeze` (intentional — no silent dimension coercion). Same
-  shapes for `MinGRU`, `SignedMinGRU`, and `RotationMinGRU`.
+  shapes for `MinGRU`, `SignedMinGRU`, `RotationMinGRU`, and `GivensMinGRU`.
 - **Do not pass pre-activations.** The paper's reference code treats
   `h_0` as a pre-activation and applies `g` to it internally; this
   implementation does not. Passing a pre-activation here silently
@@ -267,14 +277,15 @@ All exposed state is **real hidden state** — an output of `forward()` or
   `h_0` raise, via `torch._assert_async` (device-side on CUDA, so chunked
   loops incur no per-chunk host sync). Exact zeros are accepted and
   clamped to the dtype's smallest normal before `log()`, since
-  legitimately small states underflow to 0.0 in fp16/bf16. `SignedMinGRU`
-  and `RotationMinGRU` accept any real `h_0` — no clamp, no check; the
-  positivity constraint is a property of the log-space parameterization
-  only.
-- `RotationMinGRU.h_0` is an intrinsic learned parameter, not an optional
-  flag (see "Rotation variant," below): a zero state has no orbit under
-  the group action, so it can't demonstrate tracking, and a state on a
-  reflection axis collapses reflections onto rotations.
+  legitimately small states underflow to 0.0 in fp16/bf16. `SignedMinGRU`,
+  `RotationMinGRU`, and `GivensMinGRU` accept any real `h_0` — no clamp,
+  no check; the positivity constraint is a property of the log-space
+  parameterization only.
+- `RotationMinGRU.h_0` and `GivensMinGRU.h_0` are each an intrinsic
+  learned parameter, not an optional flag (see "Rotation variant" and
+  "Givens variant," below): a zero state has no orbit under the group
+  action, so it can't demonstrate tracking, and a state on a reflection
+  axis collapses reflections onto rotations.
 
 The full derivation and code path for each rule above is in the
 corresponding docstrings in `min_gru.py` (`forward`, `step`, `log_g`).
@@ -293,8 +304,10 @@ corresponding docstrings in `min_gru.py` (`forward`, `step`, `log_g`).
   sequential path, remove the decorator.
 - Numerical agreement between the parallel and sequential paths, fp32 at
   T=128: ~1e-5 for `MinGRU` (`logcumsumexp` accumulation), ~1e-7 for
-  `SignedMinGRU` (no exp/log round-trip), ~1e-6 for `RotationMinGRU` —
-  none exact by construction.
+  `SignedMinGRU` (no exp/log round-trip), ~1e-6 for `RotationMinGRU`, and
+  ~1e-5 for `GivensMinGRU` (a product of `rounds` k×k blocks per step, so
+  more matrix accumulation than the single 2x2) — none exact by
+  construction.
 
 ## The ladder: fading, flipping, turning, reading
 
@@ -370,7 +383,7 @@ and "Expressivity limits" below is the formal version of this picture.
   range is worth checking in a proxy run rather than assuming parity
   with a standard GRU. `SignedMinGRU` removes this constraint.
 - **Expressivity class.** Input-dependent, state-independent transitions
-  put all three mixers in the same broad class as Mamba/S6 and GLA:
+  put all four mixers in the same broad class as Mamba/S6 and GLA:
   fixed-depth stacks are TC⁰ (Merrill et al., *The Illusion of State in
   State-Space Models*) and cannot do unbounded state tracking that a
   single nonlinear GRU layer can. (Circuit-complexity shorthand used
@@ -385,10 +398,10 @@ and "Expressivity limits" below is the formal version of this picture.
   is believed unable to.) Depth recovers bounded-depth nonlinear
   interaction with history, not sequential computation. Depth-matched
   comparisons against a standard GRU confound layer count with
-  mechanism. Non-diagonal transitions (`RotationMinGRU`) lift the
-  *commutativity* restriction and provably solve bounded non-abelian
-  tracking (S3, a solvable group) that no diagonal variant can at any
-  width — but that is not the same as the unbounded, non-solvable-group
+  mechanism. Non-diagonal transitions (`RotationMinGRU`, `GivensMinGRU`)
+  lift the *commutativity* restriction and provably solve bounded
+  non-abelian tracking (S3, a solvable group) that no diagonal variant
+  can at any width — but that is not the same as the unbounded, non-solvable-group
   tracking (e.g. S5, NC¹-complete) that requires state-dependent gates;
   see the Signed and Rotation variant sections below. The probes make
   all of this measurable.
@@ -443,9 +456,9 @@ What decoupling does **not** restore: diagonal transitions still
 commute (scalar multiplication), so non-abelian state tracking
 (permutation composition and everything NC¹-complete) remains out of
 reach at any width, coupled or not — that requires non-diagonal
-transitions (`RotationMinGRU`, below) or state-dependent gates (i.e., a
-standard GRU). All diagonal variants, signed or not, remain in TC⁰ per
-Merrill et al.'s iterated-scalar-product argument.
+transitions (`RotationMinGRU` or `GivensMinGRU`, below) or state-dependent
+gates (i.e., a standard GRU). All diagonal variants, signed or not, remain
+in TC⁰ per Merrill et al.'s iterated-scalar-product argument.
 
 Practical differences from `MinGRU`: any real `h_0` is legal (no
 positivity check, no underflow clamp), and there are 3 linear heads
@@ -805,13 +818,98 @@ selection above (full comparison in `experiments/SUMMARY.md`, rounds 5
 and 8).
 
 Practical differences from the other mixers: 4 linear heads (z, h,
-theta, u) vs. `SignedMinGRU`'s 3 / `MinGRU`'s 2 (mind parameter-matched
-comparisons); `h_0` is an intrinsic learned parameter with no
-`learnable_h0` flag (see "State conventions"); `hidden_size` must be
+theta, u) vs. `SignedMinGRU`'s 3 / `GivensMinGRU`'s 3 / `MinGRU`'s 2
+(mind parameter-matched comparisons); `h_0` is an intrinsic learned
+parameter with no `learnable_h0` flag (see "State conventions");
+`hidden_size` must be
 even (`ValueError` otherwise). The scan is O(T log T) work / O(log T)
 depth in pure torch ops, same tradeoff as `linear_scan`. Numerical
 agreement vs. the sequential path is covered in "Implementation notes,"
 above.
+
+## Givens variant (`GivensMinGRU`)
+
+Enriches the non-commutative rung of the ladder without leaving it.
+`RotationMinGRU` gives each transition a single 2x2 planar rotation;
+`GivensMinGRU` builds each per-token transition from a product of Givens
+rotations acting on a `block_size`-dimensional block of state, a strictly
+richer family of orthogonal maps at the same per-token state.
+
+**What a Givens rotation is.** A Givens rotation is the smallest possible
+rotation: it acts on one coordinate plane of a `k`-dimensional space and
+leaves the other `k−2` directions fixed — the identity matrix except for
+`cos`/`sin` entries in two rows. It is the atom of orthogonal structure:
+exactly orthogonal at every parameter value (no normalization step),
+determinant `+1`, one angle per plane. `RotationMinGRU` is already a Givens
+machine at `k = 2` — one plane, one input-dependent angle per token.
+`GivensMinGRU` composes many of them: at the default `block_size = 8`,
+`rounds = 3`, each per-token transition is a product of three brick-wall
+layers of Givens rotations (round 0 pairs planes (0,1),(2,3),(4,5),(6,7);
+round 1 the staggered planes (1,2),(3,4),(5,6),(7,0); round 2 repeats
+round 0's pattern), all angles emitted by one linear head. Disjoint planes
+within a round commute; the stagger between rounds is what couples all
+eight dimensions. Products of enough Givens rotations reach all of SO(k),
+so three rounds are a deliberate budget, not a representational limit. The
+result stays continuous, stays exactly special-orthogonal, stays parallel
+(the same associative scan, generalized to k×k blocks by
+`matrix_affine_scan`), and keeps the standard 64-element per-token state at
+the repo's `d_model`.
+
+**Where the richer map earns its place.** The extra structure is a
+*trainability* lever, not a jump in expressivity class — an 8D Givens
+product tracks the same solvable-group automata as a 2x2 rotation, and
+both remain below the state-dependent-gate line. What it changes is how
+often training finds a working composer. Within the rotation family, at
+matched 64-element per-token state, 8-dimensional Givens blocks fit
+`S3-hier` on 8 of 12 seeds against 1 of 12 for continuous 2D rotation
+blocks (Fisher exact p ≈ 0.009). The full measured evidence — per-length
+means, the delta-family comparison, and the map-richness argument — is
+tabulated under "Depth vs. hierarchy," above; this section covers the
+mechanism and its costs rather than restating that table.
+
+**The trade it does not escape.** Orthogonality buys norm preservation: no
+amplitude decay across hundreds of compositions. But continuity still
+means no attractor — nothing pins a learned angle to the exact group
+element it approximates, so small angle errors compound with length
+exactly as an unsnapped `RotationMinGRU`'s do, and accuracy still decays by
+`T = 1024`. Among seeds that fit, the givens8 composer holds 0.927 @512
+and 0.733 @1024 (best seed 0.956 / 0.812); pooled across all 12 seeds the
+`signed → givens8` profile is 0.949 / 0.885 / 0.787 / 0.613 at
+@64 / @256 / @512 / @1024 (the top row of the "Depth vs. hierarchy"
+table). Exactness at length remains unique to the snapped 2D composer's
+rare exact seed (0.983 @1024) — no continuous composer, Givens included,
+reaches it. Snapping the Givens angles is the obvious hybrid and an open
+question, not a promise.
+
+**Capacity disclosure.** At matched 64-element per-token state, the
+givens8 composer carries 14,624 parameters against the 2D-rotation
+composer's 12,544 — the map-richness gradient above costs +2.2% at the
+full stack, not a step change in capacity, so the fit-rate separation is
+not attributable to parameter count. Against the delta-rule composer
+shrunk to the same 64-element state (which fits 4 of 12 seeds), the
+comparison is parameter-unmatched (14,624 vs 3,306) and reads as
+suggestive only (p ≈ 0.22).
+
+**Measured CPU cost.** The parallel k×k scan is not the cheap path on CPU.
+Measured uncontended forward+backward at `B = 128, T = 64` (min of three
+runs), one training step costs 0.961s for the parallel-scan givens8
+transition against 0.179s for the sequential delta-rule path. The case for
+`GivensMinGRU` is the parallel-only design constraint together with fit
+reliability and length generalization within the rotation family, not
+training-step speed: no parallel-scan configuration measured here beats the
+sequential delta path on CPU, and the promotion rests on the first three
+properties rather than the last.
+
+Practical differences from the other mixers: 3 linear heads (theta, z, h)
+vs. `RotationMinGRU`'s 4 / `SignedMinGRU`'s 3 (mind parameter-matched
+comparisons); `hidden_size` must be a multiple of `block_size` and
+`block_size` must be even (`ValueError` otherwise); `h_0` is an intrinsic
+learned parameter with no `learnable_h0` flag (see "State conventions");
+stacks holding more than one Givens block construct without the
+multi-rotation warning, since the continuous transition has no
+straight-through snap to compound. The scan is O(T log T) work / O(log T)
+depth in pure torch ops. Numerical agreement vs. the sequential path is
+covered in "Implementation notes," above.
 
 ## Time-aware decay
 
@@ -820,8 +918,8 @@ no notion of how much real time elapsed between events. `decay=` adds
 an optional per-event forgetting term so a gap between events shrinks
 whatever the recurrence was already going to keep, without touching
 how it injects new information. Available on `MinGRU`, `SignedMinGRU`,
-and `RotationMinGRU` alike, and threaded through `MinGRUBlock` /
-`MinGRUStack`.
+`RotationMinGRU`, and `GivensMinGRU` alike, and threaded through
+`MinGRUBlock` / `MinGRUStack`.
 
 What follows works mechanism-first: the transition math and the
 `delta_t` contract below, then two experiments — a channel ablation
@@ -835,8 +933,8 @@ evidence before the mechanism.
 
 **Mechanism.** Each step's transition coefficient is scaled by
 `gamma = exp(-lambda * f(delta_t))`, where `lambda >= 0` is a per-
-channel (per-block, for `RotationMinGRU`) decay rate and `f` is
-identity or `log1p`. `gamma` multiplies the transition only —
+channel (per-block, for `RotationMinGRU`/`GivensMinGRU`) decay rate and
+`f` is identity or `log1p`. `gamma` multiplies the transition only —
 injection (`b_t`, the new information entering at this step) is never
 decayed, in every mixer:
 
@@ -848,6 +946,10 @@ decayed, in every mixer:
   by a positive scalar, so the snapped rotation angle is recovered
   unchanged from the decayed matrix; only amplitude is affected
   (direction/amplitude separation, unaffected by decay).
+- `GivensMinGRU`: `gamma * M_t` per block, the identical semantics to
+  `RotationMinGRU` — a scalar `gamma` commutes with the orthogonal block
+  action, so the composed rotation is recovered unchanged from the
+  decayed matrix; only amplitude fades.
 
 Because `lambda >= 0` and `delta_t >= 0`, `gamma` is always in `(0,
 1]` — decay can only shrink the transition, never amplify it.
@@ -874,8 +976,9 @@ disabled, or enabling decay without passing `delta_t`, both raise
 - `"fixed"`: `lambda = decay_rate`, a scalar buffer, uniform across
   channels/blocks — not learned.
 - `"learnable"`: `lambda = softplus(rho)`, one `rho` per hidden
-  channel (`MinGRU`/`SignedMinGRU`) or per block (`RotationMinGRU`);
-  `rho` is initialized so `lambda == decay_rate` exactly at
+  channel (`MinGRU`/`SignedMinGRU`) or per block
+  (`RotationMinGRU`/`GivensMinGRU`); `rho` is initialized so
+  `lambda == decay_rate` exactly at
   construction (`decay_rate` is then an *init* value, not a fixed
   constant).
 
@@ -1058,14 +1161,16 @@ shortcut for the training length."
 python probes.py TASK MODEL [N_LAYERS]
 ```
 
-- **`TASK`** — one of `parity`, `S3`, `session-parity`,
-  `parity-timestamped`. The last two supply `delta_t` (see "Time-aware
-  decay"); `GRU` has no `delta_t` input path and raises `ValueError` on
-  them.
+- **`TASK`** — one of `parity`, `S3`, `S3-hier`, `session-parity`,
+  `parity-timestamped`. `S3-hier` is the harder extract-then-compose
+  probe (chance ≈ 0.167; see "Depth vs. hierarchy" under "Rotation
+  variant"). The last two supply `delta_t` (see "Time-aware decay");
+  `GRU` has no `delta_t` input path and raises `ValueError` on them.
 - **`MODEL`** — one of `GRU`, `minGRU`, `minGRU-signed`,
   `minGRU-signed-tanh`, `minGRU-signed-tanh-tdecay`,
   `minGRU-signed-tanh-tdecay-mech`, `minGRU-rotsnap`, `minGRU-hetero-sr`,
-  `minGRU-hetero-rs`, `minGRU-rotation2`. `minGRU-signed` is
+  `minGRU-hetero-rs`, `minGRU-rotation2`, `minGRU-hetero-sg8`.
+  `minGRU-signed` is
   pinned to `coupled=True`: the legacy parameterization, kept under its
   historical name so recorded rows keep their meaning. The two
   `-tdecay` rows are `decay="learnable"` at `decay_rate=0.05`,
@@ -1074,10 +1179,12 @@ python probes.py TASK MODEL [N_LAYERS]
   `MinGRUStack(mixer=["signed", "rotation"])` stacks, one order each
   (signed→rotation, rotation→signed); `minGRU-rotation2` is
   `mixer=["rotation", "rotation"]`, the broken-baseline reference (emits
-  one `UserWarning` at construction). All three fix `N_LAYERS` to the
-  mixer list's length (2) — omit it or pass 2 explicitly; a conflicting
-  value raises `ValueError`. See "Rotation variant" for their measured
-  accuracy.
+  one `UserWarning` at construction). `minGRU-hetero-sg8` is the
+  `mixer=["signed", "givens"]` stack (signed extractor → Givens composer)
+  measured on `S3-hier`; it constructs without a warning. All four fix
+  `N_LAYERS` to the mixer list's length (2) — omit it or pass 2
+  explicitly; a conflicting value raises `ValueError`. See "Rotation
+  variant" and "Givens variant" for their measured accuracy.
 - **`N_LAYERS`** — defaults to `1`. The single-mixer `minGRU-rotsnap`
   row runs at `L=1` (its recorded protocol); rotation at depth runs
   through the list-mixer rows above — see "Rotation variant" for the
@@ -1129,18 +1236,21 @@ verification, and the record of what was tried and dropped).
 
 `python min_gru.py` runs the built-in suite: parallel-vs-sequential
 equivalence for every mixer (`MinGRU`, `SignedMinGRU` decoupled and
-`coupled=True`, `RotationMinGRU`, and their stacks), chunked-vs-full
-equivalence for the same set (including carries with negative/unbounded
-states), `SignedMinGRU(coupled=True)` construction-order determinism
-(bit-exact legacy reproduction), `matrix_scan` vs. brute-force
-sequential recurrence plus a gradcheck, `RotationMinGRU`'s snapped-angle
-grid exactness and gradient flow into all four heads and `h_0`,
-`RotationMinGRU`'s `ValueError` on odd `hidden_size`, `MinGRUBlock`'s
-`ValueError` on an unknown `mixer` name, gradient flow through both
-diagonal scans and into `h0_pre` **from zero-init** (guards the
-`log_g` fix), `log_g` gradient at 0 equal to 2, and `h_0` validation
-for the log-space variant (underflowed zeros accepted, negatives
-raise).
+`coupled=True`, `RotationMinGRU`, `GivensMinGRU`, and their stacks),
+chunked-vs-full equivalence for the same set (including carries with
+negative/unbounded states), `SignedMinGRU(coupled=True)`
+construction-order determinism (bit-exact legacy reproduction),
+`matrix_scan`/`matrix_affine_scan` vs. brute-force sequential recurrence
+plus a gradcheck, `RotationMinGRU`'s snapped-angle grid exactness and
+gradient flow into all four heads and `h_0`, `GivensMinGRU`'s exact
+orthogonality/determinant and gradient flow into all three heads and
+`h_0`, `RotationMinGRU`'s `ValueError` on odd `hidden_size`,
+`GivensMinGRU`'s `ValueError` on indivisible `hidden_size` and odd
+`block_size`, `MinGRUBlock`'s `ValueError` on an unknown `mixer` name,
+gradient flow through both diagonal scans and into `h0_pre` **from
+zero-init** (guards the `log_g` fix), `log_g` gradient at 0 equal to 2,
+and `h_0` validation for the log-space variant (underflowed zeros
+accepted, negatives raise).
 
 ## Further reading
 

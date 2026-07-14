@@ -230,10 +230,10 @@ S3-hier trainability (full record: `EXPERIMENTS.md` parts 1–3; driver:
   p = 0.22, composer params unmatched 14,624 vs 3,306) — suggestive
   only. Fit quality is mechanism-independent (fit-only @1024: 0.733
   Givens vs 0.739 small-delta); mechanisms differ in fit RATE.
-  GivensMinGRU is the promotion candidate under the parallel-only
-  constraint on reliability + gen + design fit; measured CPU cost
-  still favors the sequential delta path (no parallel-scan config
-  beats it on CPU; microbenchmark in EXPERIMENTS.md).
+  GivensMinGRU is promoted to `min_gru.py` as the selectable `givens`
+  mixer under the parallel-only constraint on reliability + gen + design
+  fit; measured CPU cost still favors the sequential delta path (no
+  parallel-scan config beats it on CPU; microbenchmark in EXPERIMENTS.md).
 - **Killed arms** (pre-registered rules): soft-warmup, Neelakantan
   gradient noise under Adam, curriculum-as-fixer, budget-2x for the
   rotation composer, VQ interface bottlenecks, distill-then-snap
@@ -261,7 +261,19 @@ S3-hier trainability (full record: `EXPERIMENTS.md` parts 1–3; driver:
 4. **Promotion** DONE (2026-07-12): SignedMinGRU/RotationMinGRU and
    the mixer-selector stack in `min_gru.py` (step() methods, docs,
    self-tests), `probes.py` registry + GRID wiring, README results
-   at current-env numbers.
+   at current-env numbers. GivensMinGRU and its k×k `matrix_affine_scan`
+   are likewise promoted (2026-07-14): selectable `mixer="givens"`
+   (defaults `block_size=8, rounds=3`), `probes.py` row
+   `minGRU-hetero-sg8` on `S3-hier` and GRID-wired, with self-tests
+   covering orthogonality, scan-vs-sequential, and forward-vs-step. The
+   pooled n=12 `hetero-loop-17-sg8` evidence carries onto the promoted
+   path by construction bit-identity plus one exact end-to-end
+   replication (round `givens-promotion-replication-01`, every fit/gen/
+   ckpt metric matching the recorded seed-0 row exactly). README ships
+   the Givens mechanism section with the parameter (14,624 vs 12,544 at
+   matched 64-element state) and measured-CPU-cost (parallel-scan givens8
+   0.961s vs sequential delta16 0.179s, uncontended fwd+bwd, B=128, T=64)
+   disclosures.
 
 ## How to run
 
