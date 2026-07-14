@@ -567,8 +567,13 @@ fixed Latin-square lookup built to be non-representable by either group
 of order six. The generator for each pair must be *extracted* before it
 can be *composed*: a lone rotation layer can't absorb the lookup by
 relabeling angles the way it can for a plain group operation. Measured
-at `MAX_STEPS=1600` unless noted (seeds per row as listed), multi-seed
-means:
+at `MAX_STEPS=1600` unless noted (seeds per row as listed; every number
+budget-relative), multi-seed means. Rotation- and delta-bearing rows
+use best-val@128 checkpoint selection (val@384 where noted);
+signed-tanh and `GRU` rows use the early-stop protocol they are
+recorded under. The n=6 `minGRU-hetero-sr` row pools rounds
+`hetero-legB-v2` (seeds 0–2) and `hetero-loop-03-base-ext` (seeds
+3–5), same protocol:
 
 | config (task `S3-hier`, chance ≈ 0.167) | seeds | acc@64 | acc@256 | acc@512 | acc@1024 |
 |---|---|---|---|---|---|
@@ -588,7 +593,8 @@ rotation-family rows but shows the same length decay documented for
 non-commutative composition, not the exact automaton. The
 extract-then-compose rotation stack (signed → rotation) fits on one
 seed in six at the standard budget (best-val@128 0.988 on that seed)
-and sits near chance on the rest. Rotation-bearing configurations show
+and sits near chance on the rest — its n=6 mean hides a 0.186–0.535
+per-seed spread @1024. Rotation-bearing configurations show
 a 0.86–1.0 per-seed spread at n=8 on plain `S3` — the large gaps here
 (fit vs. chance) are the trustworthy signal, not small differences
 between adjacent rows.
@@ -602,23 +608,27 @@ training dynamic already documented for plain `minGRU-rotsnap`,
 extending into the hetero stack's harder joint extract-and-compose
 optimization problem.
 
-Why the results split this way: composition destroys information for
-any layer above it, so the order is forced — a rotation layer fed raw
-sub-tokens composes a mixture nothing downstream can take apart,
-which is why rotation→signed wins on plain `S3` (where tokens *are*
-the operations) and sits at chance here. Why the working order still
-trains poorly is measured, not hypothesized: the extractor is never
-the bottleneck. On instrumented reruns of the recorded seeds, a linear
+Why the results split this way: composing first is hard to undo — a
+rotation layer fed raw sub-tokens builds a mixture nothing downstream
+is observed to take apart — a design rationale consistent with
+rotation→signed winning on plain `S3` (where tokens *are* the
+operations) and sitting at chance here, though the order effect is not
+itself isolated from other differences between the two stacks. Why the
+working order still trains poorly is measured rather than
+hypothesized, as far as linear probes can see: the extractor is not
+the bottleneck on any recorded seed. On instrumented reruns, a linear
 probe decodes the pair's generator from layer-1 states at ≥0.95 within
 400–800 steps on every seed — including seeds that plateau
 permanently — while the composer's snapped angles keep oscillating
 between grid cells (7–24% of snapped indices flip between checkpoints
 on plateau seeds, collapsing to ~0.1–1% only on a run that locks). The
 failure is the composer's search for an exact discrete solution, and
-that solution's training basin is measurably tiny: retraining from the
-winning weights perturbed by 1% per-tensor noise recovers near-exact
-accuracy on 2 of 3 seeds but returns to the exact automaton on none,
-at any perturbation scale tested (round `hetero-loop-14-basin`).
+that solution's training basin is measurably tiny at the standard
+budget: retraining for 1600 steps from the winning weights perturbed
+by 1% per-tensor noise recovers near-exact accuracy on 2 of 3 seeds
+but returns to the exact automaton on none, at any perturbation scale
+tested (one winner checkpoint, Gaussian perturbations, n=3 per scale;
+longer retrain budgets untested — round `hetero-loop-14-basin`).
 Auxiliary supervision or extractor-first schedules would target a
 coupling bottleneck that does not exist; best-val@128 remains the
 working tool — it hits 1.0 on runs that land the exact automaton and
