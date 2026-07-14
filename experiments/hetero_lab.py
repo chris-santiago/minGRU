@@ -58,7 +58,100 @@ from probes import (
 )
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from variants import VARIANTS, VariantBlock  # noqa: E402
+from variants import VARIANTS, VariantBlock, DeltaNetMixer  # noqa: E402
+
+
+def matrix_affine_scan(A, Bm):
+    """Inclusive associative scan of H_t = A_t @ H_{t-1} + B_t (H_0 = 0).
+
+    A: (B, T, h, k, k) square transitions; Bm: (B, T, h, k, v)
+    rectangular injections. Returns (Abar, Bbar), the cumulative affine
+    maps with H_t = Abar_t @ H_0 + Bbar_t; with H_0 = 0, H_t = Bbar_t.
+
+    Doubling (Hillis-Steele) scan: log2(T) rounds; each round composes
+    the affine pair at t with the pair ending at t-offset,
+    (A2, B2) o (A1, B1) = (A2 @ A1, A2 @ B1 + B2), where "2" is later.
+    Same associativity argument as min_gru.matrix_scan, generalized
+    from fixed 2x2 blocks to square-k transitions with rectangular
+    injections (the delta rule's matrix-valued state).
+    """
+    Ab, Bb = A, Bm
+    offset, T = 1, A.size(1)
+    while offset < T:
+        newA = torch.einsum("bthij,bthjk->bthik", Ab[:, offset:], Ab[:, :-offset])
+        newB = (
+            torch.einsum("bthij,bthjv->bthiv", Ab[:, offset:], Bb[:, :-offset])
+            + Bb[:, offset:]
+        )
+        Ab = torch.cat([Ab[:, :offset], newA], dim=1)
+        Bb = torch.cat([Bb[:, :offset], newB], dim=1)
+        offset *= 2
+    return Ab, Bb
+
+
+class DeltaScanMixer(DeltaNetMixer):
+    """DeltaNetMixer with a parallel associative-scan forward.
+
+    Identical parameters and state_dict to DeltaNetMixer (it subclasses
+    and adds none), so the sequential forward is the ground truth for
+    the equivalence selftest: per token the nh Householder micro-steps
+    compose to one affine map (A_tok, B_tok) on the matrix state H,
+
+        A_j = I - beta_j k_j k_j^T,  b_j = beta_j k_j v_j^T,
+        A_tok = A_{nh-1} @ ... @ A_0,
+        B_tok = sum_j (A_{nh-1} @ ... @ A_{j+1}) @ b_j,
+
+    and all H_t come from one matrix_affine_scan (H_0 = 0 => H_t =
+    Bbar_t); readout y_t = H_t^T q_t as in the parent. Floating-point
+    reassociation means outputs match the sequential path to ~1e-5,
+    not bit-exactly.
+    """
+
+    def forward(self, x):
+        B, T, _ = x.shape
+        h, dk = self.n_heads, self.d_k
+        q = self.linear_q(x).view(B, T, h, dk)
+        eye = torch.eye(dk, dtype=x.dtype, device=x.device)
+        A_tok = eye.expand(B, T, h, dk, dk)
+        B_tok = None
+        for j in range(self.nh):
+            k = F.normalize(self.linear_k[j](x).view(B, T, h, dk), dim=-1)
+            v = self.linear_v[j](x).view(B, T, h, self.d_v)
+            beta = (2 * torch.sigmoid(self.linear_beta[j](x)))[..., None, None]
+            A_j = eye - beta * torch.einsum("bthi,bthj->bthij", k, k)
+            b_j = beta * torch.einsum("bthi,bthv->bthiv", k, v)
+            A_tok = torch.einsum("bthij,bthjk->bthik", A_j, A_tok)
+            B_tok = b_j if B_tok is None else (
+                torch.einsum("bthij,bthjv->bthiv", A_j, B_tok) + b_j
+            )
+        _, Bbar = matrix_affine_scan(A_tok, B_tok)
+        y = torch.einsum("bthk,bthkv->bthv", q, Bbar)
+        return self.out_proj(y.reshape(B, T, h * self.d_v))
+
+
+def _selftest_delta_scan():
+    """DeltaScanMixer must match DeltaNetMixer's sequential forward on
+    the SAME weights (outputs and parameter gradients), for nh in
+    {1, 2} and a non-power-of-two T."""
+    for nh in (1, 2):
+        torch.manual_seed(7)
+        B, T, d = 3, 13, 64
+        x = torch.randn(B, T, d)
+        seq = DeltaNetMixer(d, d, nh=nh, n_heads=4)
+        par = DeltaScanMixer(d, d, nh=nh, n_heads=4)
+        par.load_state_dict(seq.state_dict())
+        y_seq, y_par = seq(x), par(x)
+        err = (y_seq - y_par).abs().max().item()
+        print(f"delta scan vs sequential (nh={nh}) max abs diff: {err:.3e}")
+        assert err < 1e-4, "parallel delta scan does not match sequential"
+        y_seq.sum().backward()
+        y_par.sum().backward()
+        for (n1, p1), (_, p2) in zip(
+            seq.named_parameters(), par.named_parameters()
+        ):
+            gerr = (p1.grad - p2.grad).abs().max().item()
+            assert gerr < 1e-3, f"grad mismatch on {n1} (nh={nh}): {gerr:.3e}"
+    print("delta scan equivalence (outputs + grads, nh=1,2) ok")
 
 RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lab_results.jsonl")
 GEN_LENGTHS = (256, 512, 1024)
@@ -116,6 +209,13 @@ class _LabRotation(RotationMinGRU):
 HETERO_FACTORY_MODELS = {
     "hetero-sd2": ("signed-tanh", "deltaproduct2"),
     "hetero-d2s": ("deltaproduct2", "signed-tanh"),
+    "hetero-sd2-par": ("signed-tanh", "deltascan2"),
+}
+
+# variants.py factories plus this lab's parallel-scan delta mixer
+LOCAL_FACTORIES = {
+    **VARIANTS,
+    "deltascan2": lambda d_in, d_h: DeltaScanMixer(d_in, d_h, nh=2),
 }
 
 
@@ -125,7 +225,7 @@ class _ListVariantStack(nn.Module):
     def __init__(self, d_model, factory_names):
         super().__init__()
         self.blocks = nn.ModuleList(
-            VariantBlock(d_model, VARIANTS[name]) for name in factory_names
+            VariantBlock(d_model, LOCAL_FACTORIES[name]) for name in factory_names
         )
         self.norm_out = nn.LayerNorm(d_model)
 
@@ -407,7 +507,9 @@ def run_arm(args):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--round", required=True)
+    p.add_argument("--selftest", action="store_true",
+                   help="run the delta-scan equivalence checks and exit")
+    p.add_argument("--round")
     p.add_argument("--task", default="S3-hier")
     p.add_argument("--model", default="minGRU-hetero-sr")
     p.add_argument("--seed", type=int, default=0)
@@ -430,7 +532,13 @@ def main():
         "cannot discriminate (e.g. 384 for gen-consolidation arms).",
     )
     p.add_argument("--dry-run", action="store_true", help="print row, skip ledger append")
-    run_arm(p.parse_args())
+    args = p.parse_args()
+    if args.selftest:
+        _selftest_delta_scan()
+        return
+    if not args.round:
+        p.error("--round is required (unless --selftest)")
+    run_arm(args)
 
 
 if __name__ == "__main__":
