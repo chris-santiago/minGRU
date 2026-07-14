@@ -968,3 +968,85 @@ swap `signed→deltaproduct2` (Loop 4, `hetero-loop-04-sd2`), length
 curriculum under the composer-credit rationale (Loop 6,
 `hetero-loop-06-curriculum`), near-solution init epsilon-sweep,
 wd x init-norm grid. Loops 4/6 report in part 2.
+
+## Round: hetero training-fix loop, part 2 (hetero-loop-04..13)
+
+**Loop 4 — composer swap, HIT 6/6 (`hetero-loop-04-sd2`).** Tier-2 #7:
+`hetero-sd2` = signed-tanh extractor -> DeltaProduct nh=2 composer
+(VariantBlock stack, `experiments/hetero_lab.py`), S3-hier, 1600 steps:
+
+| seed | fit step | val128 | @64 | @256 | @512 | @1024 |
+|---|---|---|---|---|---|---|
+| 0 | 500 | 1.0 | 1.0 | 0.9838 | 0.8021 | 0.5260 |
+| 1 | 1000 | 1.0 | 1.0 | 0.9885 | 0.8371 | 0.5562 |
+| 2 | 1200 | 1.0 | 1.0 | 0.9894 | 0.8379 | 0.5570 |
+| 3 | 900 | 1.0 | 1.0 | 0.9901 | 0.8010 | 0.5029 |
+| 4 | 1600 | 0.9998 | 1.0 | 0.9918 | 0.8384 | 0.5484 |
+| 5 | 800 | 1.0 | 1.0 | 0.9759 | 0.7703 | 0.4903 |
+
+Every seed fits exactly (baseline `minGRU-hetero-sr`: 1/6 near-fit at
+this budget); the seed lottery disappears; length gen decays smoothly
+and consistently. Trainability is a property of the composer mechanism.
+
+**Loop 6 — length curriculum, KILLED as a fixer
+(`hetero-loop-06-curriculum`).** 25% of batches at even T in [2,16],
+seeds 0-5: no seed reaches val128 0.9 (max 0.657). 4/6 matched seeds
+improve modestly (acc@64 mean 0.638 vs 0.572) but the baseline's one
+near-fit seed regresses (0.773 vs 0.999) — floor-raiser,
+ceiling-lowerer.
+
+**Loop 7 — attribution control, PASSES (`hetero-loop-07-d2L1`).**
+`deltaproduct2` L=1 on S3-hier, seeds 0-5: all near chance (acc@64
+0.225-0.251, val128 0.198-0.213). A single delta layer cannot both
+extract the pair function and compose — the hetero win in Loop 4 is
+depth buying hierarchy, not DeltaProduct solving S3-hier outright.
+
+**Loop 8 — budget consolidates gen; selection-saturation artifact
+fixed (`hetero-loop-08-sd2-6400`, `-v384`).** First attempt at 4x
+budget selected by val@128, which saturates at 1.0 by step 500 —
+the 6400 run reproduced the 1600 row exactly (row retained as the
+saturation record). Fix: `--ckpt-t` selection-length flag with a
+guard rejecting the reported test lengths; selection at T=384. Seeds
+0-2: val384 0.965/0.949/0.960 (best steps 6400/4000/6100), acc@256
+0.996-0.997, @512 0.877-0.889, @1024 0.590-0.597 (from ~0.53 at 1600).
+Drift shrinks with budget but approaches an asymptote well below
+exactness.
+
+**Loops 9-13 — drift-mechanism refutation cascade (diagnostics; only
+Loop 12 produced accuracy rows).** All diagnostics ran on
+deterministic reruns that reproduced their ledger anchors exactly.
+
+1. *Amplitude decay — refuted.* Learned beta sits far from 2 (medians
+   0.53/0.89 per micro-step) yet composer state norm grows 22->29
+   over 1024 steps; no collapse.
+2. *Extraction drift — refuted.* Layer-1 generator probe at positions
+   >=768 matches the early-position control (0.990 vs 0.988).
+3. *Beta-exactness as the S3-vs-S3-hier discriminator — refuted.*
+   Plain-S3 deltaproduct2 (which holds 0.974+ through 1024) learns
+   the same non-orthogonal beta regime (medians 0.91/1.28); a
+   "snap the delta gate" arm was killed before build.
+4. *Composer-input non-stationarity — refuted.* Post-norm bucket
+   statistics match an analytically stationary control (cos >=0.9996).
+5. *Within-class map variance — measured real, causally refuted as
+   the drift driver.* Per-token composed maps vary MORE within a
+   generator class than across classes (spread/separation 1.4-2.0 per
+   head). But collapsing the variance does not help: a from-scratch
+   VQ8 interface bottleneck breaks fit entirely
+   (`hetero-loop-12-vq8`: 6/6 chance), and post-hoc k-means
+   quantization of the trained composer's input is chance at k<=16,
+   and at k=64 preserves @64 (0.992) while making gen WORSE
+   (0.671/0.444 vs 0.801/0.503 at 512/1024). The within-class clouds
+   are functional — the composer's solution is a continuous
+   distributed code, not one map per class.
+
+**Where this leaves the mechanism picture.** The drift is intrinsic to
+the continuous solution family the delta composer learns at this
+scale/budget: it shrinks with training but asymptotes below exactness,
+and every cheap structural handle (orthogonality, input hygiene,
+discretization) has been ruled out by measurement or causal test. The
+program-level trade, both directions mechanistically grounded:
+discrete-map composers (rotation-snap) are exact when training finds
+them but training rarely finds them; continuous-map composers
+(DeltaProduct nh=2) are found by training every time but are never
+exact. Loop 14 (basin radius of the exact solution under near-solution
+init) reports in the close.
