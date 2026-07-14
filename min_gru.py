@@ -812,6 +812,71 @@ def matrix_scan(M: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.T
     return A, Bc
 
 
+def matrix_affine_scan(
+    A: torch.Tensor, Bm: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Associative scan for ``H_t = A_t @ H_{t-1} + B_t``, k x k transitions.
+
+    The k x k generalization of ``matrix_scan``: transitions are square
+    ``k x k`` matrices (instead of ``matrix_scan``'s fixed 2x2 blocks)
+    and injections are rectangular ``k x v`` matrix-valued states
+    (instead of ``matrix_scan``'s 2-vectors, i.e. ``v = 1``). Both scan
+    the same affine monoid
+    ``(A1, B1) o (A2, B2) = (A2 @ A1, A2 @ B1 + B2)`` by the same
+    Hillis-Steele doubling scheme; ``matrix_scan`` is exactly the
+    ``k = 2, v = 1`` special case, and ``matrix_affine_scan`` is what
+    the ``k > 2`` block-rotation mixer (``GivensMinGRU``, with the state
+    as a ``v = 1`` column) and matrix-valued delta-rule states run on.
+    O(T log T) work, O(log T) depth, pure torch ops, differentiable.
+    Composition order is ``A_current @ A_earlier`` — matrix
+    multiplication does not commute — so, as in ``matrix_scan``, the
+    running product depends on order.
+
+    Parameters
+    ----------
+    A : torch.Tensor
+        Shape ``(B, T, n, k, k)``. Per-block square transitions ``A_t``;
+        stability expects each ``A_t``'s spectral norm ``<= 1`` but this
+        is not enforced.
+    Bm : torch.Tensor
+        Shape ``(B, T, n, k, v)``. Additive injections ``B_t``, viewed
+        as ``n`` ``k x v`` matrices per timestep (``v = 1`` recovers the
+        vector state of ``matrix_scan``).
+
+    Returns
+    -------
+    tuple of torch.Tensor
+        ``(Abar, Bbar)``, shapes ``(B, T, n, k, k)`` and
+        ``(B, T, n, k, v)``, each aligned to ``t``, where
+        ``H_t = Abar_t @ H_0 + Bbar_t`` with ``Abar_t`` the running
+        matrix product of ``A`` and ``Bbar_t`` the ``H_0 = 0`` solution
+        of the recurrence.
+
+    Notes
+    -----
+    Same simplicity-over-efficiency tradeoff as ``matrix_scan`` /
+    ``linear_scan``: Hillis-Steele is work-inefficient (O(T log T) vs
+    O(T)) and retains O(log T) full ``(B, T, n, k, k)`` tensors for
+    autograd. Fine at the short training lengths this repo targets
+    (probes train at T=64); revisit for long-sequence training. Kept as
+    a distinct helper beside ``matrix_scan`` (rather than a
+    generalization of it) so the recorded 2x2 rotation evidence's
+    floating-point path is preserved byte-for-byte.
+    """
+    Ab, Bb = A, Bm
+    offset, T = 1, A.size(1)
+    while offset < T:
+        newA = torch.einsum("btnij,btnjk->btnik", Ab[:, offset:], Ab[:, :-offset])
+        newB = (
+            torch.einsum("btnij,btnjv->btniv", Ab[:, offset:], Bb[:, :-offset])
+            + Bb[:, offset:]
+        )
+        Ab = torch.cat([Ab[:, :offset], newA], dim=1)
+        Bb = torch.cat([Bb[:, :offset], newB], dim=1)
+        offset *= 2
+    return Ab, Bb
+
+
 class SignedMinGRU(DecayMixin, nn.Module):
     """minGRU variant with signed diagonal transitions (linear-space scan).
 
@@ -1376,6 +1441,306 @@ class RotationMinGRU(DecayMixin, nn.Module):
         )
 
 
+class GivensMinGRU(DecayMixin, nn.Module):
+    """minGRU variant with k-dim block-rotation transitions (non-diagonal).
+
+    The ``k > 2`` generalization of ``RotationMinGRU``'s ``snap=None``
+    regime. State is ``n_blocks = hidden_size / block_size`` independent
+    blocks of ``k = block_size`` dims (64 state elements total at the
+    repo's ``d_model = 512``: the same per-token state as every other
+    promoted mixer). Per block and token the transition is a product of
+    ``rounds`` layers of Givens rotations on fixed brick-wall planes,
+
+        M_t = G_{rounds-1} @ ... @ G_1 @ G_0,
+        h_t = M_t @ h_{t-1} + b_t,     b_t = sigmoid(z_t) * Linear_h(x_t)
+
+    (``h_{t-1}``, ``h_t``, ``b_t`` viewed as ``k``-vectors per block).
+    Each round ``r`` rotates a set of disjoint coordinate planes by
+    input-dependent angles from one linear head: even rounds pair planes
+    ``(0,1),(2,3),...``; odd rounds the staggered
+    ``(1,2),(3,4),...,(k-1,0)``. Every ``G_r`` is orthogonal with
+    determinant ``+1`` by construction, so ``M_t`` is exactly
+    special-orthogonal — continuous, with no straight-through snap.
+
+    Where ``RotationMinGRU`` manufactures attractors at exact group
+    elements by snapping 2x2 angles, ``GivensMinGRU`` deliberately does
+    not: ``rounds`` brick-wall layers of Givens rotations compose to
+    reach all of ``SO(k)`` (three rounds is the budget chosen for
+    ``k = 8``), giving richer non-abelian per-token maps at matched
+    state capacity, at the cost of having no attractor at any particular
+    transition — angles drift under length generalization exactly as
+    ``RotationMinGRU(snap=None)``'s do. Like the other matrix-transition
+    mixers it runs on a non-commutative parallel scan
+    (``matrix_affine_scan``, the ``k``-dim generalization of
+    ``matrix_scan``), so it can represent non-abelian state tracking a
+    diagonal (commutative) scan provably cannot.
+
+    Depth: unlike ``RotationMinGRU``, stacks holding multiple Givens
+    blocks construct WITHOUT a warning — the multi-rotation
+    ``UserWarning`` names straight-through snap compounding, which the
+    continuous (unsnapped) Givens transition does not have (see
+    ``MinGRUStack``).
+
+    ``h_0`` is an unconditional learnable parameter (no ``learnable_h0``
+    flag, same convention and rationale as ``RotationMinGRU``):
+    ``h_0 = 0`` has no orbit under the group action, so a zero initial
+    state cannot demonstrate state tracking; a random nonzero learned
+    vector avoids that failure mode.
+
+    Parameters
+    ----------
+    input_size : int
+        Dimensionality of the inputs ``x_t``.
+    hidden_size : int
+        Dimensionality of the hidden states ``h_t``; must be an integer
+        multiple of ``block_size`` (``hidden_size = n_blocks *
+        block_size``).
+    bias : bool, default=True
+        Whether the three linear maps carry bias terms.
+    block_size : int, default=8
+        Per-block state dimension ``k``; must be even and divide
+        ``hidden_size``. The default keeps the standard 64-element
+        per-token state at the repo's ``d_model``.
+    rounds : int, default=3
+        Number of brick-wall Givens layers composed per transition.
+        Three rounds generate all of ``SO(k)`` for ``k = 8`` (the
+        evidence configuration).
+    decay : {"fixed", "learnable", None}, default=None
+        Exponential time decay of the carried state: ``M_decayed =
+        gamma * M`` per block, with ``gamma = exp(-lambda *
+        f(delta_t))``. A scalar ``gamma`` commutes with the orthogonal
+        block action, so the composed transition's rotation is
+        unaffected — only amplitude fades — identical decay semantics to
+        ``RotationMinGRU``. ``None`` disables decay: ``delta_t`` must
+        then be omitted, and the forward computation is bit-identical to
+        the module without this feature (no ``gamma = 1`` multiply on
+        the disabled-decay path). ``"fixed"``: ``lambda = decay_rate``,
+        a scalar buffer. ``"learnable"``: ``lambda = softplus(rho)``,
+        one ``rho`` per block (``n_blocks`` channels), initialized so
+        ``lambda == decay_rate`` at construction. ``delta_t = 0`` gives
+        ``gamma = 1`` exactly.
+    decay_rate : float, default=1.0
+        Fixed decay rate, or the learnable rate's init target.
+    log1p_delta : bool, default=False
+        If True, ``delta_t`` is passed through ``log1p`` before scaling
+        by ``lambda``. See ``_normalize_delta_t``.
+
+    Raises
+    ------
+    ValueError
+        If ``hidden_size`` is not a multiple of ``block_size``, or
+        ``block_size`` is odd (at construction); or if ``decay`` is not
+        one of ``None``, ``"fixed"``, ``"learnable"`` (at construction);
+        or if ``decay`` is enabled without ``delta_t``, or ``delta_t``
+        is given without decay enabled (at call time, in
+        ``forward``/``step``).
+
+    Notes
+    -----
+    Same forward/step shapes as the module's other mixers: ``forward``
+    maps ``x (B, T, input_size)`` with optional ``h_0 (B, 1,
+    hidden_size)`` to ``(B, T, hidden_size)``; ``step`` maps ``x_t (B,
+    input_size)`` with optional ``h_prev (B, hidden_size)`` to ``(B,
+    hidden_size)``. ``delta_t`` follows the same optionality and shapes
+    as ``RotationMinGRU`` (``(B, T)`` or ``(B, T, 1)`` for ``forward``;
+    ``(B,)`` or ``(B, 1)`` for ``step``), with the identical
+    decay/``delta_t`` pairing contract (``ValueError`` both directions,
+    see ``_validate_delta_t_pairing``) and CPU-only invalid-entry
+    warning. Parameter count is 3 linear heads (theta, z, h): the angle
+    head emits ``n_blocks * rounds * (block_size / 2)`` angles.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        bias: bool = True,
+        block_size: int = 8,
+        rounds: int = 3,
+        decay: Decay = None,
+        decay_rate: float = 1.0,
+        log1p_delta: bool = False,
+    ):
+        super().__init__()
+        if block_size % 2 != 0:
+            raise ValueError(
+                f"GivensMinGRU requires an even block_size (got {block_size}); "
+                "brick-wall Givens rounds pair the k state dims into k/2 "
+                "disjoint planes."
+            )
+        if hidden_size % block_size != 0:
+            raise ValueError(
+                f"GivensMinGRU requires hidden_size ({hidden_size}) divisible by "
+                f"block_size ({block_size}); state is n_blocks = hidden_size / "
+                "block_size blocks of block_size dims."
+            )
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.k = block_size
+        self.n_blocks = hidden_size // block_size
+        self.rounds = rounds
+        half = block_size // 2
+        # RNG-draw order (the bit-identity seam vs the lab evidence
+        # generator): linear_theta, linear_z, linear_h, h0, then the
+        # angle-plane buffers (no RNG), then decay params last via
+        # _init_decay. Do not reorder the three Linear heads or h0.
+        self.linear_theta = nn.Linear(input_size, self.n_blocks * rounds * half, bias=bias)
+        self.linear_z = nn.Linear(input_size, hidden_size, bias=bias)
+        self.linear_h = nn.Linear(input_size, hidden_size, bias=bias)
+        self.h0 = nn.Parameter(torch.randn(1, 1, hidden_size) * 0.5)
+        for r in range(rounds):
+            start = r % 2
+            i_idx = torch.arange(start, block_size, 2) % block_size
+            j_idx = (i_idx + 1) % block_size
+            self.register_buffer(f"_pi{r}", i_idx)
+            self.register_buffer(f"_pj{r}", j_idx)
+        self._init_decay(decay, decay_rate, log1p_delta, self.n_blocks)
+
+    def _coeffs(
+        self, x: torch.Tensor, dt: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Per-block transition matrix and injection; shared by forward/step.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Shape ``(..., input_size)`` — ``forward`` passes
+            ``(B, T, input_size)``, ``step`` passes ``(B, input_size)``;
+            both work unchanged since ``nn.Linear`` and the elementwise
+            ops here broadcast uniformly over leading dims, so this
+            single helper serves both call paths and they cannot drift
+            apart.
+        dt : torch.Tensor, optional
+            Already-normalized ``delta_t`` (see ``_prepare_decay``),
+            shape matching ``x``'s leading dims. None if decay is
+            disabled.
+
+        Returns
+        -------
+        tuple of torch.Tensor
+            ``M``, shape ``(..., n_blocks, k, k)``: the (possibly
+            decayed) special-orthogonal transition, the product of
+            ``rounds`` brick-wall Givens layers. Decay scales the whole
+            block matrix by a positive scalar per ``(..., n_blocks)``,
+            leaving the rotation unchanged — only amplitude is affected.
+            ``b``, shape ``(..., n_blocks, k)``: the injection
+            ``sigmoid(z_t) * Linear_h(x_t)`` (never decayed), reshaped
+            into ``n_blocks`` ``k``-vectors.
+        """
+        lead = x.shape[:-1]
+        half = self.k // 2
+        theta = self.linear_theta(x).view(*lead, self.n_blocks, self.rounds, half)
+        eye = torch.eye(self.k, dtype=x.dtype, device=x.device)
+        M = eye.expand(*lead, self.n_blocks, self.k, self.k).clone()
+        for r in range(self.rounds):
+            i_idx = getattr(self, f"_pi{r}")
+            j_idx = getattr(self, f"_pj{r}")
+            cos = torch.cos(theta[..., r, :]).unsqueeze(-1)  # (..., n, half, 1)
+            sin = torch.sin(theta[..., r, :]).unsqueeze(-1)
+            rows_i = M[..., i_idx, :]
+            rows_j = M[..., j_idx, :]
+            M = M.clone()
+            M[..., i_idx, :] = cos * rows_i - sin * rows_j
+            M[..., j_idx, :] = sin * rows_i + cos * rows_j
+        if dt is not None:
+            M = self._decay_gamma(dt).unsqueeze(-1).unsqueeze(-1) * M
+        z = torch.sigmoid(self.linear_z(x))
+        b = (z * self.linear_h(x)).reshape(*lead, self.n_blocks, self.k)
+        return M, b
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        h_0: torch.Tensor | None = None,
+        delta_t: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Parallel forward over a full sequence.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input sequence, shape ``(B, T, input_size)``.
+        h_0 : torch.Tensor, optional
+            Initial hidden state, shape ``(B, 1, hidden_size)`` (reshaped
+            into ``n_blocks`` ``k``-vectors internally). Defaults to the
+            learned initial state.
+        delta_t : torch.Tensor, optional
+            Time gaps preceding each event, shape ``(B, T)`` or
+            ``(B, T, 1)``; required iff ``decay`` is enabled.
+
+        Returns
+        -------
+        torch.Tensor
+            All hidden states ``h_1..h_T``, shape
+            ``(B, T, hidden_size)``.
+
+        Raises
+        ------
+        ValueError
+            If ``decay`` is enabled without ``delta_t``, or ``delta_t``
+            is given without decay enabled.
+        """
+        B, T, _ = x.shape
+        if h_0 is None:
+            h_0 = self.h0.expand(B, 1, self.hidden_size)
+        h0_blocks = h_0.reshape(B, self.n_blocks, self.k)
+        dt = self._prepare_decay(delta_t, canonical_ndim=2)
+        M, b = self._coeffs(x, dt)
+        Abar, Bbar = matrix_affine_scan(M, b.unsqueeze(-1))
+        h = torch.einsum("btnij,bnj->btni", Abar, h0_blocks) + Bbar.squeeze(-1)
+        return h.reshape(B, T, self.hidden_size)
+
+    @torch.no_grad()
+    def step(
+        self,
+        x_t: torch.Tensor,
+        h_prev: torch.Tensor | None = None,
+        delta_t: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Single recurrent step; same real-state convention as forward().
+
+        Computed from the same ``_coeffs`` helper ``forward()`` uses
+        (applied per-step instead of over the full sequence), so the two
+        paths cannot drift apart — mirrors ``RotationMinGRU``.
+
+        Parameters
+        ----------
+        x_t : torch.Tensor
+            Input at the current timestep, shape ``(B, input_size)``.
+        h_prev : torch.Tensor, optional
+            Previous hidden state, shape ``(B, hidden_size)``. Defaults
+            to the learned initial state.
+        delta_t : torch.Tensor, optional
+            Time gap preceding this event, shape ``(B,)`` or ``(B, 1)``;
+            required iff ``decay`` is enabled.
+
+        Returns
+        -------
+        torch.Tensor
+            New hidden state, shape ``(B, hidden_size)``.
+
+        Raises
+        ------
+        ValueError
+            If ``decay`` is enabled without ``delta_t``, or ``delta_t``
+            is given without decay enabled.
+        """
+        B = x_t.size(0)
+        if h_prev is None:
+            h_prev = self.h0.expand(B, 1, self.hidden_size)[:, 0]
+        h_prev_blocks = h_prev.reshape(B, self.n_blocks, self.k)
+        dt = self._prepare_decay(delta_t, canonical_ndim=1)
+        M, b = self._coeffs(x_t, dt)
+        h = torch.einsum("bnij,bnj->bni", M, h_prev_blocks) + b
+        return h.reshape(B, self.hidden_size)
+
+    def extra_repr(self) -> str:
+        return (
+            f"input_size={self.input_size}, hidden_size={self.hidden_size}, "
+            f"block_size={self.k}, rounds={self.rounds}"
+        )
+
+
 class MinGRUBlock(nn.Module):
     """Pre-norm residual block: LN -> minGRU -> +x, then LN -> MLP -> +x.
 
@@ -1396,20 +1761,24 @@ class MinGRUBlock(nn.Module):
     learnable_h0 : bool, default=False
         Routed to the block's mixer when ``mixer`` is ``"log"`` or
         ``"signed"`` (see ``MinGRU`` / ``SignedMinGRU``). Not accepted
-        by ``"rotation"``: ``RotationMinGRU``'s ``h_0`` is an intrinsic
-        learned parameter with no ``learnable_h0`` flag, so this
-        argument is silently unused when ``mixer="rotation"``.
-    mixer : {"log", "signed", "rotation"}, default="log"
+        by ``"rotation"`` or ``"givens"``: ``RotationMinGRU``'s and
+        ``GivensMinGRU``'s ``h_0`` is an intrinsic learned parameter
+        with no ``learnable_h0`` flag, so this argument is silently
+        unused for those mixers.
+    mixer : {"log", "signed", "rotation", "givens"}, default="log"
         Selects the sequence mixer: ``MinGRU`` (log-space parallel
-        scan), ``SignedMinGRU`` (signed diagonal transitions), or
-        ``RotationMinGRU`` (2x2 block rotations). Any other value
-        raises ``ValueError``.
+        scan), ``SignedMinGRU`` (signed diagonal transitions),
+        ``RotationMinGRU`` (2x2 block rotations), or ``GivensMinGRU``
+        (k-dim block rotations built from brick-wall Givens rounds). Any
+        other value raises ``ValueError``.
     mixer_kwargs : dict, optional
         Extra constructor kwargs forwarded to the selected mixer class
-        (e.g. ``{"coupled": True}`` for ``"signed"``, or
-        ``{"snap": (2, 3, 5)}`` for ``"rotation"``); pass ``decay``,
-        ``decay_rate``, ``log1p_delta`` here to enable time decay (see
-        ``MinGRU``/``SignedMinGRU``/``RotationMinGRU``).
+        (e.g. ``{"coupled": True}`` for ``"signed"``,
+        ``{"snap": (2, 3, 5)}`` for ``"rotation"``, or
+        ``{"block_size": 8, "rounds": 3}`` for ``"givens"``); pass
+        ``decay``, ``decay_rate``, ``log1p_delta`` here to enable time
+        decay (see
+        ``MinGRU``/``SignedMinGRU``/``RotationMinGRU``/``GivensMinGRU``).
 
     Notes
     -----
@@ -1421,12 +1790,14 @@ class MinGRUBlock(nn.Module):
     ``MinGRUStack``.
     """
 
-    # name -> (class, accepts_learnable_h0). RotationMinGRU's h_0 is
-    # intrinsic (see class docstring), so the flag is not forwarded to it.
+    # name -> (class, accepts_learnable_h0). RotationMinGRU's and
+    # GivensMinGRU's h_0 are intrinsic (see their class docstrings), so
+    # the flag is not forwarded to them.
     _MIXER_CLASSES: dict[str, tuple[type[nn.Module], bool]] = {
         "log": (MinGRU, True),
         "signed": (SignedMinGRU, True),
         "rotation": (RotationMinGRU, False),
+        "givens": (GivensMinGRU, False),
     }
 
     def __init__(
@@ -1666,10 +2037,10 @@ class MinGRUStack(nn.Module):
     learnable_h0 : bool, default=False
         Passed through to every block; routed to the block's mixer
         when ``mixer`` is ``"log"`` or ``"signed"``, unused for
-        ``"rotation"`` (see ``MinGRUBlock``).
+        ``"rotation"`` and ``"givens"`` (see ``MinGRUBlock``).
     mixer : str or list of str, default="log"
         Sequence mixer for the blocks; one of ``{"log", "signed",
-        "rotation"}`` (see ``MinGRUBlock``). A single ``str`` uses that
+        "rotation", "givens"}`` (see ``MinGRUBlock``). A single ``str`` uses that
         mixer for every block, bit-identical to prior versions: same
         construction order, same RNG consumption, same state_dict
         keys. Unknown ``str`` values raise ``ValueError`` (from
@@ -1744,7 +2115,10 @@ class MinGRUStack(nn.Module):
     rotation stacks are validated only at L=2 on the S3 probe (deeper
     is untested — see the README's Rotation variant section, "Depth:
     L=2 is validated"); construction proceeds regardless. A single
-    ``"rotation"`` block in a mixed stack does not warn.
+    ``"rotation"`` block in a mixed stack does not warn. Multiple
+    ``"givens"`` blocks do NOT warn: the warning is specific to the
+    straight-through snap discontinuity, and ``GivensMinGRU`` is
+    continuous (unsnapped), so it has no such discontinuity to compound.
     """
 
     def __init__(
