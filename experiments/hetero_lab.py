@@ -133,12 +133,12 @@ def _selftest_delta_scan():
     """DeltaScanMixer must match DeltaNetMixer's sequential forward on
     the SAME weights (outputs and parameter gradients), for nh in
     {1, 2} and a non-power-of-two T."""
-    for nh in (1, 2):
+    for nh, heads, dk in ((1, 4, None), (2, 4, None), (2, 1, 8)):
         torch.manual_seed(7)
         B, T, d = 3, 13, 64
         x = torch.randn(B, T, d)
-        seq = DeltaNetMixer(d, d, nh=nh, n_heads=4)
-        par = DeltaScanMixer(d, d, nh=nh, n_heads=4)
+        seq = DeltaNetMixer(d, d, nh=nh, n_heads=heads, d_k=dk, d_v=dk)
+        par = DeltaScanMixer(d, d, nh=nh, n_heads=heads, d_k=dk, d_v=dk)
         par.load_state_dict(seq.state_dict())
         y_seq, y_par = seq(x), par(x)
         err = (y_seq - y_par).abs().max().item()
@@ -211,6 +211,7 @@ HETERO_FACTORY_MODELS = {
     "hetero-d2s": ("deltaproduct2", "signed-tanh"),
     "hetero-sd2-par": ("signed-tanh", "deltascan2"),
     "hetero-sg8": ("signed-tanh", "givens8"),
+    "hetero-sdm": ("signed-tanh", "deltamini"),
 }
 
 class GivensMinGRU(nn.Module):
@@ -316,6 +317,11 @@ LOCAL_FACTORIES = {
     **VARIANTS,
     "deltascan2": lambda d_in, d_h: DeltaScanMixer(d_in, d_h, nh=2),
     "givens8": lambda d_in, d_h: GivensMinGRU(d_in, d_h, block_size=8, rounds=3),
+    # matched-capacity delta (write-erase mechanism at the promoted
+    # mixers' 64-element state; parallel scan is cheap at d_k=8)
+    "deltamini": lambda d_in, d_h: DeltaScanMixer(
+        d_in, d_h, nh=2, n_heads=1, d_k=8, d_v=8
+    ),
 }
 
 

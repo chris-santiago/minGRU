@@ -238,15 +238,22 @@ class DeltaNetMixer(nn.Module):
     counterpart to RotationMinGRU's snap grid.
     """
 
-    def __init__(self, d_in, d_h, nh=1, n_heads=4):
+    def __init__(self, d_in, d_h, nh=1, n_heads=4, d_k=None, d_v=None):
         super().__init__()
-        assert d_h % n_heads == 0, "d_h must be divisible by n_heads"
+        # d_k/d_v default to the original tied d_h//n_heads layout, so the
+        # registered "deltanet"/"deltaproduct2" rows are construction-
+        # identical to the recorded incumbent-delta evidence. Explicit
+        # values decouple state size (n_heads * d_k * d_v) from d_h for
+        # capacity-matched arms (e.g. n_heads=1, d_k=d_v=8 -> 64 state
+        # elements, the promoted mixers' per-token state).
+        if d_k is None:
+            assert d_h % n_heads == 0, "d_h must be divisible by n_heads"
         self.d_in = d_in
         self.d_h = d_h
         self.nh = nh
         self.n_heads = n_heads
-        self.d_k = d_h // n_heads
-        self.d_v = self.d_k
+        self.d_k = d_k if d_k is not None else d_h // n_heads
+        self.d_v = d_v if d_v is not None else self.d_k
         self.linear_q = nn.Linear(d_in, n_heads * self.d_k)
         self.linear_k = nn.ModuleList(
             nn.Linear(d_in, n_heads * self.d_k) for _ in range(nh)
