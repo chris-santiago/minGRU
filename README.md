@@ -40,6 +40,7 @@ below and in `probes.py`) don't match 1:1 — here's the bridge:
 | `SignedMinGRU`, `coupled=False` (default) | `minGRU-signed-tanh` | decoupled eigenvalue; recommended for parity-like tasks |
 | `SignedMinGRU`, `coupled=True` (legacy) | `minGRU-signed` | pinned to `coupled=True` in `probes.py`; kept under its historical name |
 | `RotationMinGRU` (`mixer="rotation"`) | `minGRU-rotsnap` | runs at L=1; depth via the list-mixer rows (`minGRU-hetero-*`, `minGRU-rotation2`); needs the `CKPT=1` best-val@128 protocol below |
+| `GivensMinGRU` (`mixer="givens"`) | `minGRU-hetero-sg8` (the `mixer=["signed", "givens"]` composer stack; no standalone single-mixer entry in `probes.py`'s `MIXER_REGISTRY`) | measured on `S3-hier`, not the plain `S3`/parity columns below — see "Givens variant" |
 | `torch.nn.GRU` (reference baseline) | `GRU` | state-dependent gating; the ceiling both tasks are measured against |
 
 **Recommended:** for parity-like problems (state must flip sign based on a
@@ -58,7 +59,17 @@ holds at 4x-16x. The base `MinGRU` (log-space,
 `mixer="log"`) stays at chance on both tasks regardless of depth — a
 parameterization limit, not a training one. A standard GRU remains the
 ceiling: state-dependent gating holds both tasks at 1.000 (to three
-decimals) at every tested length with a single layer.
+decimals) at every tested length with a single layer. For deeper stacks
+that must both extract a non-commutative operation from raw input and
+then compose it (a harder joint problem than tracking a single operation
+directly), swapping the composer from a 2D rotation block to
+`GivensMinGRU` (`mixer="givens"`) raises fit reliability on the `S3-hier`
+task from 1 of 12 seeds to 8 of 12 (Fisher exact p ≈ 0.009), at a matched
+64-element per-token state and within +2.2% of full-stack parameters —
+though, like the other continuous composers here, it buys no attractor at
+length and still decays by T=1024; see "Givens variant," below, for the
+mechanism, the measured decay, and the parallel-only design case for
+choosing it over the sequential delta-rule composer.
 
 Numbers below are multi-seed means (torch 2.5.1, CPU; seed counts stated
 per row). Protocol: seq2seq tagging (dense supervision), T_train=64,
@@ -228,6 +239,17 @@ y, state = hetero_stack(x)            # (B, T, 32) -> (B, T, 256), per-block sta
 # "rotation"]) warns once per construction (STE-compounding) and proceeds.
 ```
 
+```python
+hetero_stack_givens = MinGRUStack(
+    32, 256, n_layers=2, mixer=["signed", "givens"],
+)
+x = torch.randn(4, 10, 32)
+y, state = hetero_stack_givens(x)     # (B, T, 32) -> (B, T, 256), per-block states
+# signed extractor -> Givens composer (block_size=8, rounds=3 defaults);
+# no multi-rotation-style warning on construction -- see "Givens variant"
+# for the measured fit-reliability and length-generalization tradeoffs
+```
+
 Streaming inference (O(1) memory; state is `n_layers × d_model` per sample):
 
 ```python
@@ -357,6 +379,9 @@ snaps its angles to an exact grid — which is also why the grid must
 contain the angles your problem needs. Whether depth can supply the
 feature extraction a single rung-3 layer lacks turns out to be a real
 tradeoff, not a yes/no — see "Rotation variant," below.
+(`GivensMinGRU` occupies this same rung with a richer per-token map —
+k-dimensional block rotations instead of a single 2D plane — not a fifth
+rung; see "Givens variant," below.)
 
 **Rung 4 — memory that reads itself (a standard GRU).** Everything
 below shares one discipline: the update at step *t* is chosen by the
@@ -574,7 +599,10 @@ configurations. Deeper homogeneous rotation stacks (L=4) are untested
 under this protocol and remain open. (Run history:
 `experiments/EXPERIMENTS.md`.)
 
-**Depth vs. hierarchy: a tradeoff, not a ranking.** A second probe
+**Depth vs. hierarchy: a tradeoff, not a ranking.** *(This subsection
+is the evidence base for the promoted `GivensMinGRU` mixer among others;
+"Givens variant," below, gives that mixer's own summary, mechanism, and
+costs without repeating this table.)* A second probe
 task, `S3-hier` (chance ≈ 1/6), pairs consecutive sub-tokens through a
 fixed Latin-square lookup built to be non-representable by either group
 of order six. The generator for each pair must be *extracted* before it
