@@ -877,7 +877,13 @@ round 1 the staggered planes (1,2),(3,4),(5,6),(7,0); round 2 repeats
 round 0's pattern), all angles emitted by one linear head. Disjoint planes
 within a round commute; the stagger between rounds is what couples all
 eight dimensions. Products of enough Givens rotations reach all of SO(k),
-so three rounds are a deliberate budget, not a representational limit. The
+so three rounds are a deliberate budget, not a representational limit.
+The brick-wall mesh itself is the standard construction from the
+orthogonal/unitary-RNN literature — EUNN (Jing et al., 2017), built on the
+rectangular interferometer mesh of Clements et al. (2016), with the Givens
+rotation as described in Golub & Van Loan — borrowed deliberately: what is
+new here is the input-dependent angles per token and the measured
+trainability result, not the factorization. The
 result stays continuous, stays exactly special-orthogonal, stays parallel
 (the same associative scan, generalized to k×k blocks by
 `matrix_affine_scan`), and keeps the standard 64-element per-token state at
@@ -1311,3 +1317,15 @@ Length.* arXiv:2406.06484.
 Siems, J., Carstensen, T., Zela, A., Hutter, F., Pontil, M., &
 Grazzi, R. (2025). *DeltaProduct: Improving State-Tracking in Linear
 RNNs via Householder Products.* NeurIPS 2025. arXiv:2502.10297.
+
+Jing, L., Shen, Y., Dubcek, T., Peurifoy, J., Skirlo, S., LeCun, Y.,
+Tegmark, M., & Soljačić, M. (2017). *Tunable Efficient Unitary Neural
+Networks (EUNN) and their application to RNNs.* ICML 2017.
+arXiv:1612.05231.
+
+Clements, W. R., Humphreys, P. C., Metcalf, B. J., Kolthammer, W. S.,
+& Walmsley, I. A. (2016). *Optimal design for universal multiport
+interferometers.* Optica 3(12).
+
+Golub, G. H., & Van Loan, C. F. (2013). *Matrix Computations*
+(4th ed.). Johns Hopkins University Press. (Givens rotations.)

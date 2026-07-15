@@ -1463,6 +1463,11 @@ class GivensMinGRU(DecayMixin, nn.Module):
     ``(1,2),(3,4),...,(k-1,0)``. Every ``G_r`` is orthogonal with
     determinant ``+1`` by construction, so ``M_t`` is exactly
     special-orthogonal — continuous, with no straight-through snap.
+    The brick-wall plane layout is the standard rectangular mesh from
+    the orthogonal/unitary-RNN literature (EUNN: Jing et al. 2017,
+    arXiv:1612.05231; mesh design: Clements et al. 2016) built from
+    Givens plane rotations (Golub & Van Loan, *Matrix Computations*);
+    the departure here is input-dependent angles per token.
 
     Where ``RotationMinGRU`` manufactures attractors at exact group
     elements by snapping 2x2 angles, ``GivensMinGRU`` deliberately does
