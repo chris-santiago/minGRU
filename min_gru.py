@@ -1466,10 +1466,13 @@ class GivensMinGRU(DecayMixin, nn.Module):
 
     Where ``RotationMinGRU`` manufactures attractors at exact group
     elements by snapping 2x2 angles, ``GivensMinGRU`` deliberately does
-    not: ``rounds`` brick-wall layers of Givens rotations compose to
-    reach all of ``SO(k)`` (three rounds is the budget chosen for
-    ``k = 8``), giving richer non-abelian per-token maps at matched
-    state capacity, at the cost of having no attractor at any particular
+    not: each per-token map lives on a ``rounds * block_size / 2``-angle
+    submanifold of ``SO(k)`` — 12 of ``SO(8)``'s 28 dimensions at the
+    defaults; products of enough Givens rotations (about ``k - 1``
+    brick-wall rounds) generate all of ``SO(k)``, so three rounds is a
+    deliberate budget rather than full per-token coverage — giving
+    richer non-abelian per-token maps at matched state capacity, at the
+    cost of having no attractor at any particular
     transition — angles drift under length generalization exactly as
     ``RotationMinGRU(snap=None)``'s do. Like the other matrix-transition
     mixers it runs on a non-commutative parallel scan
@@ -1504,9 +1507,11 @@ class GivensMinGRU(DecayMixin, nn.Module):
         ``hidden_size``. The default keeps the standard 64-element
         per-token state at the repo's ``d_model``.
     rounds : int, default=3
-        Number of brick-wall Givens layers composed per transition.
-        Three rounds generate all of ``SO(k)`` for ``k = 8`` (the
-        evidence configuration).
+        Number of brick-wall Givens layers composed per transition; must
+        be at least 1. Full ``SO(k)`` coverage would take
+        ``k * (k - 1) / 2`` rotations (about ``k - 1`` brick-wall
+        rounds); the default three rounds span a 12-angle submanifold of
+        ``SO(8)`` and are the evidence-validated budget.
     decay : {"fixed", "learnable", None}, default=None
         Exponential time decay of the carried state: ``M_decayed =
         gamma * M`` per block, with ``gamma = exp(-lambda *
@@ -1575,6 +1580,12 @@ class GivensMinGRU(DecayMixin, nn.Module):
                 f"GivensMinGRU requires hidden_size ({hidden_size}) divisible by "
                 f"block_size ({block_size}); state is n_blocks = hidden_size / "
                 "block_size blocks of block_size dims."
+            )
+        if rounds < 1:
+            raise ValueError(
+                f"GivensMinGRU requires rounds >= 1 (got {rounds}); with no "
+                "Givens layers every transition is the identity and the mixer "
+                "cannot mix state."
             )
         self.input_size = input_size
         self.hidden_size = hidden_size
@@ -3449,7 +3460,15 @@ if __name__ == "__main__":
         raise AssertionError("odd block_size should have raised ValueError")
     except ValueError:
         pass
-    print("givens construction ValueError (indivisible hidden_size, odd block_size): ok")
+    try:
+        GivensMinGRU(D_in, D_h, rounds=0)  # no Givens layers: identity mixer
+        raise AssertionError("rounds=0 should have raised ValueError")
+    except ValueError:
+        pass
+    print(
+        "givens construction ValueError (indivisible hidden_size, odd "
+        "block_size, rounds=0): ok"
+    )
 
     try:
         MinGRUBlock(D_h, mixer="not_a_mixer")
