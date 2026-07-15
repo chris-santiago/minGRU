@@ -67,9 +67,11 @@ directly), swapping the composer from a 2D rotation block to
 task from 1 of 12 seeds to 8 of 12 (Fisher exact p ≈ 0.009), at a matched
 64-element per-token state and within +2.2% of full-stack parameters —
 though, like the other continuous composers here, it buys no attractor at
-length and still decays by T=1024; see "Givens variant," below, for the
-mechanism, the measured decay, and the parallel-only design case for
-choosing it over the sequential delta-rule composer.
+length and still decays by T=1024. See "The hierarchical task: S3-hier,"
+below, for the task's construction and the full cross-mechanism evidence
+table, and "Givens variant" for the mechanism, the measured decay, and
+the parallel-only design case for choosing it over the sequential
+delta-rule composer.
 
 Numbers below are multi-seed means (torch 2.5.1, CPU; seed counts stated
 per row). Protocol: seq2seq tagging (dense supervision), T_train=64,
@@ -234,7 +236,7 @@ x = torch.randn(4, 10, 32)
 y, state = hetero_stack(x)            # (B, T, 32) -> (B, T, 256), per-block states
 # one rotation block inside a deeper signed stack (extract-then-compose);
 # mixer_kwargs is keyed by mixer type, not applied flat, when mixer is a
-# list -- see "Rotation variant" for the measured depth/hierarchy tradeoffs.
+# list -- see "The hierarchical task: S3-hier" for the measured depth/hierarchy tradeoffs.
 # A mixer list with more than one "rotation" entry (e.g. ["rotation",
 # "rotation"]) warns once per construction (STE-compounding) and proceeds.
 ```
@@ -599,22 +601,180 @@ configurations. Deeper homogeneous rotation stacks (L=4) are untested
 under this protocol and remain open. (Run history:
 `experiments/EXPERIMENTS.md`.)
 
-**Depth vs. hierarchy: a tradeoff, not a ranking.** *(This subsection
-is the evidence base for the promoted `GivensMinGRU` mixer among others;
-"Givens variant," below, gives that mixer's own summary, mechanism, and
-costs without repeating this table.)* A second probe
-task, `S3-hier` (chance ≈ 1/6), pairs consecutive sub-tokens through a
-fixed Latin-square lookup built to be non-representable by either group
-of order six. The generator for each pair must be *extracted* before it
-can be *composed*: a lone rotation layer can't absorb the lookup by
-relabeling angles the way it can for a plain group operation. Measured
-at `MAX_STEPS=1600` unless noted (seeds per row as listed; every number
+Depth-2 rotation stacks on the harder extract-then-compose task — and
+the cross-mechanism comparison they sit in — are covered in "The
+hierarchical task: S3-hier," below.
+
+**Training protocol: best-val@128 selection + retry-on-flag.** The
+exact automaton is reachable but is **not** a stable attractor of
+standard training — runs wander in and out of the exact solution over
+the course of optimization, and once train accuracy saturates the loss
+is blind to the difference between an exact solution and a decaying
+shortcut. The validated protocol replaces early-stop with
+best-checkpoint selection by validation accuracy at a length *longer*
+than the training length (T=128 when training at T=64 — not one of the
+eventual eval lengths, so it cannot leak into reported metrics),
+evaluated over the full step budget. A best-val@128 score below 1.0
+flags the run as failed and should be retried rather than trusted.
+`probes.py`'s `CKPT=1` env var implements the selection half of this
+protocol:
+
+```
+CKPT=1 python probes.py S3 minGRU-rotsnap
+```
+
+**Seed success rate.** Across 8 fresh seeds under this protocol, only
+1 of 8 lands the exact solution (accuracy 1.0 to the checked precision
+at every length out to 1024); the other 7 reach best-val@128 = 1.0 (no
+flag) yet still decay measurably at 4x-16x the training length (worst
+seed 0.859 @1024). The mean length-generalization numbers in "What this
+shows," above (1.000 @256, 0.996 @512, 0.958 @1024) are the honest
+average over all 8 seeds, including the non-exact ones — not a
+best-seed headline. Per the mechanism verification in
+`experiments/SUMMARY.md`, every seed — including the non-exact ones —
+contains a D3 representation readable off its weights; failed seeds
+are simply less exact, not missing the mechanism.
+
+The flag is therefore one-directional: best-val@128 < 1.0 reliably
+means retry, but the flag passing does **not** certify exactness at
+length — confirm length generalization directly rather than relying on
+the flag alone, and budget for retries when reproducing this variant.
+
+**Incumbent comparison (mechanism-level).** The DeltaNet (Yang et al.)
+/ DeltaProduct (Siems et al., NeurIPS 2025) transition rule is
+reimplemented as a lab mixer, `DeltaNetMixer` in
+`experiments/variants.py`: `nh=1` (`"deltanet"`, a single Householder
+reflection per token) and `nh=2` (`"deltaproduct2"`, two reflections
+per token, composing to a rotation). This is a reimplementation of the
+transition rule, not their released code (Triton/CUDA, a different
+training stack that does not run in this repo's CPU-only environment),
+measured under the same protocol as the S3 table above (3 seeds,
+best-val@128 checkpoint selection, `MAX_STEPS=1600`):
+
+| task | model | seeds | protocol | acc@64 | acc@256 | acc@512 | acc@1024 |
+|---|---|---|---|---|---|---|---|
+| S3 | `deltanet` (`nh=1`), L=1 | 3 | best-val@128 | 0.419 | 0.356 | 0.345 | 0.339 |
+| S3 | `deltaproduct2` (`nh=2`), L=1 | 3 | best-val@128 | 1.000 | 1.000 | 1.000 | 0.989 |
+| S3 | *`minGRU-rotsnap`, L=1 (reference, above)* | *8* | *best-val@128* | *1.000* | *1.000* | *0.996* | *0.958* |
+
+`nh=1` cannot fit S3 (mean@64 = 0.419, in the diagonal/reflection chance
+band). A single reflection has determinant -1 on every application and
+cannot compose to the even-permutation elements S3 needs, matching
+DeltaProduct's own representability theory. `nh=2` fits S3 on every
+seed and trains reliably with no retry protocol: all three seeds reach
+best-val@128 = 1.000 by step 200-300 (against the 1600-step budget) and
+no seed raises the sub-1.0 flag that `minGRU-rotsnap` relies on to mark
+a run for retry. That is a materially better training profile than
+`minGRU-rotsnap` on this task at this budget: the snap grid's rotsnap
+reference lands the exact solution in only 1 of 8 seeds and still needs
+the retry-on-flag protocol to separate that seed from the other 7,
+while `deltaproduct2`'s 3 of 3 seeds all land near-exactly without any
+retries (an unequal-sample comparison — n=3 vs. n=8 — though the
+val@128-by-step-300 unanimity leaves little room for a seed-luck
+reading). On parity, both incumbent configurations show the same
+length-generalization inconsistency across seeds: `deltanet` mean@1024
+= 0.851 (per-seed range 0.730-1.000) and `deltaproduct2` mean@1024 =
+0.810 (per-seed range 0.692-1.000), both below this repo's recorded
+`signed-tanh` parity result (n=6, mean@1024 = 0.994, worst seed 0.984).
+Signed-tanh's tanh asymptote gives it a length-generalization
+attractor the delta rule's beta/k parameterization does not share
+under this protocol.
+
+What the snap mechanism still uniquely provides: an exact solution when
+a seed lands it (`minGRU-rotsnap`'s 1 exact-to-16x seed of 8, vs.
+`deltaproduct2`'s near-exact-but-not-exact 0.974-0.999 @1024 across all
+3 seeds) and the weights-level D3 homomorphism certificate (per-block
+matrices extracted from a trained model satisfy the D3 composition
+table to ~1e-4 — see above and `experiments/SUMMARY.md`).
+
+**Capacity disclosure.** At the shared `d_model=64`, parameter counts
+are `deltanet` 16,900 / `deltaproduct2` 25,480 vs. `RotationMinGRU`
+12,544 / `SignedMinGRU` 12,480. Both incumbent configurations carry
+more parameters than the minGRU variants they are compared against,
+and `deltaproduct2` carries roughly 2x `deltanet`'s own count. More
+materially, both incumbent configurations carry a per-token state of
+`n_heads * d_k * d_v` = 1,024 elements (4 heads x 16 x 16), against 64
+state elements per token for the minGRU variants. The incumbents
+carry roughly 16x more state per token at this `d_model`, which favors
+their fit and length-generalization numbers above. These are
+same-`d_model`, not same-capacity, comparisons.
+
+All of the above is budget-relative (1600-step budget, 3 seeds, this
+repo's harness and protocol only): it is not a claim about the
+incumbents' released systems, published training regimes, or published
+numbers, and it does not run in the other direction either: nothing
+here shows the minGRU variants would still lead at a larger budget or a
+different protocol. (Run history: `experiments/EXPERIMENTS.md`.)
+
+**Alternatives tried and dropped.** Three other fixes were tested and
+abandoned: a full orthogonality constraint on the transition matrices,
+a regularizer that pulls angles toward the snap grid, and post-hoc
+projection/ablation of near-exact blocks at inference. Each either
+hurt length generalization or was redundant with the best-val@128
+selection above (full comparison in `experiments/SUMMARY.md`, rounds 5
+and 8).
+
+Practical differences from the other mixers: 4 linear heads (z, h,
+theta, u) vs. `SignedMinGRU`'s 3 / `GivensMinGRU`'s 3 / `MinGRU`'s 2
+(mind parameter-matched comparisons); `h_0` is an intrinsic learned
+parameter with no `learnable_h0` flag (see "State conventions");
+`hidden_size` must be
+even (`ValueError` otherwise). The scan is O(T log T) work / O(log T)
+depth in pure torch ops, same tradeoff as `linear_scan`. Numerical
+agreement vs. the sequential path is covered in "Implementation notes,"
+above.
+
+## The hierarchical task: S3-hier (extract, then compose)
+
+*(This section is the evidence base for the promoted `GivensMinGRU`
+mixer among others; "Givens variant," below, gives that mixer's own
+summary, mechanism, and costs without repeating this table. Protocol
+terms — best-val@128 selection, the retry flag — are defined under
+"Rotation variant," above.)*
+
+**The task.** `S3-hier` (chance ≈ 1/6) is the harder of the repo's two
+S3 probes: the group operation is hidden inside a *pair* of sub-tokens.
+Sub-tokens are drawn uniformly from `{0..5}`; each consecutive pair
+`(x[2k], x[2k+1])` selects a generator `g = LATIN[a, b]`, composed onto
+the running S3 product when the pair completes. Labels are dense: odd
+positions carry the just-updated composition, even (mid-pair) positions
+carry the previous one.
+
+`LATIN` is a fixed 6x6 Latin square (every symbol exactly once per row
+and column), so a single sub-token carries no information about the
+generator: the distribution of `g` given `a` alone — or `b` alone — is
+uniform, and no per-token shortcut exists. It is additionally verified
+non-isotopic to both groups of order six (Z6 and S3): no relabeling of
+rows, columns, and symbols turns it into either group's Cayley table,
+so a rotation layer cannot absorb the lookup by relabeling its angle
+assignment the way it can for a plain group operation. (`VERIFY_LATIN=1`
+re-runs the import-time sanity check; `probes.py` documents the
+exhaustive offline isotopy verification.) Extraction is therefore
+genuine work that must happen *before* composition — the property the
+heterogeneous stacks below are built around.
+
+A worked sample, verbatim from `probes.make_s3_hier` (seed-0 training
+stream, batch row 0, first six steps):
+
+```
+x      1  5   0  2   1  1  ...
+pairs  (1,5)  (0,2)  (1,1)
+g        0      5      2       g = LATIN[a, b]
+y      0  0   0  5   5  1  ...
+```
+
+The label updates only when a pair completes and carries mid-pair; the
+first drawn pair happens to map to the identity, so the label holds at
+0 through step 4.
+
+**Depth vs. hierarchy: a tradeoff, not a ranking.** Measured at
+`MAX_STEPS=1600` unless noted (seeds per row as listed; every number
 budget-relative), multi-seed means. Rotation- and delta-bearing rows
 use best-val@128 checkpoint selection (val@384 where noted);
 signed-tanh and `GRU` rows use the early-stop protocol they are
 recorded under. The n=6 `minGRU-hetero-sr` row pools rounds
-`hetero-legB-v2` (seeds 0–2) and `hetero-loop-03-base-ext` (seeds
-3–5), same protocol:
+`hetero-legB-v2` (seeds 0-2) and `hetero-loop-03-base-ext` (seeds
+3-5), same protocol:
 
 | config (task `S3-hier`, chance ≈ 0.167) | seeds | acc@64 | acc@256 | acc@512 | acc@1024 |
 |---|---|---|---|---|---|
@@ -736,125 +896,6 @@ winner (0.983 @1024) — no continuous composer reached it. No configuration win
 budget-independent: every number above is relative to the stated step
 budget, not a claim that any configuration solves `S3-hier`.
 
-**Training protocol: best-val@128 selection + retry-on-flag.** The
-exact automaton is reachable but is **not** a stable attractor of
-standard training — runs wander in and out of the exact solution over
-the course of optimization, and once train accuracy saturates the loss
-is blind to the difference between an exact solution and a decaying
-shortcut. The validated protocol replaces early-stop with
-best-checkpoint selection by validation accuracy at a length *longer*
-than the training length (T=128 when training at T=64 — not one of the
-eventual eval lengths, so it cannot leak into reported metrics),
-evaluated over the full step budget. A best-val@128 score below 1.0
-flags the run as failed and should be retried rather than trusted.
-`probes.py`'s `CKPT=1` env var implements the selection half of this
-protocol:
-
-```
-CKPT=1 python probes.py S3 minGRU-rotsnap
-```
-
-**Seed success rate.** Across 8 fresh seeds under this protocol, only
-1 of 8 lands the exact solution (accuracy 1.0 to the checked precision
-at every length out to 1024); the other 7 reach best-val@128 = 1.0 (no
-flag) yet still decay measurably at 4x-16x the training length (worst
-seed 0.859 @1024). The mean length-generalization numbers in "What this
-shows," above (1.000 @256, 0.996 @512, 0.958 @1024) are the honest
-average over all 8 seeds, including the non-exact ones — not a
-best-seed headline. Per the mechanism verification in
-`experiments/SUMMARY.md`, every seed — including the non-exact ones —
-contains a D3 representation readable off its weights; failed seeds
-are simply less exact, not missing the mechanism.
-
-The flag is therefore one-directional: best-val@128 < 1.0 reliably
-means retry, but the flag passing does **not** certify exactness at
-length — confirm length generalization directly rather than relying on
-the flag alone, and budget for retries when reproducing this variant.
-
-**Incumbent comparison (mechanism-level).** The DeltaNet (Yang et al.)
-/ DeltaProduct (Siems et al., NeurIPS 2025) transition rule is
-reimplemented as a lab mixer, `DeltaNetMixer` in
-`experiments/variants.py`: `nh=1` (`"deltanet"`, a single Householder
-reflection per token) and `nh=2` (`"deltaproduct2"`, two reflections
-per token, composing to a rotation). This is a reimplementation of the
-transition rule, not their released code (Triton/CUDA, a different
-training stack that does not run in this repo's CPU-only environment),
-measured under the same protocol as the S3 table above (3 seeds,
-best-val@128 checkpoint selection, `MAX_STEPS=1600`):
-
-| task | model | seeds | protocol | acc@64 | acc@256 | acc@512 | acc@1024 |
-|---|---|---|---|---|---|---|---|
-| S3 | `deltanet` (`nh=1`), L=1 | 3 | best-val@128 | 0.419 | 0.356 | 0.345 | 0.339 |
-| S3 | `deltaproduct2` (`nh=2`), L=1 | 3 | best-val@128 | 1.000 | 1.000 | 1.000 | 0.989 |
-| S3 | *`minGRU-rotsnap`, L=1 (reference, above)* | *8* | *best-val@128* | *1.000* | *1.000* | *0.996* | *0.958* |
-
-`nh=1` cannot fit S3 (mean@64 = 0.419, in the diagonal/reflection chance
-band). A single reflection has determinant -1 on every application and
-cannot compose to the even-permutation elements S3 needs, matching
-DeltaProduct's own representability theory. `nh=2` fits S3 on every
-seed and trains reliably with no retry protocol: all three seeds reach
-best-val@128 = 1.000 by step 200-300 (against the 1600-step budget) and
-no seed raises the sub-1.0 flag that `minGRU-rotsnap` relies on to mark
-a run for retry. That is a materially better training profile than
-`minGRU-rotsnap` on this task at this budget: the snap grid's rotsnap
-reference lands the exact solution in only 1 of 8 seeds and still needs
-the retry-on-flag protocol to separate that seed from the other 7,
-while `deltaproduct2`'s 3 of 3 seeds all land near-exactly without any
-retries (an unequal-sample comparison — n=3 vs. n=8 — though the
-val@128-by-step-300 unanimity leaves little room for a seed-luck
-reading). On parity, both incumbent configurations show the same
-length-generalization inconsistency across seeds: `deltanet` mean@1024
-= 0.851 (per-seed range 0.730-1.000) and `deltaproduct2` mean@1024 =
-0.810 (per-seed range 0.692-1.000), both below this repo's recorded
-`signed-tanh` parity result (n=6, mean@1024 = 0.994, worst seed 0.984).
-Signed-tanh's tanh asymptote gives it a length-generalization
-attractor the delta rule's beta/k parameterization does not share
-under this protocol.
-
-What the snap mechanism still uniquely provides: an exact solution when
-a seed lands it (`minGRU-rotsnap`'s 1 exact-to-16x seed of 8, vs.
-`deltaproduct2`'s near-exact-but-not-exact 0.974-0.999 @1024 across all
-3 seeds) and the weights-level D3 homomorphism certificate (per-block
-matrices extracted from a trained model satisfy the D3 composition
-table to ~1e-4 — see above and `experiments/SUMMARY.md`).
-
-**Capacity disclosure.** At the shared `d_model=64`, parameter counts
-are `deltanet` 16,900 / `deltaproduct2` 25,480 vs. `RotationMinGRU`
-12,544 / `SignedMinGRU` 12,480. Both incumbent configurations carry
-more parameters than the minGRU variants they are compared against,
-and `deltaproduct2` carries roughly 2x `deltanet`'s own count. More
-materially, both incumbent configurations carry a per-token state of
-`n_heads * d_k * d_v` = 1,024 elements (4 heads x 16 x 16), against 64
-state elements per token for the minGRU variants. The incumbents
-carry roughly 16x more state per token at this `d_model`, which favors
-their fit and length-generalization numbers above. These are
-same-`d_model`, not same-capacity, comparisons.
-
-All of the above is budget-relative (1600-step budget, 3 seeds, this
-repo's harness and protocol only): it is not a claim about the
-incumbents' released systems, published training regimes, or published
-numbers, and it does not run in the other direction either: nothing
-here shows the minGRU variants would still lead at a larger budget or a
-different protocol. (Run history: `experiments/EXPERIMENTS.md`.)
-
-**Alternatives tried and dropped.** Three other fixes were tested and
-abandoned: a full orthogonality constraint on the transition matrices,
-a regularizer that pulls angles toward the snap grid, and post-hoc
-projection/ablation of near-exact blocks at inference. Each either
-hurt length generalization or was redundant with the best-val@128
-selection above (full comparison in `experiments/SUMMARY.md`, rounds 5
-and 8).
-
-Practical differences from the other mixers: 4 linear heads (z, h,
-theta, u) vs. `SignedMinGRU`'s 3 / `GivensMinGRU`'s 3 / `MinGRU`'s 2
-(mind parameter-matched comparisons); `h_0` is an intrinsic learned
-parameter with no `learnable_h0` flag (see "State conventions");
-`hidden_size` must be
-even (`ValueError` otherwise). The scan is O(T log T) work / O(log T)
-depth in pure torch ops, same tradeoff as `linear_scan`. Numerical
-agreement vs. the sequential path is covered in "Implementation notes,"
-above.
-
 ## Givens variant (`GivensMinGRU`)
 
 Enriches the non-commutative rung of the ladder without leaving it.
@@ -898,7 +939,7 @@ matched 64-element per-token state, 8-dimensional Givens blocks fit
 `S3-hier` on 8 of 12 seeds against 1 of 12 for continuous 2D rotation
 blocks (Fisher exact p ≈ 0.009). The full measured evidence — per-length
 means, the delta-family comparison, and the map-richness argument — is
-tabulated under "Depth vs. hierarchy," above; this section covers the
+tabulated under "The hierarchical task: S3-hier," above; this section covers the
 mechanism and its costs rather than restating that table.
 
 **The trade it does not escape.** Orthogonality buys norm preservation: no
@@ -909,7 +950,7 @@ exactly as an unsnapped `RotationMinGRU`'s do, and accuracy still decays by
 `T = 1024`. Among seeds that fit, the givens8 composer holds 0.927 @512
 and 0.733 @1024 (best seed 0.956 / 0.812); pooled across all 12 seeds the
 `signed → givens8` profile is 0.949 / 0.885 / 0.787 / 0.613 at
-@64 / @256 / @512 / @1024 (the top row of the "Depth vs. hierarchy"
+@64 / @256 / @512 / @1024 (the top row of "The hierarchical task: S3-hier"
 table). Exactness at length remains unique to the snapped 2D composer's
 rare exact seed (0.983 @1024) — no continuous composer, Givens included,
 reaches it. Snapping the Givens angles is the obvious hybrid and an open
@@ -1197,8 +1238,8 @@ python probes.py TASK MODEL [N_LAYERS]
 
 - **`TASK`** — one of `parity`, `S3`, `S3-hier`, `session-parity`,
   `parity-timestamped`. `S3-hier` is the harder extract-then-compose
-  probe (chance ≈ 0.167; see "Depth vs. hierarchy" under "Rotation
-  variant"). The last two supply `delta_t` (see "Time-aware decay");
+  probe (chance ≈ 0.167; see "The hierarchical task:
+  S3-hier"). The last two supply `delta_t` (see "Time-aware decay");
   `GRU` has no `delta_t` input path and raises `ValueError` on them.
 - **`MODEL`** — one of `GRU`, `minGRU`, `minGRU-signed`,
   `minGRU-signed-tanh`, `minGRU-signed-tanh-tdecay`,
