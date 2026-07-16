@@ -74,6 +74,9 @@ non-power-of-two. Out-of-envelope shapes raise `ScanFallback`, which
 crash.
 """
 
+import contextlib
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -132,6 +135,82 @@ _ENVELOPE = frozenset({1, 2, 4, 8, 16})
 # BLOCK_D channels at once, keeping lanes wide (spec §5). A safe default;
 # the cloud benchmark phase may autotune it.
 _LINEAR_BLOCK_D = 128
+
+
+@contextlib.contextmanager
+def _scan_env(mode: str | None = None):
+    """Save ``MINGRU_SCAN``'s current value, optionally force ``mode`` for
+    the duration of the block, then restore whatever value (or absence)
+    preceded it.
+
+    Matches ``min_gru.py``'s own ``__main__`` selftest discipline (its
+    ``_set_scan_env``/``finally: _set_scan_env(_saved_scan_env)`` pattern).
+    Without this, each parity runner (``_run_forward_parity``,
+    ``_run_grad_parity``, ``_run_angle_fused_parity``) set
+    ``os.environ["MINGRU_SCAN"] = "eager"`` (or ``"triton"``) to force one
+    path for its own sweep and never restored it, leaking ``eager`` into the
+    rest of the process (e.g. a subsequent ``--bench``/``--memory`` run
+    invoked in the same process as ``--check``) once the runner returned.
+
+    ``mode=None`` (the default) means "don't force a value on entry, just
+    guarantee restoration on exit" -- for callers (``_run_angle_fused_parity``)
+    whose own body toggles ``MINGRU_SCAN`` internally (e.g. alternating
+    ``eager``/``triton`` per case) rather than needing one fixed value for
+    the whole block.
+    """
+    saved = os.environ.get("MINGRU_SCAN")
+    if mode is not None:
+        os.environ["MINGRU_SCAN"] = mode
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop("MINGRU_SCAN", None)
+        else:
+            os.environ["MINGRU_SCAN"] = saved
+
+
+def parallel_scan_log_recompute(
+    log_coeffs: torch.Tensor, log_values: torch.Tensor
+) -> torch.Tensor:
+    """Pure-torch re-derivation of ``min_gru.parallel_scan_log``'s eager math.
+
+    Defined at module level, OUTSIDE the ``if _HAS_TRITON:`` block below (no
+    Triton import needed -- plain ``torch``/``torch.nn.functional`` only), so
+    it is always importable, even on a CPU-only/no-Triton install. Two
+    callers: ``_parallel_scan_log_backward``'s autograd-through-recomputation
+    (inside ``_HAS_TRITON`` -- differentiates through this via
+    ``torch.autograd.grad``), and this module's own ``__main__`` CPU
+    lockstep selftest below, which asserts this function matches
+    ``min_gru.parallel_scan_log`` on random CPU tensors WITHOUT needing a
+    GPU/Triton -- catching drift between this and the eager reference on
+    ordinary CI (and the GPU-less Phase-4 wheel CI), not only the GPU-only
+    grad-parity selftest.
+
+    MAINTENANCE: this formula must be kept byte-identical to
+    ``min_gru.parallel_scan_log``'s eager body (``a_star = pad(cumsum(log_coeffs));
+    log_h = a_star + logcumsumexp(log_values - a_star); h = exp(log_h)[:, 1:]``).
+    Replicated here (rather than calling ``min_gru.parallel_scan_log`` directly)
+    so the backward neither re-enters the ``MINGRU_SCAN`` dispatcher nor
+    depends on ``min_gru``'s env state; the CPU lockstep selftest is what
+    keeps the two copies from silently drifting.
+
+    Parameters
+    ----------
+    log_coeffs : torch.Tensor
+        Shape ``(B, T, D)``. ``log(a_t)`` for ``t = 1..T``.
+    log_values : torch.Tensor
+        Shape ``(B, T + 1, D)``. Slot 0 is ``log(h_0)``; slots ``1..T`` are
+        ``log(b_t)``.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(B, T, D)``. The states ``h_1..h_T``.
+    """
+    a_star = F.pad(torch.cumsum(log_coeffs, dim=1), (0, 0, 1, 0))
+    log_h = a_star + torch.logcumsumexp(log_values - a_star, dim=1)
+    return torch.exp(log_h)[:, 1:]
 
 
 # Populated below only when Triton is importable (see ``_HAS_TRITON``).
@@ -1083,18 +1162,14 @@ if _HAS_TRITON:
         with torch.enable_grad():
             lc = log_coeffs.detach().requires_grad_(True)
             lv = log_values.detach().requires_grad_(True)
-            # Byte-for-byte the eager math of min_gru.parallel_scan_log
-            # (a_star = pad(cumsum(log_coeffs)); log_h = a_star +
-            # logcumsumexp(log_values - a_star); h = exp(log_h)[:, 1:]).
-            # Replicated here rather than calling the eager function so the
-            # backward neither re-enters the MINGRU_SCAN dispatcher nor
-            # depends on min_gru's env state. MAINTENANCE: this formula must
-            # be kept byte-identical to min_gru.parallel_scan_log's eager
-            # body -- no static check enforces that; only the grad-parity
-            # selftest (_run_grad_parity, below) catches divergence.
-            a_star = F.pad(torch.cumsum(lc, dim=1), (0, 0, 1, 0))
-            log_h = a_star + torch.logcumsumexp(lv - a_star, dim=1)
-            h = torch.exp(log_h)[:, 1:]
+            # Calls the module-level `parallel_scan_log_recompute` (defined
+            # above, outside this `if _HAS_TRITON:` block) rather than
+            # inlining the formula here -- the CPU-runnable lockstep
+            # selftest in `__main__` below cross-checks THAT function
+            # against `min_gru.parallel_scan_log`, so this call site
+            # inherits that guarantee instead of maintaining its own
+            # unchecked copy.
+            h = parallel_scan_log_recompute(lc, lv)
         dlc, dlv = torch.autograd.grad(h, (lc, lv), grad_outputs=grad_h)
         return dlc, dlv
 
@@ -1260,6 +1335,7 @@ if _HAS_TRITON:
         perm: torch.Tensor,
         sgn: torch.Tensor,
         p2p: torch.Tensor,
+        *,
         has_scale: int,
         has_decay: int,
     ) -> torch.Tensor:
@@ -1275,6 +1351,14 @@ if _HAS_TRITON:
         (the angle-fused path is a module-forward fast path, not one of the
         four scan ops), so it is looked up by ``hasattr(triton_scans,
         "angle_scan_impl")`` instead.
+
+        ``has_scale``/``has_decay`` are keyword-only here (this function's
+        public-ish entry point, called from ``min_gru._dispatch_angle_scan``)
+        -- self-documenting 0/1 flags at the call site instead of a bare
+        trailing ``1, 0``. The underlying ``angle_scan_fwd`` ``triton_op``
+        this function calls keeps its flat positional-int schema unchanged
+        (a ``torch.library`` op signature, not a Python call-site
+        convenience).
 
         Parameters mirror ``angle_scan_fwd``'s: ``theta`` ``(B, T, n, R,
         half)``; ``scale``/``gamma`` ``(B, T, n)``; ``b`` ``(B, T, n, k)``;
@@ -1468,6 +1552,29 @@ def available() -> bool | str:
     return True
 
 
+# Public surface (additive metadata, Phase-4 packaging prep): the
+# availability probe, the fallback-signal exception, the scan-op impl
+# registry, and the angle-fused entry point + the raw triton_op wrappers.
+# Built conditionally because the Triton-gated names only exist in the
+# namespace when `_HAS_TRITON` (a CPU-only/no-Triton install still imports
+# this module successfully -- see the module docstring -- so `__all__`
+# must not name an attribute that doesn't exist in that case). Everything
+# else (the `_`-prefixed kernels, dispatch helpers, and selftest runners)
+# is implementation detail, not part of the documented public API.
+__all__ = ["available", "ScanFallback", "SCAN_IMPLS"]
+if _HAS_TRITON:
+    __all__ += [
+        "angle_scan_impl",
+        "affine_scan_fwd",
+        "linear_scan_fwd",
+        "parallel_scan_log_fwd",
+        "affine_scan_bwd",
+        "linear_scan_bwd",
+        "angle_scan_fwd",
+        "angle_scan_bwd",
+    ]
+
+
 # --- Forward-parity selftest (spec §9.1, §10) -------------------------------
 #
 # Runs only when CUDA + Triton are present; otherwise skips LOUDLY (prints
@@ -1604,10 +1711,18 @@ def _run_forward_parity(collect: list[dict] | None = None) -> int:
     ``python triton_scans.py``'s own selftest invocation (and any other
     caller that doesn't pass it) is byte-identical to before this seam
     existed: nothing is collected, nothing else changes.
-    """
-    import os
 
-    os.environ["MINGRU_SCAN"] = "eager"  # force the eager reference path
+    A thin wrapper: ``_scan_env("eager")`` forces the eager reference path
+    for the whole sweep and restores ``MINGRU_SCAN`` to whatever it was
+    before this call on return, so `--check` never leaks ``eager`` into
+    the rest of the process; the actual sweep is ``_run_forward_parity_body``.
+    """
+    with _scan_env("eager"):
+        return _run_forward_parity_body(collect)
+
+
+def _run_forward_parity_body(collect: list[dict] | None = None) -> int:
+    """The §9.1 forward-parity sweep itself; see ``_run_forward_parity``."""
     import min_gru
 
     device = "cuda"
@@ -1797,10 +1912,17 @@ def _run_grad_parity(collect: list[dict] | None = None) -> int:
 
     ``collect``: see ``_run_forward_parity`` -- same optional append-only
     parity-conformance-artifact seam, same ``None``-default no-op contract.
-    """
-    import os
 
-    os.environ["MINGRU_SCAN"] = "eager"  # force the eager reference path
+    A thin wrapper: ``_scan_env("eager")`` forces the eager reference path
+    for the whole sweep and restores ``MINGRU_SCAN`` on return -- see
+    ``_run_forward_parity``. The actual sweep is ``_run_grad_parity_body``.
+    """
+    with _scan_env("eager"):
+        return _run_grad_parity_body(collect)
+
+
+def _run_grad_parity_body(collect: list[dict] | None = None) -> int:
+    """The §9.1 gradient-parity sweep itself; see ``_run_grad_parity``."""
     import min_gru
 
     device = "cuda"
@@ -1945,9 +2067,20 @@ def _run_angle_fused_parity(collect: list[dict] | None = None) -> int:
     throughout; the earlier "gentle decay" Givens case existed only to dodge
     the since-rejected division-based reversal's roundoff blowup and would be
     misleading to keep now that that dodge is unnecessary.
-    """
-    import os
 
+    A thin wrapper: ``check_mixer`` (below, in the body) toggles
+    ``MINGRU_SCAN`` between ``"eager"``/``"triton"`` itself per case, so
+    ``_scan_env()`` (no forced mode) only guarantees ``MINGRU_SCAN`` is
+    restored to whatever it was before this call once the sweep returns --
+    see ``_run_forward_parity``. The actual sweep is
+    ``_run_angle_fused_parity_body``.
+    """
+    with _scan_env():
+        return _run_angle_fused_parity_body(collect)
+
+
+def _run_angle_fused_parity_body(collect: list[dict] | None = None) -> int:
+    """The angle-fused parity sweep itself; see ``_run_angle_fused_parity``."""
     import min_gru
 
     device = "cuda"
@@ -2091,6 +2224,41 @@ def _run_angle_fused_parity(collect: list[dict] | None = None) -> int:
 
 
 if __name__ == "__main__":
+    # =========================================================================
+    # CPU lockstep guard: `parallel_scan_log_recompute` (the backward's
+    # autograd-through-recomputation formula, module-level and Triton-free)
+    # vs `min_gru.parallel_scan_log` (the frozen eager reference). Runs
+    # ALWAYS, before the CUDA/Triton availability check below -- unlike the
+    # rest of this file's selftest suite, this section needs no GPU/Triton,
+    # so it is no longer fully vacuous on a CPU-only/no-Triton machine: it
+    # catches head-math drift between the backward's recompute path and the
+    # eager reference on ordinary CI (and the GPU-less Phase-4 wheel CI),
+    # not only the GPU-only grad-parity selftest (`_run_grad_parity`, which
+    # additionally exercises the actual Triton-dispatched backward).
+    # =========================================================================
+    import min_gru as _min_gru_lockstep
+
+    torch.manual_seed(2026)
+    _B, _T, _D = 3, 17, 8
+    _k_pre = torch.randn(_B, _T, _D)
+    _log_coeffs = -F.softplus(_k_pre)
+    _log_z = -F.softplus(-_k_pre)
+    _log_tilde_h = _min_gru_lockstep.log_g(torch.randn(_B, _T, _D))
+    _log_h0 = torch.randn(_B, 1, _D) * 0.1
+    _log_values = torch.cat([_log_h0, _log_z + _log_tilde_h], dim=1)
+
+    _h_recompute = parallel_scan_log_recompute(_log_coeffs, _log_values)
+    _h_eager = _min_gru_lockstep.parallel_scan_log(_log_coeffs, _log_values)
+    _lockstep_err = (_h_recompute - _h_eager).abs().max().item()
+    assert _lockstep_err < 1e-6, (
+        "parallel_scan_log_recompute diverges from min_gru.parallel_scan_log "
+        f"(max_abs={_lockstep_err:.3e}) -- MAINTENANCE lockstep broken"
+    )
+    print(
+        "CPU lockstep: parallel_scan_log_recompute vs min_gru.parallel_scan_log "
+        f"(max_abs={_lockstep_err:.3e}): ok"
+    )
+
     _status = available()
     if _status is not True:
         print(f"triton_scans selftest SKIPPED (loud): {_status}")

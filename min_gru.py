@@ -49,6 +49,25 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Public surface (additive metadata, Phase-4 packaging prep): the four
+# mixers, the block/stack wrappers, and the four scan functions -- exactly
+# what the README documents as importable (e.g. `from min_gru import
+# MinGRUStack`). Everything else (dispatch internals, decay machinery,
+# `g`/`log_g`, `DecayMixin`) is implementation detail, not part of the
+# documented public API.
+__all__ = [
+    "MinGRU",
+    "SignedMinGRU",
+    "RotationMinGRU",
+    "GivensMinGRU",
+    "MinGRUBlock",
+    "MinGRUStack",
+    "parallel_scan_log",
+    "linear_scan",
+    "matrix_scan",
+    "matrix_affine_scan",
+]
+
 Decay = Literal["fixed", "learnable"] | None
 
 # --- Triton scan dispatch seam ----------------------------------------------
@@ -293,10 +312,17 @@ def _dispatch_angle_scan(
     perm: torch.Tensor,
     sgn: torch.Tensor,
     p2p: torch.Tensor,
+    *,
     has_scale: int,
     has_decay: int,
 ):
     """Run the angle-fused kernel, or return ``None`` to fall back to eager.
+
+    ``has_scale``/``has_decay`` are keyword-only: both are 0/1 flags with no
+    positional meaning a reader could infer from a bare ``1, 0`` at a call
+    site (unlike ``theta``/``scale``/etc., whose names the tensor shapes
+    already suggest) -- keyword-only makes every call site self-documenting
+    and immune to an accidental argument-order swap between the two flags.
 
     The module-forward analogue of ``_dispatch_scan``, sharing both of its
     hoisted helpers. Both current call sites (``GivensMinGRU``,
@@ -339,7 +365,8 @@ def _dispatch_angle_scan(
         if not hasattr(triton_scans, "angle_scan_impl"):
             raise triton_scans.ScanFallback("no angle-fused Triton kernel registered")
         return triton_scans.angle_scan_impl(
-            theta, scale, gamma, b, h0, perm, sgn, p2p, has_scale, has_decay
+            theta, scale, gamma, b, h0, perm, sgn, p2p,
+            has_scale=has_scale, has_decay=has_decay,
         )
 
     result, reason = _resolve_triton_dispatch(
@@ -1768,6 +1795,53 @@ class RotationMinGRU(DecayMixin, nn.Module):
 
         return _cached_plane_meta_per_device(self, "_angle_meta_cache", device, build)
 
+    def _angle_heads(
+        self, x: torch.Tensor, dt: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Assemble the angle-fused kernel's per-step heads.
+
+        Pure extraction of ``_angle_fused_forward``'s head-assembly math
+        (no CUDA gate, no kernel dispatch) -- lets a CPU-runnable selftest
+        (``__main__``'s "CPU lockstep guard" section) call this directly and
+        cross-check its reconstructed transition against ``_coeffs``'s
+        ``(M, b)``, the MAINTENANCE lockstep this method's caller-side
+        comment warns about.
+
+        MAINTENANCE: this head derivation (``linear_theta``, snap STE,
+        ``linear_u`` -> ``tanh``, ``linear_z``/``linear_h`` -> ``b``) must be
+        kept byte-for-byte in lockstep with ``RotationMinGRU._coeffs``.
+        ``_coeffs`` is frozen for evidence invariance (its eager op sequence
+        must not be reordered or refactored -- see the class/module
+        docstrings), so it is re-derived here rather than shared; any future
+        change to ``_coeffs``'s head math must be mirrored in this method by
+        hand. Two checks catch divergence: the GPU-only module-level
+        angle-fused parity selftest (``triton_scans._run_angle_fused_parity``)
+        and the CPU-runnable ``__main__`` lockstep assertion below (which
+        needs no GPU/Triton, so ordinary CI and the GPU-less Phase-4 wheel CI
+        both catch drift too).
+
+        Returns
+        -------
+        tuple of torch.Tensor
+            ``theta`` ``(B, T, n_blocks, 1, 1)`` post-snap; ``scale`` =
+            ``tanh(u_t)`` ``(B, T, n_blocks)``; ``gamma`` ``(B, T, n_blocks)``
+            (all ones if ``dt`` is None); ``b`` ``(B, T, n_blocks, 2)``.
+        """
+        B, T, _ = x.shape
+        n = self.n_blocks
+        theta = self.linear_theta(x)
+        if self.snap is not None:
+            snapped = torch.round(theta / self.snap_step) * self.snap_step
+            theta = theta + (snapped - theta).detach()
+        theta = theta.view(B, T, n, 1, 1)
+        scale = torch.tanh(self.linear_u(x))  # d_t, (B, T, n)
+        b = (torch.sigmoid(self.linear_z(x)) * self.linear_h(x)).reshape(B, T, n, 2)
+        if dt is not None:
+            gamma = self._decay_gamma(dt).expand(B, T, n)
+        else:
+            gamma = torch.ones(B, T, n, dtype=x.dtype, device=x.device)
+        return theta, scale, gamma, b
+
     def _angle_fused_forward(
         self, x: torch.Tensor, h0_blocks: torch.Tensor, dt: torch.Tensor | None
     ) -> torch.Tensor | None:
@@ -1775,11 +1849,12 @@ class RotationMinGRU(DecayMixin, nn.Module):
 
         On CUDA under ``MINGRU_SCAN=auto``/``triton`` this assembles the raw
         rotation angle, the ``tanh(u)`` scale channel, injection, decay, and
-        ``h_0`` and routes them through the angle-fused Triton kernel, never
-        materializing the 2x2 transition matrices ``matrix_scan`` is defined
-        over. On CPU or under ``eager`` it returns ``None`` without importing
-        ``triton_scans``, so ``forward`` runs its unchanged eager path (the
-        recorded evidence path stays byte-identical). The snap STE stays here
+        ``h_0`` (via ``_angle_heads``) and routes them through the
+        angle-fused Triton kernel, never materializing the 2x2 transition
+        matrices ``matrix_scan`` is defined over. On CPU or under ``eager``
+        it returns ``None`` without importing ``triton_scans``, so
+        ``forward`` runs its unchanged eager path (the recorded evidence path
+        stays byte-identical). The snap STE stays inside ``_angle_heads``
         upstream -- the kernel consumes POST-snap angles.
 
         The reversible backward reads every ``h_{t-1}`` exactly from the
@@ -1795,32 +1870,12 @@ class RotationMinGRU(DecayMixin, nn.Module):
         if not _angle_scan_should_try(x.is_cuda):
             return None
         B, T, _ = x.shape
-        n = self.n_blocks
-        # MAINTENANCE: this head derivation (linear_theta, snap STE,
-        # linear_u -> tanh, linear_z/linear_h -> b) must be kept byte-for-byte
-        # in lockstep with `RotationMinGRU._coeffs`. `_coeffs` is frozen for
-        # evidence invariance (its eager op sequence must not be reordered or
-        # refactored -- see the class/module docstrings), so it is re-derived
-        # here rather than shared; any future change to `_coeffs`'s head math
-        # must be mirrored in this method by hand. No static check enforces
-        # that -- only the Task-7 module-level angle-fused parity selftest
-        # (`triton_scans._run_angle_fused_parity`) catches divergence.
-        theta = self.linear_theta(x)
-        if self.snap is not None:
-            snapped = torch.round(theta / self.snap_step) * self.snap_step
-            theta = theta + (snapped - theta).detach()
-        theta = theta.view(B, T, n, 1, 1)
-        scale = torch.tanh(self.linear_u(x))  # d_t, (B, T, n)
-        b = (torch.sigmoid(self.linear_z(x)) * self.linear_h(x)).reshape(B, T, n, 2)
-        if dt is not None:
-            gamma = self._decay_gamma(dt).expand(B, T, n)
-            has_decay = 1
-        else:
-            gamma = torch.ones(B, T, n, dtype=x.dtype, device=x.device)
-            has_decay = 0
+        theta, scale, gamma, b = self._angle_heads(x, dt)
+        has_decay = 1 if dt is not None else 0
         perm, sgn, p2p = self._angle_plane_meta(x.device)
         h = _dispatch_angle_scan(
-            theta, scale, gamma, b, h0_blocks, perm, sgn, p2p, 1, has_decay
+            theta, scale, gamma, b, h0_blocks, perm, sgn, p2p,
+            has_scale=1, has_decay=has_decay,
         )
         if h is None:
             return None
@@ -2177,18 +2232,64 @@ class GivensMinGRU(DecayMixin, nn.Module):
 
         return _cached_plane_meta_per_device(self, "_angle_meta_cache", device, build)
 
+    def _angle_heads(
+        self, x: torch.Tensor, dt: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Assemble the angle-fused kernel's per-step heads.
+
+        Pure extraction of ``_angle_fused_forward``'s head-assembly math (no
+        CUDA gate, no kernel dispatch) -- lets a CPU-runnable selftest
+        (``__main__``'s "CPU lockstep guard" section) call this directly and
+        cross-check its reconstructed transition against ``_coeffs``'s
+        ``(M, b)``, the MAINTENANCE lockstep this method's caller-side
+        comment warns about.
+
+        MAINTENANCE: this head derivation (``linear_theta`` view,
+        ``linear_z``/``linear_h`` -> ``b``) must be kept byte-for-byte in
+        lockstep with ``GivensMinGRU._coeffs``. ``_coeffs`` is frozen for
+        evidence invariance (its eager op sequence must not be reordered or
+        refactored -- see the class/module docstrings), so it is re-derived
+        here rather than shared; any future change to ``_coeffs``'s head math
+        must be mirrored in this method by hand. Two checks catch
+        divergence: the GPU-only module-level angle-fused parity selftest
+        (``triton_scans._run_angle_fused_parity``) and the CPU-runnable
+        ``__main__`` lockstep assertion below (which needs no GPU/Triton, so
+        ordinary CI and the GPU-less Phase-4 wheel CI both catch drift too).
+
+        Returns
+        -------
+        tuple of torch.Tensor
+            ``theta`` ``(B, T, n_blocks, rounds, k // 2)``; ``scale`` = all
+            ones ``(B, T, n_blocks)`` (the Givens transition has no per-block
+            scale; kept only for the angle-fused kernel's shared calling
+            convention with ``RotationMinGRU``); ``gamma`` ``(B, T,
+            n_blocks)`` (all ones if ``dt`` is None); ``b`` ``(B, T,
+            n_blocks, k)``.
+        """
+        B, T, _ = x.shape
+        n, k, R = self.n_blocks, self.k, self.rounds
+        theta = self.linear_theta(x).view(B, T, n, R, k // 2)
+        b = (torch.sigmoid(self.linear_z(x)) * self.linear_h(x)).reshape(B, T, n, k)
+        if dt is not None:
+            gamma = self._decay_gamma(dt).expand(B, T, n)
+        else:
+            gamma = torch.ones(B, T, n, dtype=x.dtype, device=x.device)
+        scale = torch.ones(B, T, n, dtype=x.dtype, device=x.device)
+        return theta, scale, gamma, b
+
     def _angle_fused_forward(
         self, x: torch.Tensor, h0_blocks: torch.Tensor, dt: torch.Tensor | None
     ) -> torch.Tensor | None:
         """CUDA angle-fused fast path for ``forward`` (returns None off-path).
 
         On CUDA under ``MINGRU_SCAN=auto``/``triton`` this assembles the raw
-        per-round Givens angles, injection, decay, and ``h_0`` and routes them
-        through the angle-fused Triton kernel, never materializing or scanning
-        the ``k x k`` transition matrices ``matrix_affine_scan`` is defined
-        over. On CPU or under ``eager`` it returns ``None`` without importing
-        ``triton_scans`` (the recorded evidence path stays byte-identical). The
-        Givens transition has no per-block scale, so ``has_scale`` is 0.
+        per-round Givens angles, injection, decay, and ``h_0`` (via
+        ``_angle_heads``) and routes them through the angle-fused Triton
+        kernel, never materializing or scanning the ``k x k`` transition
+        matrices ``matrix_affine_scan`` is defined over. On CPU or under
+        ``eager`` it returns ``None`` without importing ``triton_scans`` (the
+        recorded evidence path stays byte-identical). The Givens transition
+        has no per-block scale, so ``has_scale`` is 0.
 
         The reversible backward reads every ``h_{t-1}`` exactly from the
         stored forward output -- never by inverting the forward step. An
@@ -2206,28 +2307,12 @@ class GivensMinGRU(DecayMixin, nn.Module):
         if not _angle_scan_should_try(x.is_cuda):
             return None
         B, T, _ = x.shape
-        n, k, R = self.n_blocks, self.k, self.rounds
-        # MAINTENANCE: this head derivation (linear_theta view, linear_z/
-        # linear_h -> b) must be kept byte-for-byte in lockstep with
-        # `GivensMinGRU._coeffs`. `_coeffs` is frozen for evidence invariance
-        # (its eager op sequence must not be reordered or refactored -- see
-        # the class/module docstrings), so it is re-derived here rather than
-        # shared; any future change to `_coeffs`'s head math must be mirrored
-        # in this method by hand. No static check enforces that -- only the
-        # Task-7 module-level angle-fused parity selftest
-        # (`triton_scans._run_angle_fused_parity`) catches divergence.
-        theta = self.linear_theta(x).view(B, T, n, R, k // 2)
-        b = (torch.sigmoid(self.linear_z(x)) * self.linear_h(x)).reshape(B, T, n, k)
-        if dt is not None:
-            gamma = self._decay_gamma(dt).expand(B, T, n)
-            has_decay = 1
-        else:
-            gamma = torch.ones(B, T, n, dtype=x.dtype, device=x.device)
-            has_decay = 0
-        scale = torch.ones(B, T, n, dtype=x.dtype, device=x.device)
+        theta, scale, gamma, b = self._angle_heads(x, dt)
+        has_decay = 1 if dt is not None else 0
         perm, sgn, p2p = self._angle_plane_meta(x.device)
         h = _dispatch_angle_scan(
-            theta, scale, gamma, b, h0_blocks, perm, sgn, p2p, 0, has_decay
+            theta, scale, gamma, b, h0_blocks, perm, sgn, p2p,
+            has_scale=0, has_decay=has_decay,
         )
         if h is None:
             return None
@@ -4284,4 +4369,103 @@ if __name__ == "__main__":
     )
     _check_angle_dispatch_seam(
         "RotationMinGRU", RotationMinGRU(4, 8, snap=None), _angle_x
+    )
+
+    # =========================================================================
+    # CPU lockstep guard: `_angle_heads` (the angle-fused kernel's head
+    # derivation, GPU-only at runtime) vs `_coeffs` (the frozen eager
+    # reference), for both mixers. Reconstructs the per-step transition
+    # matrix `_angle_heads`'s (theta, scale, gamma) heads implicitly
+    # represent -- by applying the SAME per-round factored-plane-rotation
+    # formula the angle-fused Triton kernel implements (scale -> rounds ->
+    # decay; see `triton_scans._angle_scan_fwd_kernel`) to each of the k
+    # standard basis columns -- and asserts it matches `_coeffs`'s own `M`
+    # (plus `b` directly). This is CPU-runnable (no GPU/Triton needed), so
+    # head-math drift between `_angle_heads` and `_coeffs` now fails ordinary
+    # CI (and the GPU-less Phase-4 wheel CI), not only the GPU-only
+    # module-level angle-fused parity selftest
+    # (`triton_scans._run_angle_fused_parity`).
+    # =========================================================================
+    def _reconstruct_angle_matrix(
+        theta: torch.Tensor,
+        scale: torch.Tensor,
+        gamma: torch.Tensor,
+        perm: torch.Tensor,
+        sgn: torch.Tensor,
+        p2p: torch.Tensor,
+        k: int,
+        has_scale: bool,
+    ) -> torch.Tensor:
+        """Reference (selftest-only) reconstruction of the per-step transition
+        matrix from `_angle_heads`'s heads and the plane metadata, by applying
+        the kernel's per-round formula to each of the k standard basis
+        columns: column c of the result is that action applied to e_c. Never
+        used by any runtime path -- may freely differ in implementation
+        strategy from the Triton kernel while checking the same mathematical
+        object `_coeffs` computes.
+        """
+        *lead, n, R, half = theta.shape
+        eye = torch.eye(k, dtype=theta.dtype, device=theta.device)
+        v = eye.expand(*lead, n, k, k).clone()
+        if has_scale:
+            v[..., 1, :] = scale.unsqueeze(-1) * v[..., 1, :]
+        for r in range(R):
+            cos = torch.cos(theta[..., r, :])
+            sin = torch.sin(theta[..., r, :])
+            perm_r, sgn_r, p2p_r = perm[r].long(), sgn[r], p2p[r].long()
+            cos_pos = cos[..., p2p_r]  # (*lead, n, k)
+            sin_pos = sin[..., p2p_r]
+            vp = v[..., perm_r, :]  # gather along the row axis (dim -2)
+            v = cos_pos.unsqueeze(-1) * v + (sgn_r * sin_pos).unsqueeze(-1) * vp
+        return gamma.unsqueeze(-1).unsqueeze(-1) * v
+
+    def _check_angle_heads_lockstep(
+        mixer_name: str,
+        mixer: nn.Module,
+        x: torch.Tensor,
+        delta_t: torch.Tensor | None,
+        has_scale: bool,
+    ) -> None:
+        """Cross-check one mixer's `_angle_heads` against its `_coeffs`."""
+        with torch.no_grad():
+            dt = mixer._prepare_decay(delta_t, canonical_ndim=2)
+            M_ref, b_ref = mixer._coeffs(x, dt)
+            theta, scale, gamma, b_heads = mixer._angle_heads(x, dt)
+            perm, sgn, p2p = mixer._angle_plane_meta(x.device)
+            k = M_ref.shape[-1]
+            M_recon = _reconstruct_angle_matrix(
+                theta, scale, gamma, perm, sgn, p2p, k, has_scale
+            )
+        m_err = (M_recon - M_ref).abs().max().item()
+        b_err = (b_heads.reshape(b_ref.shape) - b_ref).abs().max().item()
+        assert m_err < 1e-5, (
+            f"{mixer_name}: _angle_heads-reconstructed M diverges from "
+            f"_coeffs's M (max_abs={m_err:.3e}) -- MAINTENANCE lockstep broken"
+        )
+        assert b_err < 1e-6, (
+            f"{mixer_name}: _angle_heads's b diverges from _coeffs's b "
+            f"(max_abs={b_err:.3e}) -- MAINTENANCE lockstep broken"
+        )
+        print(
+            f"{mixer_name}: _angle_heads vs _coeffs lockstep "
+            f"(M max_abs={m_err:.3e}, b max_abs={b_err:.3e}): ok"
+        )
+
+    torch.manual_seed(11)
+    _givens_lockstep = GivensMinGRU(
+        4, 12, block_size=4, rounds=3, decay="learnable", decay_rate=1.0
+    )
+    _x_lockstep_g = torch.randn(2, 5, 4)
+    _dt_lockstep_g = torch.rand(2, 5) * 2.0 + 1e-2
+    _check_angle_heads_lockstep(
+        "GivensMinGRU (rounds=3, decay=learnable)",
+        _givens_lockstep, _x_lockstep_g, _dt_lockstep_g, has_scale=False,
+    )
+
+    torch.manual_seed(12)
+    _rotation_lockstep = RotationMinGRU(4, 8, snap=(2, 3, 4, 6))
+    _x_lockstep_r = torch.randn(2, 5, 4)
+    _check_angle_heads_lockstep(
+        "RotationMinGRU (snap=(2,3,4,6))",
+        _rotation_lockstep, _x_lockstep_r, None, has_scale=True,
     )
