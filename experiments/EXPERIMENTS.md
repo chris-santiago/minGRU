@@ -1302,3 +1302,28 @@ commit the run was executed against. This transfers the pooled n=12
 `hetero-loop-17-sg8`/`-18-sdm`/`-15-nosnap` evidence (README's Givens
 mechanism numbers) onto the promoted `min_gru.py` code path without
 rerunning the multi-seed campaign.
+
+## Round: Givens rounds ablation (`hetero-loop-19-rounds`)
+
+Motivation: an external adversarial review of `TECHNICAL_REPORT.md` flagged the headline `hetero-loop-17-sg8` finding (Givens-8 fits 8/12 vs 1/12 for the continuous 2D composer at matched 64-element state) as causally under-controlled: the comparison moves per-token map expressivity ($SO(8)$ vs $SO(2)$) and within-scan block connectivity (8 coupled channels vs 2) together, so "map richness raises fit rate" was supported only correlationally. The isolating ablation holds `block_size=8` fixed and varies `rounds` $\in \{1, 2, 3\}$: at `rounds=1` the brick-wall mesh is 4 disjoint, commuting 2D planes inside the 8D block (32 planes per token, plane-count-matched to the 2D composer's 32 blocks, no cross-plane coupling); `rounds=2` adds the one staggered layer that couples all 8 dims and breaks commutativity; `rounds=3` is the recorded promoted configuration.
+
+Design: `hetero-sg8r1` / `hetero-sg8r2` arms added to `experiments/hetero_lab.py` (`givens8r1`/`givens8r2` factories, same `_HeteroVariantTagger` signed-tanh extractor stack, same CKPT best-val@128 protocol), n=12 seeds each on `S3-hier` at the 1600-step budget; `rounds=3` is the existing `hetero-loop-17-sg8` n=12 arm, not rerun. Runs executed 4-way parallel with `OMP_NUM_THREADS=2`.
+
+Command (per run):
+
+```
+OMP_NUM_THREADS=2 uv run --python 3.12 --with 'torch==2.5.1' python experiments/hetero_lab.py \
+    --round hetero-loop-19-rounds --model hetero-sg8r1 --seed 0 --steps 1600
+```
+
+Results (fit = ckpt val@128 >= 0.99; means over all 12 seeds):
+
+| composer | rounds | fits | acc@64 | acc@256 | acc@512 | acc@1024 | fit-only @512/@1024 |
+|---|---|---|---|---|---|---|---|
+| givens8r1 | 1 | 0/12 | 0.376 | 0.235 | 0.196 | 0.182 | — |
+| givens8r2 | 2 | 6/12 | 0.805 | 0.761 | 0.675 | 0.515 | 0.916 / 0.704 |
+| givens8 (recorded, `hetero-loop-17-sg8`) | 3 | 8/12 | 0.949 | 0.885 | 0.787 | 0.613 | 0.927 / 0.733 |
+
+Fisher exact (two-sided): rounds 1 vs 3 $p \approx 0.0013$; rounds 1 vs 2 $p \approx 0.014$; rounds 2 vs 3 $p \approx 0.68$ (inseparable); rounds 1 vs the 2D composer's 1/12 $p = 1.0$ (indistinguishable). Threshold-robust: at fit threshold 0.98 the counts read 0/12, 8/12 (two near-fits at 0.983), 9/12 — same ordering.
+
+Conclusion: **the block-size/connectivity hypothesis is refuted and the non-commutativity attribution is earned.** An 8D block of disjoint commuting planes fits 0/12 — no better than the 2D composer despite the larger coupled state block — while the single staggered layer that breaks within-block commutativity recovers most of the fit-rate effect (6/12), and the third layer adds a statistically inseparable increment (8/12). Fit-only generalization is unchanged across rounds (0.704 vs 0.733 at T=1024), consistent with the reliability-vs-quality separation from `hetero-loop-17/18`. Residual caveat on the cross-family anchor only: `givens8r1` is a pure rotation (no $\tanh u$ scale channel, cannot contract), while the 2D composer carries the scale, so the r1-vs-2D equivalence is suggestive rather than exact; the within-family monotonicity (0/12 → 6/12 → 8/12 under one factory, one protocol) is the controlled result. Rows appended to `lab_results.jsonl` under `hetero-loop-19-rounds`.

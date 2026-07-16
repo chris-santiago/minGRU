@@ -432,6 +432,32 @@ and "Expressivity limits" below is the formal version of this picture.
   tracking (e.g. S5, NC¹-complete) that requires state-dependent gates;
   see the Signed and Rotation variant sections below. The probes make
   all of this measurable.
+- **A natural objection: "rotations are abelian."** Rotations confined
+  to fixed disjoint 2×2 planes with pure rotation angles are equivalent
+  to a complex-diagonal transition (the LRU parameterization); they
+  commute — angles just add — so that family is order-blind exactly like
+  the real diagonal case, and the objection is correct *for that
+  family*. Neither promoted rotation mixer is in it, and the recorded
+  measurements separate them. `RotationMinGRU`'s per-block map is
+  `R(θ_t)·diag(1, tanh u_t)` — rotation **and** flip, an O(2)-valued
+  family generating the dihedral group, which is non-abelian — and it
+  fits S3 at one layer (1.000 / 1.000 / 0.996 / 0.958, n=8, "Rotation
+  variant" below), a result unavailable to any commuting transition
+  family at any width: commuting maps yield the same final state under
+  any reordering of the inputs, while S3 labels change under
+  reordering. `GivensMinGRU` composes rotations in *staggered* planes —
+  disjoint planes within a round commute; the stagger across rounds is
+  what breaks commutativity — at fixed block size, so per-token cost
+  stays linear in width rather than the O(d²) of a full SO(d)
+  transition. Two adjacent corrections the objection often carries:
+  parity is Z₂ — abelian — and is held at length by the signed
+  *diagonal* mixer (0.994 @1024, n=6, worst seed 0.984), which needs an
+  eigenvalue at −1, not non-commutativity (the delta-rule
+  reimplementations record 0.851 and 0.810 @1024 on the same probe, n=3
+  each — "Incumbent comparison" below); and S5 is not what non-diagonal
+  transitions unlock — it is NC¹-complete, a ceiling on this entire
+  fixed-depth class (previous bullet), while non-diagonal transitions
+  unlock the *solvable* groups inside TC⁰.
 
 ## Signed variant (`SignedMinGRU`)
 
@@ -864,7 +890,8 @@ nearly constant (+2.2% full-stack). 2-dimensional rotation blocks fit
 rotations, special-orthogonal by construction, continuous, trained
 through the same parallel associative scan) fit 8/12 (Fisher exact
 p ≈ 0.009 against the 2D rate), with three of the four misses
-near-fit (best-val@128 0.83–0.98) and one low seed. The delta rule
+near-fit (best-val@128 0.83–0.98) and one low seed.
+A rounds ablation at fixed block size attributes that gap to the coupling that breaks within-block commutativity, not to block size: with `rounds=1` (four disjoint, commuting 2D planes inside the 8D block) the composer fits 0/12 — no better than the 2D composer — while the single staggered coupling layer of `rounds=2` recovers 6/12 and `rounds=3` reaches the 8/12 above (0/12 vs 8/12 p ≈ 0.0013; rounds 2 vs 3 inseparable, p ≈ 0.68; fit-only generalization unchanged across rounds — per-seed rows under `hetero-loop-19-rounds`). The delta rule
 shrunk to the same 64-element state fits 4/12 with chance plateaus on
 the misses (`hetero-sdm` above) — so the full-size delta composer's
 6/6 owes much of its reliability to its 16x-larger state (1,024

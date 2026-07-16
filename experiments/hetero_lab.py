@@ -214,6 +214,14 @@ HETERO_FACTORY_MODELS = {
     "hetero-sd2-par": ("signed-tanh", "deltascan2"),
     "hetero-sg8": ("signed-tanh", "givens8"),
     "hetero-sdm": ("signed-tanh", "deltamini"),
+    # rounds ablation at fixed block_size=8 (hetero-loop-19-rounds):
+    # rounds=1 is 4 disjoint commuting 2D planes inside the 8D block
+    # (block-size/connectivity arm, no cross-plane coupling); rounds=2
+    # adds the staggered layer that couples all 8 dims. Separates "map
+    # richness / non-commutativity" from "bigger coupled block" as the
+    # cause of the hetero-sg8 (rounds=3) fit-rate jump over 2D rotation.
+    "hetero-sg8r1": ("signed-tanh", "givens8r1"),
+    "hetero-sg8r2": ("signed-tanh", "givens8r2"),
 }
 
 class GivensMinGRU(nn.Module):
@@ -370,6 +378,8 @@ LOCAL_FACTORIES = {
     **VARIANTS,
     "deltascan2": lambda d_in, d_h: DeltaScanMixer(d_in, d_h, nh=2),
     "givens8": lambda d_in, d_h: GivensMinGRU(d_in, d_h, block_size=8, rounds=3),
+    "givens8r1": lambda d_in, d_h: GivensMinGRU(d_in, d_h, block_size=8, rounds=1),
+    "givens8r2": lambda d_in, d_h: GivensMinGRU(d_in, d_h, block_size=8, rounds=2),
     # matched-capacity delta (write-erase mechanism at the promoted
     # mixers' 64-element state; parallel scan is cheap at d_k=8)
     "deltamini": lambda d_in, d_h: DeltaScanMixer(
