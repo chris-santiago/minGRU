@@ -75,6 +75,117 @@ _warned_scan_fallback = False
 _warned_angle_fallback = False
 
 
+def _resolve_scan_mode(is_cuda: bool) -> str | None:
+    """Validate ``MINGRU_SCAN`` and apply the eager/CPU-``auto`` short-circuit.
+
+    Shared by ``_dispatch_scan``, ``_angle_scan_should_try``, and
+    ``_dispatch_angle_scan`` -- the identical "read ``MINGRU_SCAN``,
+    validate it, then skip Triton for ``eager`` or CPU-resident ``auto``"
+    check used to be duplicated across the first two; hoisting it here lets
+    ``_dispatch_angle_scan`` call it directly too, so it no longer has to
+    (silently) trust that ``_angle_scan_should_try`` already ran first --
+    see ``_dispatch_angle_scan``'s docstring.
+
+    Parameters
+    ----------
+    is_cuda : bool
+        Whether this call's tensor input is CUDA-resident.
+
+    Returns
+    -------
+    str or None
+        The validated mode (``"auto"`` or ``"triton"``) if a Triton path
+        should be attempted; ``None`` if the caller should just run its
+        existing eager implementation (``MINGRU_SCAN=eager``, or ``auto``
+        with a CPU-resident input -- CPU behavior is unchanged: no import
+        attempted, no warning).
+
+    Raises
+    ------
+    ValueError
+        If ``MINGRU_SCAN`` is not one of ``"auto"``, ``"eager"``, ``"triton"``.
+    """
+    mode = os.environ.get("MINGRU_SCAN", "auto")
+    if mode not in _VALID_SCAN_MODES:
+        raise ValueError(
+            f"MINGRU_SCAN must be one of {_VALID_SCAN_MODES} (got {mode!r})"
+        )
+    if mode == "eager":
+        return None
+    if mode == "auto" and not is_cuda:
+        # CPU behavior is unchanged: no import attempted, no warning.
+        return None
+    return mode
+
+
+def _resolve_triton_dispatch(
+    mode: str, op_label: str, call
+) -> tuple[object | None, str | None]:
+    """Shared ``triton_scans`` resolution: lazy import, per-op availability
+    check + invocation via ``call``, and ``ScanFallback`` handling.
+
+    Both ``_dispatch_scan`` and ``_dispatch_angle_scan`` need the identical
+    "lazily import ``triton_scans``, confirm there's a usable Triton path
+    for this op, invoke it, treat a declined/failed kernel exactly like any
+    other unavailability reason" flow, differing only in which op-specific
+    availability check and kernel call to make -- this is the one hoisted
+    copy of that machinery, parameterized by ``call``.
+
+    Parameters
+    ----------
+    mode : str
+        The value a caller's own ``_resolve_scan_mode`` call already
+        validated and returned. Always ``"auto"`` or ``"triton"`` here --
+        this function is only ever reached after ruling out ``"eager"``
+        and CPU-resident ``"auto"`` (never called with any other value).
+    op_label : str
+        Human-readable name of the op/path for the ``MINGRU_SCAN=triton``
+        error message (e.g. ``repr(scan_name)``, or a fixed phrase for the
+        angle-fused path).
+    call : Callable[[module], object]
+        Given the imported ``triton_scans`` module, perform this op's own
+        availability check(s) and the actual kernel invocation, raising
+        ``triton_scans.ScanFallback`` (never a bare exception) if no usable
+        Triton path exists for this call -- out-of-envelope shape, no
+        kernel registered yet, or a launch/compile failure are all the
+        same "declined" signal to this function.
+
+    Returns
+    -------
+    tuple of (result, reason)
+        ``(kernel_result, None)`` if a Triton path ran; ``(None, reason)``
+        if it didn't (only possible when ``mode == "auto"`` -- ``"triton"``
+        raises directly below instead of returning a reason). The caller
+        owns the ``mode == "auto"`` warn-once call itself (rather than this
+        helper doing it), so each ``warnings.warn``'s ``stacklevel`` keeps
+        pointing at that caller's own original call site, unaffected by
+        this helper's stack depth.
+
+    Raises
+    ------
+    RuntimeError
+        If ``mode == "triton"`` but no Triton path is usable for this call
+        (never a silent downgrade to eager).
+    """
+    reason = None
+    try:
+        import triton_scans
+    except ImportError as exc:
+        reason = f"triton_scans not importable: {exc}"
+    else:
+        try:
+            return call(triton_scans), None
+        except triton_scans.ScanFallback as exc:
+            reason = str(exc)
+
+    if mode == "triton":
+        raise RuntimeError(
+            f"MINGRU_SCAN=triton requested for {op_label} but Triton is "
+            f"unavailable: {reason}"
+        )
+    return None, reason
+
+
 def _dispatch_scan(name: str, *args: torch.Tensor):
     """Resolve ``MINGRU_SCAN`` and run a Triton scan kernel if selected.
 
@@ -113,46 +224,21 @@ def _dispatch_scan(name: str, *args: torch.Tensor):
         available or registered for ``name`` (never a silent downgrade
         to eager).
     """
-    mode = os.environ.get("MINGRU_SCAN", "auto")
-    if mode not in _VALID_SCAN_MODES:
-        raise ValueError(
-            f"MINGRU_SCAN must be one of {_VALID_SCAN_MODES} (got {mode!r})"
-        )
-    if mode == "eager":
+    mode = _resolve_scan_mode(args[0].is_cuda)
+    if mode is None:
         return None
 
-    is_cuda = args[0].is_cuda
-    if mode == "auto" and not is_cuda:
-        # CPU behavior is unchanged: no import attempted, no warning.
-        return None
-
-    reason = None
-    try:
-        import triton_scans
-    except ImportError as exc:
-        reason = f"triton_scans not importable: {exc}"
-    else:
+    def _call(triton_scans):
         status = triton_scans.available()
         if status is not True:
-            reason = status
-        elif name not in triton_scans.SCAN_IMPLS:
-            reason = f"no Triton kernel registered for {name!r} yet"
+            raise triton_scans.ScanFallback(str(status))
+        if name not in triton_scans.SCAN_IMPLS:
+            raise triton_scans.ScanFallback(f"no Triton kernel registered for {name!r} yet")
+        return triton_scans.SCAN_IMPLS[name](*args)
 
+    result, reason = _resolve_triton_dispatch(mode, repr(name), _call)
     if reason is None:
-        try:
-            return triton_scans.SCAN_IMPLS[name](*args)
-        except triton_scans.ScanFallback as exc:
-            # The kernel declined this call (out-of-envelope shape or a
-            # launch/compile failure). Treat it exactly like any other
-            # "no usable Triton path" reason below: raise under `triton`,
-            # warn-once-and-fall-back under `auto`. Never a wrong result.
-            reason = str(exc)
-
-    if mode == "triton":
-        raise RuntimeError(
-            f"MINGRU_SCAN=triton requested for {name!r} but Triton is "
-            f"unavailable: {reason}"
-        )
+        return result
 
     # mode == "auto" with CUDA-resident inputs and no usable Triton path:
     # warn once per process, naming the reason, then fall back to eager.
@@ -170,12 +256,15 @@ def _dispatch_scan(name: str, *args: torch.Tensor):
 def _angle_scan_should_try(is_cuda: bool) -> bool:
     """Cheap pre-check: should the angle-fused module path be attempted?
 
-    Mirrors the front of ``_dispatch_scan`` -- validates ``MINGRU_SCAN`` and
-    returns ``False`` (run the unchanged eager mixer forward) for ``eager``, or
-    for ``auto`` with CPU inputs, WITHOUT importing ``triton_scans``. Keeping
-    this gate ahead of any head assembly means the recorded CPU evidence path
-    stays byte-identical and import-free. ``True`` means assemble the angle
-    heads and call ``_dispatch_angle_scan``.
+    Thin wrapper over ``_resolve_scan_mode`` -- returns ``False`` (run the
+    unchanged eager mixer forward) for ``eager``, or for ``auto`` with CPU
+    inputs, WITHOUT importing ``triton_scans``. Keeping this gate ahead of
+    any head assembly means the recorded CPU evidence path stays
+    byte-identical and import-free. ``True`` means assemble the angle heads
+    and call ``_dispatch_angle_scan`` (which independently re-validates via
+    the same ``_resolve_scan_mode`` call -- see its docstring -- so this
+    pre-check is a throughput optimization for the CPU/eager path, not a
+    correctness dependency ``_dispatch_angle_scan`` relies on).
 
     Parameters
     ----------
@@ -192,16 +281,7 @@ def _angle_scan_should_try(is_cuda: bool) -> bool:
     ValueError
         If ``MINGRU_SCAN`` is not one of ``auto``/``eager``/``triton``.
     """
-    mode = os.environ.get("MINGRU_SCAN", "auto")
-    if mode not in _VALID_SCAN_MODES:
-        raise ValueError(
-            f"MINGRU_SCAN must be one of {_VALID_SCAN_MODES} (got {mode!r})"
-        )
-    if mode == "eager":
-        return False
-    if mode == "auto" and not is_cuda:
-        return False
-    return True
+    return _resolve_scan_mode(is_cuda) is not None
 
 
 def _dispatch_angle_scan(
@@ -218,15 +298,21 @@ def _dispatch_angle_scan(
 ):
     """Run the angle-fused kernel, or return ``None`` to fall back to eager.
 
-    The module-forward analogue of ``_dispatch_scan``: reached only after
-    ``_angle_scan_should_try`` returned ``True`` (mode is ``auto`` with CUDA
-    inputs, or ``triton``). Handles the lazy ``triton_scans`` import, the
-    availability check, warn-once under ``auto``, and raise under ``triton``.
+    The module-forward analogue of ``_dispatch_scan``, sharing both of its
+    hoisted helpers. Both current call sites (``GivensMinGRU``,
+    ``RotationMinGRU``) invoke this only after ``_angle_scan_should_try``
+    already returned ``True`` (mode is ``auto`` with CUDA inputs, or
+    ``triton``) so the eager path never pays for assembling the angle
+    heads -- but this function does NOT depend on that ordering for
+    correctness: it re-validates ``MINGRU_SCAN`` itself via
+    ``_resolve_scan_mode(theta.is_cuda)``, exactly like ``_dispatch_scan``
+    does with its own tensor argument, so a direct/out-of-order call is
+    just as safe (redundant, not incorrect) as the current call sites.
     Shape/envelope validation and the launch-failure funnel live in
-    ``triton_scans.angle_scan_impl`` (mirroring how ``_dispatch_scan`` leaves
-    those checks to each ``SCAN_IMPLS`` entry) -- this function catches only
-    ``triton_scans.ScanFallback``, never a bare exception, exactly like
-    ``_dispatch_scan``.
+    ``triton_scans.angle_scan_impl`` (mirroring how ``_dispatch_scan``
+    leaves those checks to each ``SCAN_IMPLS`` entry) -- this function
+    catches only ``triton_scans.ScanFallback``, never a bare exception,
+    exactly like ``_dispatch_scan``.
 
     Returns
     -------
@@ -236,36 +322,32 @@ def _dispatch_angle_scan(
 
     Raises
     ------
+    ValueError
+        If ``MINGRU_SCAN`` is not one of ``"auto"``, ``"eager"``, ``"triton"``.
     RuntimeError
         If ``MINGRU_SCAN=triton`` but the angle-fused kernel is unavailable
         (never a silent downgrade).
     """
-    mode = os.environ.get("MINGRU_SCAN", "auto")
-    reason = None
-    try:
-        import triton_scans
-    except ImportError as exc:
-        reason = f"triton_scans not importable: {exc}"
-    else:
+    mode = _resolve_scan_mode(theta.is_cuda)
+    if mode is None:
+        return None
+
+    def _call(triton_scans):
         status = triton_scans.available()
         if status is not True:
-            reason = status
-        elif not hasattr(triton_scans, "angle_scan_impl"):
-            reason = "no angle-fused Triton kernel registered"
-
-    if reason is None:
-        try:
-            return triton_scans.angle_scan_impl(
-                theta, scale, gamma, b, h0, perm, sgn, p2p, has_scale, has_decay
-            )
-        except triton_scans.ScanFallback as exc:
-            reason = str(exc)
-
-    if mode == "triton":
-        raise RuntimeError(
-            "MINGRU_SCAN=triton requested for the angle-fused mixer path but "
-            f"Triton is unavailable: {reason}"
+            raise triton_scans.ScanFallback(str(status))
+        if not hasattr(triton_scans, "angle_scan_impl"):
+            raise triton_scans.ScanFallback("no angle-fused Triton kernel registered")
+        return triton_scans.angle_scan_impl(
+            theta, scale, gamma, b, h0, perm, sgn, p2p, has_scale, has_decay
         )
+
+    result, reason = _resolve_triton_dispatch(
+        mode, "the angle-fused mixer path", _call
+    )
+    if reason is None:
+        return result
+
     global _warned_angle_fallback
     if not _warned_angle_fallback:
         warnings.warn(

@@ -1047,8 +1047,12 @@ if _HAS_TRITON:
         ctx.save_for_backward(log_coeffs, log_values)
 
     def _parallel_scan_log_backward(ctx, grad_h):
-        if grad_h is None:
-            return None, None
+        # No `grad_h is None` guard: per the "None-grad handling" note
+        # above (this op has a single output, so the same
+        # always-materialized-tensor guarantee applies), `grad_h` is never
+        # `None` here -- consistent with `_affine_backward`/`_linear_backward`
+        # above, which take their materialized grad tensors with no such
+        # branch either.
         # Second-order autograd guard: `torch.is_grad_enabled()` here reads
         # the AMBIENT grad mode this backward was entered under (checked
         # before this function's own `torch.enable_grad()` below, which
