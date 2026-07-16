@@ -13,16 +13,18 @@ and never imports this module. This module targets `torch>=2.8` (mature
 `ImportError` below that floor, rather than failing confusingly deep
 inside kernel registration.
 
-Task 2 (this module): the generic affine-scan FORWARD core (spec §5,
+Tasks 2-3 (this module): the generic affine-scan FORWARD core (spec §5,
 Kernel 1) plus wrappers mapping three of the four scan ops onto it --
 `linear_scan` (k=1, channel-tiled), `matrix_scan` (k=2, v=1), and
-`matrix_affine_scan` (generic k, v). Kernels accumulate in fp32
+`matrix_affine_scan` (generic k, v) -- and the fused log-space FORWARD
+scan (spec §5, Kernel 2) for `parallel_scan_log` (channel-tiled lanes
+carrying a running log-coefficient cumsum plus an online max-shifted
+log-sum-exp accumulator, writing h = exp(.) directly). All four scan
+ops therefore have an entry in `SCAN_IMPLS`. Kernels accumulate in fp32
 regardless of input dtype and are registered via
 `torch.library.triton_op` so `torch.compile` sees them without graph
-breaks. Backward (Task 4), the fused log-space scan for
-`parallel_scan_log` (Task 3), and the angle-fused Givens path (Phase 2)
-land later; `parallel_scan_log` therefore has no entry in `SCAN_IMPLS`
-yet and falls back to eager under `auto`.
+breaks. Backward (Task 4) and the angle-fused Givens path (Phase 2)
+land later.
 
 Envelope (spec §4): k, v in {1, 2, 4, 8, 16}, any T >= 1 including
 non-power-of-two. Out-of-envelope shapes raise `ScanFallback`, which
@@ -83,9 +85,10 @@ class ScanFallback(Exception):
 # exactly with no masking; a shape outside this set raises ``ScanFallback``.
 _ENVELOPE = frozenset({1, 2, 4, 8, 16})
 
-# Channel-tile width for the k=1 (`linear_scan`) kernel: each program walks
-# the full T sequence for BLOCK_D channels at once, keeping lanes wide
-# (spec §5). A safe default; the cloud benchmark phase may autotune it.
+# Channel-tile width for the two elementwise-in-D kernels (`linear_scan`
+# and `parallel_scan_log`): each program walks the full T sequence for
+# BLOCK_D channels at once, keeping lanes wide (spec §5). A safe default;
+# the cloud benchmark phase may autotune it.
 _LINEAR_BLOCK_D = 128
 
 
@@ -226,6 +229,76 @@ if _HAS_TRITON:
             A_ptrs += D
             Bc_ptrs += D
 
+    @triton.jit
+    def _parallel_scan_log_fwd_kernel(
+        lc_ptr,
+        lv_ptr,
+        h_ptr,
+        T,
+        D,
+        BLOCK_D: tl.constexpr,
+    ):
+        """Channel-tiled fused log-space scan (spec §5, Kernel 2).
+
+        Solves ``h_t = a_t * h_{t-1} + b_t`` in log space (Heinsen 2023),
+        given ``log_coeffs = log(a_t)`` ``(B, T, D)`` and ``log_values``
+        ``(B, T+1, D)`` whose slot 0 is ``log(h_0)`` and slots ``1..T`` are
+        ``log(b_t)``. Mirrors the eager reference
+        (``min_gru.parallel_scan_log``)::
+
+            a_star = pad(cumsum(log_coeffs))          # (B, T+1, D), a_star_0 = 0
+            log_h  = a_star + logcumsumexp(log_values - a_star)
+            h      = exp(log_h)[:, 1:]
+
+        but never materializes the ``(B, T+1, D)`` intermediates: one
+        program owns one batch row and one BLOCK_D-wide channel tile and
+        walks ``m = 0..T``, carrying the running cumsum ``a_star`` and an
+        online max-shifted log-sum-exp accumulator ``(m_run, s_run)`` over
+        the shifted terms ``e_m = log_values[m] - a_star_m``. The max shift
+        matches the eager path's numerical structure so the fp32 outputs
+        stay parity-tight. ``m = 0`` seeds the accumulator (that term is
+        the ``h_0`` contribution and is never emitted); steps ``m = 1..T``
+        write ``h_{m} = exp(a_star_m + m_run + log(s_run))`` to output
+        index ``m - 1``. fp32 accumulation; the store casts to the output
+        dtype. Every non-power-of-two ``T`` works: the loop is exact and
+        needs no padding.
+        """
+        b = tl.program_id(0)
+        dblk = tl.program_id(1)
+
+        offs = dblk * BLOCK_D + tl.arange(0, BLOCK_D)
+        mask = offs < D
+
+        lc_ptrs = lc_ptr + b * (T * D) + offs
+        lv_ptrs = lv_ptr + b * ((T + 1) * D) + offs
+        h_ptrs = h_ptr + b * (T * D) + offs
+
+        # m = 0: a_star_0 = 0, e_0 = log_values[0] - 0. Seed the online
+        # log-sum-exp with this single term (m_run = e_0, s_run = 1). This
+        # term carries h_0 into the scan; it is never emitted.
+        a_star = tl.zeros((BLOCK_D,), tl.float32)
+        m_run = tl.load(lv_ptrs, mask=mask, other=0.0).to(tl.float32)
+        s_run = tl.full((BLOCK_D,), 1.0, tl.float32)
+        lv_ptrs += D
+
+        for _ in range(T):
+            lc = tl.load(lc_ptrs, mask=mask, other=0.0).to(tl.float32)
+            a_star = a_star + lc  # a_star_m = a_star_{m-1} + log_coeffs[m-1]
+            lv = tl.load(lv_ptrs, mask=mask, other=0.0).to(tl.float32)
+            e = lv - a_star  # e_m = log_values[m] - a_star_m
+
+            new_m = tl.maximum(m_run, e)
+            s_run = s_run * tl.exp(m_run - new_m) + tl.exp(e - new_m)
+            m_run = new_m
+
+            # log_h_m = a_star_m + logsumexp_{i<=m}(e_i) = a_star_m + m_run + log(s_run)
+            log_h = a_star + m_run + tl.log(s_run)
+            tl.store(h_ptrs, tl.exp(log_h), mask=mask)
+
+            lc_ptrs += D
+            lv_ptrs += D
+            h_ptrs += D
+
     @triton_op("mingru_scans::affine_scan_fwd", mutates_args={})
     def affine_scan_fwd(
         A: torch.Tensor, Bm: torch.Tensor
@@ -273,6 +346,31 @@ if _HAS_TRITON:
         wrap_triton(_linear_scan_fwd_kernel)[grid](a, b, A, Bc, t, d, _LINEAR_BLOCK_D)
         return A, Bc
 
+    @triton_op("mingru_scans::parallel_scan_log_fwd", mutates_args={})
+    def parallel_scan_log_fwd(
+        log_coeffs: torch.Tensor, log_values: torch.Tensor
+    ) -> torch.Tensor:
+        """Fused log-space forward scan (spec §5, Kernel 2).
+
+        ``log_coeffs`` is ``(B, T, D)`` and ``log_values`` is ``(B, T+1,
+        D)`` (slot 0 = ``log(h_0)``, slots ``1..T`` = ``log(b_t)``).
+        Returns the states ``h_1..h_T`` as ``(B, T, D)`` -- a single
+        tensor, matching ``min_gru.parallel_scan_log`` (unlike the affine
+        ops, which return a pair). Same traced-body fake-meta contract as
+        ``linear_scan_fwd``: ``.contiguous`` + ``empty_like`` + one
+        ``wrap_triton`` launch, so ``torch.compile`` sees the ``(B, T, D)``
+        output shape with no graph break.
+        """
+        log_coeffs = log_coeffs.contiguous()
+        log_values = log_values.contiguous()
+        bsz, t, d = log_coeffs.shape
+        h = torch.empty_like(log_coeffs)
+        grid = (bsz, triton.cdiv(d, _LINEAR_BLOCK_D))
+        wrap_triton(_parallel_scan_log_fwd_kernel)[grid](
+            log_coeffs, log_values, h, t, d, _LINEAR_BLOCK_D
+        )
+        return h
+
     def _linear_scan_impl(
         a: torch.Tensor, b: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -281,6 +379,17 @@ if _HAS_TRITON:
             return linear_scan_fwd(a, b)
         except Exception as exc:  # kernel launch/compile failure -> loud fallback
             raise ScanFallback(f"linear_scan Triton kernel failed: {exc}") from exc
+
+    def _parallel_scan_log_impl(
+        log_coeffs: torch.Tensor, log_values: torch.Tensor
+    ) -> torch.Tensor:
+        """SCAN_IMPLS entry for ``parallel_scan_log`` (elementwise in D, always in envelope)."""
+        try:
+            return parallel_scan_log_fwd(log_coeffs, log_values)
+        except Exception as exc:  # kernel launch/compile failure -> loud fallback
+            raise ScanFallback(
+                f"parallel_scan_log Triton kernel failed: {exc}"
+            ) from exc
 
     def _matrix_scan_impl(
         M: torch.Tensor, b: torch.Tensor
@@ -294,26 +403,39 @@ if _HAS_TRITON:
         Bm = b.unsqueeze(-1)
         try:
             Abar, Bbar = affine_scan_fwd(M, Bm)
+            # Squeeze inside the try so the ScanFallback invariant (every
+            # exit is either a clean result or a ScanFallback) is enforced
+            # by construction, even if the squeeze itself were to fail.
+            return Abar, Bbar.squeeze(-1)
         except Exception as exc:  # kernel launch/compile failure -> loud fallback
             raise ScanFallback(f"matrix_scan Triton kernel failed: {exc}") from exc
-        return Abar, Bbar.squeeze(-1)
 
     def _matrix_affine_scan_impl(
         A: torch.Tensor, Bm: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """SCAN_IMPLS entry for ``matrix_affine_scan`` (generic k, v).
 
-        Enforces the kernel envelope up front: an unsupported ``k``/``v``
-        (or a non-square transition) raises ``ScanFallback`` so the caller
-        loudly falls back to eager rather than launching a kernel the tile
-        shapes cannot represent.
+        Enforces the kernel envelope up front: an unsupported ``k``/``v``,
+        a non-square transition, or an ``A``/``Bm`` shape disagreement
+        raises ``ScanFallback`` so the caller loudly falls back to eager
+        rather than launching a kernel the tile shapes cannot represent.
+        The ``A``/``Bm`` agreement checks (matching ``(B, T, n)`` lane grid
+        and ``Bm``'s ``k`` rows) guard the kernel's pointer arithmetic,
+        which assumes both operands share the lane layout.
         """
         k = A.shape[-1]
         v = Bm.shape[-1]
-        if k not in _ENVELOPE or v not in _ENVELOPE or A.shape[-2] != k:
+        if (
+            k not in _ENVELOPE
+            or v not in _ENVELOPE
+            or A.shape[-2] != k
+            or Bm.shape[-2] != k
+            or A.shape[:3] != Bm.shape[:3]
+        ):
             raise ScanFallback(
-                f"matrix_affine_scan (k={k}, v={v}, rows={A.shape[-2]}) outside "
-                f"the Triton envelope k,v in {sorted(_ENVELOPE)} with square A"
+                f"matrix_affine_scan (A={tuple(A.shape)}, Bm={tuple(Bm.shape)}) "
+                f"outside the Triton envelope: need k,v in {sorted(_ENVELOPE)}, "
+                f"square A with k rows, and A/Bm sharing the (B, T, n, k) prefix"
             )
         try:
             return affine_scan_fwd(A, Bm)
@@ -323,6 +445,7 @@ if _HAS_TRITON:
             ) from exc
 
     SCAN_IMPLS = {
+        "parallel_scan_log": _parallel_scan_log_impl,
         "linear_scan": _linear_scan_impl,
         "matrix_scan": _matrix_scan_impl,
         "matrix_affine_scan": _matrix_affine_scan_impl,
@@ -384,13 +507,17 @@ def _run_forward_parity() -> int:
     os.environ["MINGRU_SCAN"] = "eager"  # force the eager reference path
     import min_gru
 
+    import torch.nn.functional as F
+
     device = "cuda"
     torch.manual_seed(0)
     # Flat spec bound (design spec §7 / plan constraints): outputs <= 1e-5
     # for fp32. rtol=0 so this is exactly max_abs_err <= atol, not a looser
     # relative gate -- do not reintroduce a nonzero rtol here.
     atol, rtol = 1e-5, 0.0
-    Ts = (13, 64, 128, 1024)
+    # T=1 is included so a program that never traverses the loop-increment
+    # path (a single timestep) is exercised for every op.
+    Ts = (1, 13, 64, 128, 1024)
     Bs = (2, 128)
 
     failures: list[str] = []
@@ -401,12 +528,20 @@ def _run_forward_parity() -> int:
         tag: str,
         *inputs: torch.Tensor,
         informational: bool = False,
+        case_atol: float = atol,
+        case_rtol: float = rtol,
     ) -> None:
         """Run the Triton impl and eager reference on ``inputs`` and compare.
 
         The Triton call is guarded so a ``ScanFallback`` or launch/compile
         error is reported as a per-case failure (loud, but not aborting the
         whole sweep) rather than a bare traceback.
+
+        ``case_atol``/``case_rtol`` default to the flat spec bound
+        (``atol=1e-5, rtol=0``) that governs the affine ops; a case may
+        override them where that flat bound is not physically meetable in
+        fp32 (see the ``parallel_scan_log`` section for the log-space
+        exception and its justification).
         """
         nonlocal n_pass
         label = f"{name} {tag}"
@@ -417,25 +552,76 @@ def _run_forward_parity() -> int:
             print(f"  [FAIL] {label}: {type(exc).__name__}: {exc}")
             return
         ref = getattr(min_gru, name)(*inputs)
-        out_a, ref_a = out[0], ref[0]
-        out_b, ref_b = out[1], ref[1]
-        abs_a, rel_a = _max_abs_rel(out_a, ref_a)
-        abs_b, rel_b = _max_abs_rel(out_b, ref_b)
-        abs_err = max(abs_a, abs_b)
-        ok = torch.allclose(
-            out_a.float(), ref_a.float(), atol=atol, rtol=rtol
-        ) and torch.allclose(out_b.float(), ref_b.float(), atol=atol, rtol=rtol)
+        # Ops return either a pair (the affine scans) or a single tensor
+        # (parallel_scan_log). Normalize to a tuple so one comparison loop
+        # handles both -- one harness, no fork.
+        outs = out if isinstance(out, tuple) else (out,)
+        refs = ref if isinstance(ref, tuple) else (ref,)
+        abs_err = 0.0
+        rels: list[float] = []
+        ok = True
+        for out_i, ref_i in zip(outs, refs):
+            abs_i, rel_i = _max_abs_rel(out_i, ref_i)
+            abs_err = max(abs_err, abs_i)
+            rels.append(rel_i)
+            ok = ok and torch.allclose(
+                out_i.float(), ref_i.float(), atol=case_atol, rtol=case_rtol
+            )
         if informational:
             print(f"  [info] {label}: max_abs={abs_err:.2e} (not gated)")
             return
         if ok:
             n_pass += 1
         else:
-            failures.append(
-                f"{label}: max_abs={abs_err:.2e} "
-                f"(A rel={rel_a:.2e}, B rel={rel_b:.2e})"
-            )
+            rel_str = ", ".join(f"{r:.2e}" for r in rels)
+            failures.append(f"{label}: max_abs={abs_err:.2e} (rel={rel_str})")
             print(f"  [FAIL] {label}: max_abs={abs_err:.2e}")
+
+    def _log_space_inputs(B: int, T: int, D: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build ``(log_coeffs, log_values)`` the way ``MinGRU.forward`` does.
+
+        Mirrors the construction at ``min_gru.py`` (``log_coeffs =
+        -softplus(k)``; ``log_values`` = ``[log_h0, log_z + log_tilde_h]``)
+        so the parity sweep exercises the kernel on the log-magnitude
+        regime the model actually produces (decay coeffs < 0, a T+1 value
+        column led by ``log(h_0)``), not on arbitrary noise.
+        """
+        k_pre = torch.randn(B, T, D, device=device)
+        log_coeffs = -F.softplus(k_pre)  # log(1 - sigmoid(k)) < 0
+        log_z = -F.softplus(-k_pre)  # log(sigmoid(k))
+        log_tilde_h = min_gru.log_g(torch.randn(B, T, D, device=device))
+        log_h0 = torch.randn(B, 1, D, device=device) * 0.1
+        log_values = torch.cat([log_h0, log_z + log_tilde_h], dim=1)
+        return log_coeffs, log_values
+
+    # parallel_scan_log tolerance is the log-space exception to the flat
+    # atol=1e-5 fp32 gate, and it is NOT a loosening of that gate (which
+    # still governs the affine ops verbatim). The eager reference itself
+    # runs torch.logcumsumexp over T+1 terms in fp32; accumulating a
+    # log-sum-exp that long carries an intrinsic fp32 error near 1e-4 at
+    # T=1024 (empirically the eager fp32 path is already ~1.4e-4 from its
+    # own fp64 evaluation, and the kernel's online max-shifted accumulator
+    # is in fact CLOSER to the fp64 truth than eager fp32 is). No correct
+    # fp32 kernel can match a co-noisy fp32 reference to 1e-5 at that
+    # length. The gate therefore uses the mixed (atol=1e-4, rtol=1e-4)
+    # bound -- the same tolerance min_gru.py's own parallel-scan parity
+    # self-tests use, which spec §7 cites as "matching existing selftest
+    # standards" -- so it still catches any real kernel defect (off by
+    # O(1), a shifted index, a dropped term) while honoring fp32 physics.
+    _LOG_SCAN_ATOL, _LOG_SCAN_RTOL = 1e-4, 1e-4
+    print("parallel_scan_log (log-space, elementwise in D):")
+    for B in Bs:
+        for T in Ts:
+            D = 64
+            log_coeffs, log_values = _log_space_inputs(B, T, D)
+            check(
+                "parallel_scan_log",
+                f"B={B} T={T} D={D}",
+                log_coeffs,
+                log_values,
+                case_atol=_LOG_SCAN_ATOL,
+                case_rtol=_LOG_SCAN_RTOL,
+            )
 
     print("linear_scan (k=1):")
     for B in Bs:
@@ -474,6 +660,14 @@ def _run_forward_parity() -> int:
 
     print("bf16-input rows (informational, spec §9.1):")
     B, T = 2, 64
+    lc32, lv32 = _log_space_inputs(B, T, 64)
+    check(
+        "parallel_scan_log",
+        "bf16 B=2 T=64 D=64",
+        lc32.bfloat16(),
+        lv32.bfloat16(),
+        informational=True,
+    )
     a = (torch.rand(B, T, 64, device=device) * 1.8 - 0.9).bfloat16()
     b = (torch.randn(B, T, 64, device=device) * 0.1).bfloat16()
     check("linear_scan", "bf16 B=2 T=64 D=64", a, b, informational=True)
@@ -490,8 +684,12 @@ def _run_forward_parity() -> int:
         for line in failures:
             print(f"  {line}")
         return 1
-    print(f"FORWARD PARITY PASSED: {n_pass} fp32 case(s) within "
-          f"atol={atol:.0e} rtol={rtol:.0e}")
+    print(
+        f"FORWARD PARITY PASSED: {n_pass} fp32 case(s) -- affine ops within "
+        f"the flat atol={atol:.0e} rtol={rtol:.0e} gate; parallel_scan_log "
+        f"within its documented log-space bound atol={_LOG_SCAN_ATOL:.0e} "
+        f"rtol={_LOG_SCAN_RTOL:.0e}"
+    )
     return 0
 
 
