@@ -43,8 +43,29 @@ blind) -- also zero extra saved tensors beyond the forward inputs. All
 four ops are wired via `torch.library.register_autograd` on their
 forward `triton_op` (the torch 2.8-idiomatic route for a `triton_op`:
 the backward composes with `torch.compile`'s tracing and dispatcher,
-which an `autograd.Function` wrapper around the op would not). The
-angle-fused Givens path (Phase 2) lands later.
+which an `autograd.Function` wrapper around the op would not).
+
+Task 5 (this module): the angle-fused Kernel 4 (spec §5 K4, §6 reversal
+rule, amended in "Fix round 2") -- `angle_scan_fwd`/`angle_scan_bwd`, a
+module-level fast path (not one of the four scan ops) that `GivensMinGRU`
+and `RotationMinGRU` route their forwards through on CUDA. The forward
+carries the state vector in registers and applies factored plane
+rotations from angles directly, never materializing or scanning the k x k
+transition matrices; the backward is an EXACT stored-state reversible
+recomputation (every `h_{t-1}` read from the forward output, never
+reconstructed by inverting the forward step) accumulating the grads of
+the angles, scale channel, injection, decay, and h0. It is generic over
+(block size, rounds, scale channel): Givens (k=8, `rounds`, no per-block
+scale) and Rotation (k=2, one plane, post-snap angles, tanh(u) scale). An
+earlier design let the backward divide by `gamma`/`tanh(u)` to reverse
+across a multi-step checkpoint chunk; a blind CPU probe showed that
+division amplifies roundoff by roughly `sigma_min^{-chunklen}`, blowing
+past the grad tolerance even at ordinary decay/init strengths (including
+`GivensMinGRU`'s class-default `decay_rate=1.0`) -- the user's ruling
+rejected division-based reversal entirely, so BOTH mixers now use exact
+per-step recompute and no interval parameter exists to re-enable it (see
+the Task-5 report, "Fix round 2"). Registered via
+`torch.library.register_autograd` like the four scan ops.
 
 Envelope (spec §4): k, v in {1, 2, 4, 8, 16}, any T >= 1 including
 non-power-of-two. Out-of-envelope shapes raise `ScanFallback`, which
@@ -516,6 +537,239 @@ if _HAS_TRITON:
             Aprev_ptrs -= D
             Bcprev_ptrs -= D
 
+    @triton.jit
+    def _angle_scan_fwd_kernel(
+        theta_ptr,
+        scale_ptr,
+        gamma_ptr,
+        b_ptr,
+        h0_ptr,
+        perm_ptr,
+        sgn_ptr,
+        p2p_ptr,
+        out_ptr,
+        T,
+        n,
+        k: tl.constexpr,
+        R: tl.constexpr,
+        half: tl.constexpr,
+        HAS_SCALE: tl.constexpr,
+        HAS_DECAY: tl.constexpr,
+    ):
+        """Angle-fused forward recurrence for one (batch, block) lane (spec §5 K4).
+
+        Carries the state ``h`` (a ``k``-vector) in registers across the whole
+        T sequence, applying per step the per-block scale (rotation: multiply
+        dim 1 by ``tanh(u)``; Givens: none), then ``rounds`` of factored
+        brick-wall plane rotations, then the decay ``gamma`` and injection
+        ``b`` -- exactly ``h_t = gamma_t * R(theta_t) * S_t * h_{t-1} + b_t``.
+        It NEVER materializes or scans the ``k x k`` transition matrices the
+        eager ``matrix_affine_scan`` path is defined over: each round applies a
+        structured plane rotation directly to the state vector.
+
+        Layouts (contiguous): ``theta`` ``(B,T,n,R,half)``; ``scale``/``gamma``
+        ``(B,T,n)``; ``b``/``out`` ``(B,T,n,k)``; ``h0`` ``(B,n,k)``;
+        ``perm``/``sgn``/``p2p`` ``(R,k)``. ``perm[r]`` is the partner index of
+        each position within round ``r``'s planes, ``sgn[r]`` the ``-1``/``+1``
+        first/second-member sign, ``p2p[r]`` each position's angle index among
+        the round's ``half`` angles. A round applies, per position ``p``,
+        ``v'[p] = cos_p * v[p] + sgn[p] * sin_p * v[perm[p]]`` (the ``i``/``j``
+        pair rotation), with ``cos_p``/``sin_p`` gathered from the ``half``
+        per-plane angles via the ``p2p`` selection. fp32 throughout; the store
+        casts to the output dtype. All of ``k``, ``R``, ``half`` are powers-of-
+        two-friendly constexprs, so every tile is exact and needs no masking.
+        """
+        lane = tl.program_id(0)
+        b = lane // n
+        ni = lane % n
+
+        ar_k = tl.arange(0, k)
+        ar_h = tl.arange(0, half)
+
+        sc_base = b * (T * n) + ni
+        bk_base = b * (T * n * k) + ni * k
+        th_base = b * (T * n * R * half) + ni * (R * half)
+        h0_base = b * (n * k) + ni * k
+
+        v = tl.load(h0_ptr + h0_base + ar_k).to(tl.float32)  # h_0 (k,)
+
+        sc_t = sc_base
+        bk_t = bk_base
+        th_t = th_base
+        for _t in range(T):
+            if HAS_SCALE:  # k == 2: scale dim 1 by d = tanh(u), dim 0 unchanged
+                d = tl.load(scale_ptr + sc_t).to(tl.float32)
+                v = tl.where(ar_k == 1, d * v, v)
+            for r in range(R):
+                th = tl.load(theta_ptr + th_t + r * half + ar_h).to(tl.float32)
+                ch = tl.cos(th)  # (half,)
+                sh = tl.sin(th)
+                p2p = tl.load(p2p_ptr + r * k + ar_k)  # (k,)
+                sel = (p2p[:, None] == ar_h[None, :]).to(tl.float32)  # (k, half)
+                cos_pos = tl.sum(sel * ch[None, :], axis=1)  # (k,)
+                sin_pos = tl.sum(sel * sh[None, :], axis=1)
+                perm_r = tl.load(perm_ptr + r * k + ar_k)  # (k,)
+                sgn_r = tl.load(sgn_ptr + r * k + ar_k).to(tl.float32)
+                Pm = (perm_r[:, None] == ar_k[None, :]).to(tl.float32)  # (k, k)
+                vp = tl.sum(Pm * v[None, :], axis=1)  # v[perm_r] (k,)
+                v = cos_pos * v + sgn_r * sin_pos * vp
+            if HAS_DECAY:
+                g = tl.load(gamma_ptr + sc_t).to(tl.float32)
+                v = g * v
+            bt = tl.load(b_ptr + bk_t + ar_k).to(tl.float32)
+            v = v + bt  # h_t
+            tl.store(out_ptr + bk_t + ar_k, v)
+            sc_t += n
+            bk_t += n * k
+            th_t += n * R * half
+
+    @triton.jit
+    def _angle_scan_bwd_kernel(
+        theta_ptr,
+        scale_ptr,
+        gamma_ptr,
+        b_ptr,
+        h0_ptr,
+        out_ptr,
+        gout_ptr,
+        perm_ptr,
+        sgn_ptr,
+        p2p_ptr,
+        gtheta_ptr,
+        gscale_ptr,
+        ggamma_ptr,
+        gb_ptr,
+        gh0_ptr,
+        T,
+        n,
+        k: tl.constexpr,
+        R: tl.constexpr,
+        half: tl.constexpr,
+        HAS_SCALE: tl.constexpr,
+        HAS_DECAY: tl.constexpr,
+    ):
+        """Exact stored-state reversible backward of ``_angle_scan_fwd_kernel`` (spec §6).
+
+        One program owns a ``(b, n)`` lane and walks ``t = T .. 1``, carrying
+        the state adjoint ``ghat`` (the future steps' contribution to
+        ``dL/dh_t``) in registers. ``h_{t-1}`` is read EXACTLY every step from
+        the forward output ``out`` (all states, which the module returns
+        anyway) -- or from ``h0`` at ``t = 1`` -- never reconstructed by
+        inverting the forward step. An earlier design divided by ``gamma``/
+        ``tanh(u)`` to reverse across a multi-step checkpoint chunk; a blind
+        CPU probe showed that division amplifies roundoff by roughly
+        ``sigma_min^{-chunklen}`` (sigma_min = gamma * min(1, |scale|)), blowing
+        past the grad tolerance even at ordinary decay/init strengths (e.g. the
+        ``GivensMinGRU`` class-default ``decay_rate=1.0``). The user's ruling
+        (see the Task-5 report, "Fix round 2") rejected division-based reversal
+        entirely: every ``h_{t-1}`` is the stored forward state, so no such
+        amplification can occur, at the cost of the forward output being the
+        only "checkpoint" (already required as the module's return value, so
+        no extra memory).
+
+        Given ``h_{t-1}`` it recomputes the per-round forward states, forms the
+        total adjoint ``gbar = grad_out_t + ghat`` on ``h_t``, and accumulates
+        ``dL/db`` (= ``gbar``), ``dL/dgamma`` (= ``sum(gbar * rot)``), the
+        per-plane ``dL/dtheta`` (reduced from per-position grads via the same
+        ``p2p`` selection), and ``dL/d(scale)`` (rotation only). The adjoint
+        propagated to ``h_{t-1}`` (= ``M_t^T gbar``) becomes the next step's
+        ``ghat``; after ``t = 1`` it is ``dL/dh_0``. fp32 throughout.
+        """
+        lane = tl.program_id(0)
+        b = lane // n
+        ni = lane % n
+        ar_k = tl.arange(0, k)
+        ar_h = tl.arange(0, half)
+
+        sc_base = b * (T * n) + ni
+        bk_base = b * (T * n * k) + ni * k
+        th_base = b * (T * n * R * half) + ni * (R * half)
+        h0_base = b * (n * k) + ni * k
+
+        ghat = tl.zeros((k,), tl.float32)
+
+        # Walk t = T .. 1 with a forward loop + computed reverse index (the
+        # proven Kernel-3 idiom; avoids a runtime negative-step range).
+        for _step in range(T):
+            it = T - 1 - _step
+
+            # h_{t-1}: the stored forward output at it-1, or h0 at t = 1 --
+            # always an exact read, never an inverted reconstruction.
+            if it == 0:
+                hprev = tl.load(h0_ptr + h0_base + ar_k).to(tl.float32)
+            else:
+                hprev = tl.load(
+                    out_ptr + bk_base + (it - 1) * (n * k) + ar_k
+                ).to(tl.float32)
+
+            # --- recompute forward per-round states vv[0..R] from h_{t-1} ---
+            if HAS_SCALE:
+                d = tl.load(scale_ptr + sc_base + it * n).to(tl.float32)
+                v0s = tl.where(ar_k == 1, d * hprev, hprev)
+            else:
+                v0s = hprev
+            vv = [v0s]
+            for r in range(R):
+                th = tl.load(theta_ptr + th_base + it * (n * R * half) + r * half + ar_h).to(tl.float32)
+                ch = tl.cos(th)
+                sh = tl.sin(th)
+                p2p = tl.load(p2p_ptr + r * k + ar_k)
+                sel = (p2p[:, None] == ar_h[None, :]).to(tl.float32)
+                cos_pos = tl.sum(sel * ch[None, :], axis=1)
+                sin_pos = tl.sum(sel * sh[None, :], axis=1)
+                perm_r = tl.load(perm_ptr + r * k + ar_k)
+                sgn_r = tl.load(sgn_ptr + r * k + ar_k).to(tl.float32)
+                Pm = (perm_r[:, None] == ar_k[None, :]).to(tl.float32)
+                vp = tl.sum(Pm * vv[r][None, :], axis=1)
+                vv.append(cos_pos * vv[r] + sgn_r * sin_pos * vp)
+            rot = vv[R]
+
+            # --- adjoints ---
+            gout = tl.load(gout_ptr + bk_base + it * (n * k) + ar_k).to(tl.float32)
+            gbar = gout + ghat  # dL/dh_t
+            tl.store(gb_ptr + bk_base + it * (n * k) + ar_k, gbar)
+            if HAS_DECAY:
+                g = tl.load(gamma_ptr + sc_base + it * n).to(tl.float32)
+                tl.store(ggamma_ptr + sc_base + it * n, tl.sum(gbar * rot))
+                a = g * gbar  # adjoint on rot = vv[R]
+            else:
+                a = gbar
+
+            for r in range(R):
+                rr = R - 1 - r
+                th = tl.load(theta_ptr + th_base + it * (n * R * half) + rr * half + ar_h).to(tl.float32)
+                ch = tl.cos(th)
+                sh = tl.sin(th)
+                p2p = tl.load(p2p_ptr + rr * k + ar_k)
+                sel = (p2p[:, None] == ar_h[None, :]).to(tl.float32)
+                cos_pos = tl.sum(sel * ch[None, :], axis=1)
+                sin_pos = tl.sum(sel * sh[None, :], axis=1)
+                perm_r = tl.load(perm_ptr + rr * k + ar_k)
+                sgn_r = tl.load(sgn_ptr + rr * k + ar_k).to(tl.float32)
+                Pm = (perm_r[:, None] == ar_k[None, :]).to(tl.float32)
+                vr = vv[rr]
+                vp = tl.sum(Pm * vr[None, :], axis=1)
+                # dL/dtheta per position, then reduce to the round's `half` angles
+                gtp = a * (-sin_pos * vr + sgn_r * cos_pos * vp)  # (k,)
+                gth_half = tl.sum(sel * gtp[:, None], axis=0)  # (half,)
+                tl.store(
+                    gtheta_ptr + th_base + it * (n * R * half) + rr * half + ar_h,
+                    gth_half,
+                )
+                # adjoint on vv[rr]: cos_pos * a + gather(sgn * sin_pos * a, perm)
+                tmp = sgn_r * sin_pos * a
+                a = cos_pos * a + tl.sum(Pm * tmp[None, :], axis=1)
+
+            if HAS_SCALE:
+                d = tl.load(scale_ptr + sc_base + it * n).to(tl.float32)
+                # v0s = (hprev0, d*hprev1): dL/dd = a1 * hprev1; adjoint on hprev
+                gd = tl.sum(tl.where(ar_k == 1, a * hprev, 0.0))
+                tl.store(gscale_ptr + sc_base + it * n, gd)
+                a = tl.where(ar_k == 1, a * d, a)
+            ghat = a
+
+        tl.store(gh0_ptr + h0_base + ar_k, ghat)  # dL/dh_0
+
     @triton_op("mingru_scans::affine_scan_fwd", mutates_args={})
     def affine_scan_fwd(
         A: torch.Tensor, Bm: torch.Tensor
@@ -780,6 +1034,217 @@ if _HAS_TRITON:
         _parallel_scan_log_backward,
         setup_context=_parallel_scan_log_setup_context,
     )
+
+    # --- Kernel 4: angle-fused forward + exact stored-state reversible backward
+    #
+    # A module-level fast path (not one of the four scan ops): `GivensMinGRU`
+    # and `RotationMinGRU` route their forwards here on CUDA, passing the raw
+    # rotation angles / scale channel / injection / decay / h0 directly, so the
+    # k x k transition matrices `matrix_affine_scan` is defined over are never
+    # materialized or scanned. `theta` `(B,T,n,R,half)`, `scale`/`gamma`
+    # `(B,T,n)`, `b` `(B,T,n,k)`, `h0` `(B,n,k)`, and the plane metadata
+    # `perm`/`sgn`/`p2p` `(R,k)`. `scale`/`gamma` are always passed as concrete
+    # tensors (ones when the feature is off); the `has_scale`/`has_decay`
+    # constexprs gate whether they are read, so the disabled path is exact
+    # (no spurious multiply/divide).
+    #
+    # The backward reads every ``h_{t-1}`` exactly from the forward output
+    # (never reconstructs it by dividing out ``gamma``/``tanh(u)``): an earlier
+    # design let the caller pick a reversal checkpoint interval C (recomputing
+    # C-1 states per chunk via inverse rotation + division), but a blind CPU
+    # probe showed that division amplifies roundoff by roughly
+    # ``sigma_min^{-chunklen}``, which blew past the grad tolerance even at
+    # ordinary decay/init strengths (including ``GivensMinGRU``'s class-default
+    # ``decay_rate=1.0``). The user's ruling (Task-5 report, "Fix round 2")
+    # rejected division-based reversal entirely, so there is no interval
+    # parameter left in this op's signature -- reversal cannot be re-enabled by
+    # any caller.
+
+    @triton_op("mingru_scans::angle_scan_fwd", mutates_args={})
+    def angle_scan_fwd(
+        theta: torch.Tensor,
+        scale: torch.Tensor,
+        gamma: torch.Tensor,
+        b: torch.Tensor,
+        h0: torch.Tensor,
+        perm: torch.Tensor,
+        sgn: torch.Tensor,
+        p2p: torch.Tensor,
+        has_scale: int,
+        has_decay: int,
+    ) -> torch.Tensor:
+        """Angle-fused forward (spec §5 Kernel 4). Returns states ``h`` ``(B,T,n,k)``.
+
+        Same traced-body fake-meta contract as the scan ops (``.contiguous`` +
+        ``empty_like`` + one ``wrap_triton`` launch), so ``torch.compile`` sees
+        the output shape with no graph break.
+        """
+        theta = theta.contiguous()
+        scale = scale.contiguous()
+        gamma = gamma.contiguous()
+        b = b.contiguous()
+        h0 = h0.contiguous()
+        perm = perm.contiguous()
+        sgn = sgn.contiguous()
+        p2p = p2p.contiguous()
+        B, T, n, R, half = theta.shape
+        k = b.shape[-1]
+        out = torch.empty_like(b)
+        grid = (B * n,)
+        wrap_triton(_angle_scan_fwd_kernel)[grid](
+            theta, scale, gamma, b, h0, perm, sgn, p2p, out, T, n,
+            k, R, half, int(has_scale), int(has_decay),
+        )
+        return out
+
+    @triton_op("mingru_scans::angle_scan_bwd", mutates_args={})
+    def angle_scan_bwd(
+        theta: torch.Tensor,
+        scale: torch.Tensor,
+        gamma: torch.Tensor,
+        b: torch.Tensor,
+        h0: torch.Tensor,
+        out: torch.Tensor,
+        grad_out: torch.Tensor,
+        perm: torch.Tensor,
+        sgn: torch.Tensor,
+        p2p: torch.Tensor,
+        has_scale: int,
+        has_decay: int,
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ]:
+        """Angle-fused exact stored-state reversible backward (spec §6).
+
+        Reads the forward inputs, the forward output ``out`` (the source of
+        every ``h_{t-1}``), and the incoming state grads ``grad_out``. Returns
+        ``(dtheta, dscale, dgamma, db, dh0)`` shaped like ``theta``, ``scale``,
+        ``gamma``, ``b``, ``h0``. The module's own autograd then backprops
+        ``dscale``/``dgamma`` through ``tanh(u)`` / ``exp(-lambda dt)`` to the
+        real parameters, so this op handles only the recurrence.
+
+        ``dscale``/``dgamma`` use ``zeros_like`` rather than ``empty_like``:
+        the kernel only stores into them when ``HAS_SCALE``/``HAS_DECAY`` is
+        set, so the disabled-feature output would otherwise be uninitialized
+        memory. The disabled-feature grads are never consumed (the module
+        never differentiates through the "ones" placeholder it passed in that
+        case), but zero-init makes the returned tensor correct on its own
+        terms rather than relying on that caller invariant.
+        """
+        theta = theta.contiguous()
+        scale = scale.contiguous()
+        gamma = gamma.contiguous()
+        b = b.contiguous()
+        h0 = h0.contiguous()
+        out = out.contiguous()
+        grad_out = grad_out.contiguous()
+        perm = perm.contiguous()
+        sgn = sgn.contiguous()
+        p2p = p2p.contiguous()
+        B, T, n, R, half = theta.shape
+        k = b.shape[-1]
+        dtheta = torch.empty_like(theta)
+        dscale = torch.zeros_like(scale)
+        dgamma = torch.zeros_like(gamma)
+        db = torch.empty_like(b)
+        dh0 = torch.empty_like(h0)
+        grid = (B * n,)
+        wrap_triton(_angle_scan_bwd_kernel)[grid](
+            theta, scale, gamma, b, h0, out, grad_out, perm, sgn, p2p,
+            dtheta, dscale, dgamma, db, dh0, T, n,
+            k, R, half, int(has_scale), int(has_decay),
+        )
+        return dtheta, dscale, dgamma, db, dh0
+
+    def _angle_setup_context(ctx, inputs, output):
+        (theta, scale, gamma, b, h0, perm, sgn, p2p,
+         has_scale, has_decay) = inputs
+        # The forward output (all states) is what the backward reads every
+        # h_{t-1} from; it is the module's return value, so saving it adds no
+        # allocation.
+        ctx.save_for_backward(theta, scale, gamma, b, h0, output, perm, sgn, p2p)
+        ctx.has_scale = has_scale
+        ctx.has_decay = has_decay
+
+    def _angle_backward(ctx, grad_out):
+        theta, scale, gamma, b, h0, out, perm, sgn, p2p = ctx.saved_tensors
+        dtheta, dscale, dgamma, db, dh0 = angle_scan_bwd(
+            theta, scale, gamma, b, h0, out, grad_out, perm, sgn, p2p,
+            ctx.has_scale, ctx.has_decay,
+        )
+        # One grad per forward input, in order; None for the non-tensor args and
+        # for perm/sgn/p2p (constant plane metadata, never differentiated).
+        return dtheta, dscale, dgamma, db, dh0, None, None, None, None, None
+
+    register_autograd(
+        "mingru_scans::angle_scan_fwd",
+        _angle_backward,
+        setup_context=_angle_setup_context,
+    )
+
+    def angle_scan_impl(
+        theta: torch.Tensor,
+        scale: torch.Tensor,
+        gamma: torch.Tensor,
+        b: torch.Tensor,
+        h0: torch.Tensor,
+        perm: torch.Tensor,
+        sgn: torch.Tensor,
+        p2p: torch.Tensor,
+        has_scale: int,
+        has_decay: int,
+    ) -> torch.Tensor:
+        """Envelope-guarded entry point for the angle-fused kernel (module callers).
+
+        Mirrors the ``SCAN_IMPLS``-style wrappers (e.g.
+        ``_matrix_affine_scan_impl``): validates every shape-agreement
+        invariant ``_angle_scan_fwd_kernel``'s pointer arithmetic assumes
+        BEFORE any launch, then funnels any launch/compile failure into
+        ``ScanFallback`` -- so ``min_gru._dispatch_angle_scan`` only ever needs
+        to catch that one exception type, exactly the contract ``_dispatch_scan``
+        gets from each ``SCAN_IMPLS`` entry. Not itself a ``SCAN_IMPLS`` entry
+        (the angle-fused path is a module-forward fast path, not one of the
+        four scan ops), so it is looked up by ``hasattr(triton_scans,
+        "angle_scan_impl")`` instead.
+
+        Parameters mirror ``angle_scan_fwd``'s: ``theta`` ``(B, T, n, R,
+        half)``; ``scale``/``gamma`` ``(B, T, n)``; ``b`` ``(B, T, n, k)``;
+        ``h0`` ``(B, n, k)``; ``perm``/``sgn``/``p2p`` ``(R, k)``. ``k`` must
+        be in the module's block-size envelope.
+        """
+        if theta.ndim != 5 or b.ndim != 4:
+            raise ScanFallback(
+                f"angle-fused kernel (theta={tuple(theta.shape)}, "
+                f"b={tuple(b.shape)}) outside the envelope: need 5-D "
+                "(B, T, n, R, half) theta and 4-D (B, T, n, k) b"
+            )
+        B, T, n, R, half = theta.shape
+        k = b.shape[-1]
+        if (
+            k not in _ENVELOPE
+            or b.shape[:3] != (B, T, n)
+            or tuple(scale.shape) != (B, T, n)
+            or tuple(gamma.shape) != (B, T, n)
+            or tuple(h0.shape) != (B, n, k)
+            or tuple(perm.shape) != (R, k)
+            or tuple(sgn.shape) != (R, k)
+            or tuple(p2p.shape) != (R, k)
+        ):
+            raise ScanFallback(
+                f"angle-fused kernel (theta={tuple(theta.shape)}, "
+                f"scale={tuple(scale.shape)}, gamma={tuple(gamma.shape)}, "
+                f"b={tuple(b.shape)}, h0={tuple(h0.shape)}, "
+                f"perm={tuple(perm.shape)}, sgn={tuple(sgn.shape)}, "
+                f"p2p={tuple(p2p.shape)}) outside the envelope: need k in "
+                f"{sorted(_ENVELOPE)} and scale/gamma/b/h0/perm/sgn/p2p shapes "
+                "agreeing with theta's (B, T, n, R, half) on (B, T, n, R, k)"
+            )
+        try:
+            return angle_scan_fwd(
+                theta, scale, gamma, b, h0, perm, sgn, p2p, has_scale, has_decay
+            )
+        except Exception as exc:  # kernel launch/compile failure -> loud fallback
+            raise ScanFallback(f"angle-fused Triton kernel failed: {exc}") from exc
 
     def _linear_scan_impl(
         a: torch.Tensor, b: torch.Tensor
@@ -1323,6 +1788,127 @@ def _run_grad_parity() -> int:
     return 0
 
 
+def _run_angle_fused_parity() -> int:
+    """Module-level output+grad parity for the angle-fused path (spec §9.2).
+
+    Builds each rotation-family mixer on CUDA and compares its forward output
+    and every parameter gradient between the eager path (``MINGRU_SCAN=eager``,
+    the ``_coeffs`` -> ``matrix_scan``/``matrix_affine_scan`` reference) and the
+    angle-fused Triton path (``MINGRU_SCAN=triton``) on identical weights,
+    inputs, and cotangents. Covers ``GivensMinGRU`` (decay off, and decay on AT
+    THE CLASS DEFAULT ``decay_rate=1.0``) and ``RotationMinGRU`` (snap off/on,
+    decay off and on). Both mixers now back their angle-fused reversal with
+    EXACT stored-state recompute (no division, no checkpoint interval -- see
+    the Task-5 report, "Fix round 2"), so realistic decay strengths are used
+    throughout; the earlier "gentle decay" Givens case existed only to dodge
+    the since-rejected division-based reversal's roundoff blowup and would be
+    misleading to keep now that that dodge is unnecessary.
+    """
+    import os
+
+    import min_gru
+
+    device = "cuda"
+    # Module-output bound: the affine flat fp32 gate; parameter grads <= 1e-3.
+    out_atol, grad_atol = 1e-5, 1e-3
+    failures: list[str] = []
+    n_pass = 0
+
+    def check_mixer(name: str, mixer_fn, delta_scale: float | None) -> None:
+        """Build and check one mixer. ``mixer_fn`` is seeded THEN called, so
+        its parameter init is reproducible (unlike passing an already-built
+        mixer, whose weights would depend on whatever RNG state preceded this
+        call site)."""
+        nonlocal n_pass
+        torch.manual_seed(0)
+        mixer = mixer_fn().to(device)
+        B, T = 4, 96
+        x = torch.randn(B, T, mixer.input_size, device=device)
+        dt = None
+        if delta_scale is not None:
+            dt = torch.rand(B, T, device=device) * delta_scale
+
+        os.environ["MINGRU_SCAN"] = "eager"
+        mixer.zero_grad(set_to_none=True)
+        out_e = mixer(x, delta_t=dt)
+        torch.manual_seed(1234)
+        cot = torch.randn_like(out_e)
+        (cot * out_e).sum().backward()
+        grads_e = {nm: p.grad.detach().clone() for nm, p in mixer.named_parameters()}
+
+        os.environ["MINGRU_SCAN"] = "triton"
+        mixer.zero_grad(set_to_none=True)
+        try:
+            out_t = mixer(x, delta_t=dt)
+        except Exception as exc:
+            failures.append(f"{name}: fused forward raised {type(exc).__name__}: {exc}")
+            print(f"  [FAIL] {name}: {type(exc).__name__}: {exc}")
+            os.environ["MINGRU_SCAN"] = "eager"
+            return
+        (cot * out_t).sum().backward()
+        grads_t = {nm: p.grad.detach().clone() for nm, p in mixer.named_parameters()}
+        os.environ["MINGRU_SCAN"] = "eager"
+
+        out_err, _ = _max_abs_rel(out_t, out_e)
+        ok = torch.allclose(out_t.float(), out_e.float(), atol=out_atol, rtol=0.0)
+        grad_err = 0.0
+        for nm in grads_e:
+            ge, gt = grads_e[nm], grads_t.get(nm)
+            if gt is None:
+                ok = False
+                failures.append(f"{name}: missing fused grad for {nm}")
+                continue
+            err, _ = _max_abs_rel(gt, ge)
+            grad_err = max(grad_err, err)
+            ok = ok and torch.allclose(gt.float(), ge.float(), atol=grad_atol, rtol=0.0)
+        if ok:
+            n_pass += 1
+            print(f"  [ok]   {name}: out={out_err:.2e} grad={grad_err:.2e}")
+        else:
+            failures.append(f"{name}: out={out_err:.2e} grad={grad_err:.2e}")
+            print(f"  [FAIL] {name}: out={out_err:.2e} grad={grad_err:.2e}")
+
+    print("angle-fused GivensMinGRU (k=8, rounds=3, exact stored-state backward):")
+    check_mixer(
+        "givens decay=None",
+        lambda: min_gru.GivensMinGRU(32, 64, block_size=8, rounds=3),
+        None,
+    )
+    check_mixer(
+        "givens decay=learnable (class-default decay_rate=1.0)",
+        lambda: min_gru.GivensMinGRU(32, 64, block_size=8, rounds=3, decay="learnable"),
+        1.0,
+    )
+    print("angle-fused RotationMinGRU (k=2, tanh-u scale, exact stored-state backward):")
+    check_mixer(
+        "rotation snap=None decay=None",
+        lambda: min_gru.RotationMinGRU(32, 64, snap=None),
+        None,
+    )
+    check_mixer(
+        "rotation snap=(2,3,4,6) decay=None",
+        lambda: min_gru.RotationMinGRU(32, 64, snap=(2, 3, 4, 6)),
+        None,
+    )
+    check_mixer(
+        "rotation snap=(2,3,4,6) decay=learnable",
+        lambda: min_gru.RotationMinGRU(32, 64, snap=(2, 3, 4, 6), decay="learnable", decay_rate=1.0),
+        1.0,
+    )
+
+    print()
+    if failures:
+        print(f"ANGLE-FUSED PARITY FAILED: {len(failures)} case(s), {n_pass} passed")
+        for line in failures:
+            print(f"  {line}")
+        return 1
+    print(
+        f"ANGLE-FUSED PARITY PASSED: {n_pass} case(s) -- outputs within "
+        f"atol={out_atol:.0e}, parameter grads within atol={grad_atol:.0e}"
+    )
+    return 0
+
+
 if __name__ == "__main__":
     _status = available()
     if _status is not True:
@@ -1331,4 +1917,6 @@ if __name__ == "__main__":
     _fwd = _run_forward_parity()
     print()
     _bwd = _run_grad_parity()
-    raise SystemExit(_fwd or _bwd)
+    print()
+    _angle = _run_angle_fused_parity()
+    raise SystemExit(_fwd or _bwd or _angle)
