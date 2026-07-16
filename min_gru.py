@@ -138,7 +138,14 @@ def _dispatch_scan(name: str, *args: torch.Tensor):
             reason = f"no Triton kernel registered for {name!r} yet"
 
     if reason is None:
-        return triton_scans.SCAN_IMPLS[name](*args)
+        try:
+            return triton_scans.SCAN_IMPLS[name](*args)
+        except triton_scans.ScanFallback as exc:
+            # The kernel declined this call (out-of-envelope shape or a
+            # launch/compile failure). Treat it exactly like any other
+            # "no usable Triton path" reason below: raise under `triton`,
+            # warn-once-and-fall-back under `auto`. Never a wrong result.
+            reason = str(exc)
 
     if mode == "triton":
         raise RuntimeError(
