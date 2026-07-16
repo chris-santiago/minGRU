@@ -41,6 +41,7 @@ O(1)-memory streaming via step().
 """
 
 import math
+import os
 import warnings
 from typing import Literal
 
@@ -49,6 +50,113 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 Decay = Literal["fixed", "learnable"] | None
+
+# --- Triton scan dispatch seam ----------------------------------------------
+#
+# MINGRU_SCAN selects which implementation backs the four scan functions
+# below (mirrors probes.py's MAX_STEPS/CKPT env-var idiom: read via
+# os.environ.get at call time, not cached at import time):
+#   "auto" (default) -- CUDA-resident inputs with an importable, available
+#       Triton kernel registered for the op run that kernel; everything
+#       else (CPU tensors, missing/unavailable triton_scans, no kernel
+#       registered yet for the op) falls back to the eager implementation
+#       below, unchanged. A CUDA-input fallback warns exactly once per
+#       process, naming the reason.
+#   "eager" -- always the eager implementation; triton_scans is never
+#       imported.
+#   "triton" -- always a Triton kernel; raises rather than silently
+#       falling back to eager if one isn't available.
+# See triton_scans.py and the design spec
+# (.claude/output/specs/2026-07-16-triton-scan-kernels-design.md) §4 for
+# the full contract. triton_scans is imported lazily, only from within
+# this function, so importing/running min_gru.py never attempts it.
+_VALID_SCAN_MODES = ("auto", "eager", "triton")
+_warned_scan_fallback = False
+
+
+def _dispatch_scan(name: str, *args: torch.Tensor):
+    """Resolve ``MINGRU_SCAN`` and run a Triton scan kernel if selected.
+
+    Called as a guard at the top of each of the four scan functions
+    (``parallel_scan_log``, ``linear_scan``, ``matrix_scan``,
+    ``matrix_affine_scan``), before any of their existing eager
+    computation. A non-``None`` return is the scan's final result (the
+    caller returns it immediately, skipping the eager code below); a
+    ``None`` return means "fall through to the unchanged eager
+    implementation".
+
+    Parameters
+    ----------
+    name : str
+        The scan function's own name, used to look up its Triton
+        implementation in ``triton_scans.SCAN_IMPLS`` and to name the op
+        in fallback warnings and errors.
+    *args : torch.Tensor
+        The scan function's positional tensor arguments, forwarded as-is
+        to the Triton implementation when one runs. ``args[0]`` is
+        inspected for ``.is_cuda`` to decide device residency.
+
+    Returns
+    -------
+    tuple, torch.Tensor, or None
+        The Triton kernel's result if one ran; ``None`` to signal the
+        eager fallback.
+
+    Raises
+    ------
+    ValueError
+        If ``MINGRU_SCAN`` is set to something other than ``"auto"``,
+        ``"eager"``, or ``"triton"``.
+    RuntimeError
+        If ``MINGRU_SCAN=triton`` but no Triton implementation is
+        available or registered for ``name`` (never a silent downgrade
+        to eager).
+    """
+    mode = os.environ.get("MINGRU_SCAN", "auto")
+    if mode not in _VALID_SCAN_MODES:
+        raise ValueError(
+            f"MINGRU_SCAN must be one of {_VALID_SCAN_MODES} (got {mode!r})"
+        )
+    if mode == "eager":
+        return None
+
+    is_cuda = args[0].is_cuda
+    if mode == "auto" and not is_cuda:
+        # CPU behavior is unchanged: no import attempted, no warning.
+        return None
+
+    reason = None
+    try:
+        import triton_scans
+    except ImportError as exc:
+        reason = f"triton_scans not importable: {exc}"
+    else:
+        status = triton_scans.available()
+        if status is not True:
+            reason = status
+        elif name not in triton_scans.SCAN_IMPLS:
+            reason = f"no Triton kernel registered for {name!r} yet"
+
+    if reason is None:
+        return triton_scans.SCAN_IMPLS[name](*args)
+
+    if mode == "triton":
+        raise RuntimeError(
+            f"MINGRU_SCAN=triton requested for {name!r} but Triton is "
+            f"unavailable: {reason}"
+        )
+
+    # mode == "auto" with CUDA-resident inputs and no usable Triton path:
+    # warn once per process, naming the reason, then fall back to eager.
+    global _warned_scan_fallback
+    if not _warned_scan_fallback:
+        warnings.warn(
+            f"MINGRU_SCAN=auto fell back to the eager scan implementation "
+            f"for {name!r} despite CUDA inputs: {reason}",
+            stacklevel=3,
+        )
+        _warned_scan_fallback = True
+    return None
 
 
 def g(x: torch.Tensor) -> torch.Tensor:
@@ -120,6 +228,9 @@ def parallel_scan_log(log_coeffs: torch.Tensor, log_values: torch.Tensor) -> tor
     torch.Tensor
         Shape ``(B, T, D)``. The states ``h_1..h_T``.
     """
+    result = _dispatch_scan("parallel_scan_log", log_coeffs, log_values)
+    if result is not None:
+        return result
     # a*_t = sum_{i<=t} log(a_i), padded with a*_0 = 0
     a_star = F.pad(torch.cumsum(log_coeffs, dim=1), (0, 0, 1, 0))
     log_h0_plus_b_star = torch.logcumsumexp(log_values - a_star, dim=1)
@@ -745,6 +856,9 @@ def linear_scan(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.T
     ``torch.associative_scan`` primitive exists to lean on. Revisit for
     long-sequence training.
     """
+    result = _dispatch_scan("linear_scan", a, b)
+    if result is not None:
+        return result
     T = a.size(1)
     A, Bc = a, b
     offset = 1
@@ -800,6 +914,9 @@ def matrix_scan(M: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.T
     the short training lengths this repo targets (probes train at
     T=64); revisit for long-sequence training.
     """
+    result = _dispatch_scan("matrix_scan", M, b)
+    if result is not None:
+        return result
     B_, T, n = M.shape[:3]
     eye = torch.eye(2, dtype=M.dtype, device=M.device)
     A, Bc = M, b
@@ -865,6 +982,9 @@ def matrix_affine_scan(
     generalization of it) so the recorded 2x2 rotation evidence's
     floating-point path is preserved byte-for-byte.
     """
+    result = _dispatch_scan("matrix_affine_scan", A, Bm)
+    if result is not None:
+        return result
     Ab, Bb = A, Bm
     offset, T = 1, A.size(1)
     while offset < T:
@@ -3606,3 +3726,80 @@ if __name__ == "__main__":
         "generic decay-constructed-last check (all _MIXER_CLASSES entries, "
         "fixed buffer / learnable parameter): ok"
     )
+
+    # =====================================================================
+    # MINGRU_SCAN dispatch seam: CPU-testable branches of _dispatch_scan.
+    # triton_scans.py itself requires torch>=2.8 and CUDA to do anything
+    # useful, so its real Triton-path behavior isn't testable here; these
+    # assertions instead pin the seam's env-var resolution, mode
+    # validation, and CPU/eager guarantees against regression. Each block
+    # sets/restores os.environ["MINGRU_SCAN"] around one assertion (read at
+    # call time -- see _dispatch_scan -- so in-process mutation is safe and
+    # observable immediately).
+    # =====================================================================
+    import sys
+
+    _a = torch.randn(2, 8, 4)
+    _b = torch.randn(2, 8, 4)
+    _scan_env_key = "MINGRU_SCAN"
+    _saved_scan_env = os.environ.get(_scan_env_key)
+
+    def _set_scan_env(value: str | None) -> None:
+        if value is None:
+            os.environ.pop(_scan_env_key, None)
+        else:
+            os.environ[_scan_env_key] = value
+
+    try:
+        # 1. Invalid MINGRU_SCAN value raises ValueError.
+        _set_scan_env("not-a-real-mode")
+        try:
+            linear_scan(_a, _b)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid MINGRU_SCAN value must raise ValueError")
+        print("MINGRU_SCAN=<invalid> raises ValueError: ok")
+
+        # 2. MINGRU_SCAN=eager never imports triton_scans.
+        sys.modules.pop("triton_scans", None)
+        _set_scan_env("eager")
+        _eager_out = linear_scan(_a, _b)
+        assert "triton_scans" not in sys.modules, (
+            "MINGRU_SCAN=eager must never import triton_scans"
+        )
+        print("MINGRU_SCAN=eager: no triton_scans import, ok")
+
+        # 3. MINGRU_SCAN=triton on CPU (no CUDA/Triton kernel available)
+        # raises RuntimeError naming the reason -- never a silent fallback.
+        _set_scan_env("triton")
+        try:
+            linear_scan(_a, _b)
+        except RuntimeError as _exc:
+            assert str(_exc), "RuntimeError must name a reason"
+        else:
+            raise AssertionError(
+                "MINGRU_SCAN=triton with no Triton available must raise "
+                "RuntimeError, never silently fall back to eager"
+            )
+        print("MINGRU_SCAN=triton on CPU raises RuntimeError naming the reason: ok")
+
+        # 4. Default (unset -> "auto") + CPU tensors: output identical to
+        # eager, and triton_scans still never imported.
+        sys.modules.pop("triton_scans", None)
+        _set_scan_env(None)
+        _auto_A, _auto_Bc = linear_scan(_a, _b)
+        _eager_A, _eager_Bc = _eager_out
+        assert torch.equal(_auto_A, _eager_A) and torch.equal(_auto_Bc, _eager_Bc), (
+            "MINGRU_SCAN=auto (default) must match MINGRU_SCAN=eager exactly "
+            "on CPU tensors"
+        )
+        assert "triton_scans" not in sys.modules, (
+            "MINGRU_SCAN=auto with CPU tensors must never import triton_scans"
+        )
+        print(
+            "MINGRU_SCAN=auto (default) on CPU: output matches eager exactly, "
+            "no triton_scans import: ok"
+        )
+    finally:
+        _set_scan_env(_saved_scan_env)
