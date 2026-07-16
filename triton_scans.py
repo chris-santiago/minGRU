@@ -155,6 +155,24 @@ except ImportError as _exc:  # pragma: no cover - exercised only off-GPU
 if _HAS_TRITON:
     from torch.library import register_autograd, triton_op, wrap_triton
 
+    # fp32 contraction / auto-MMA guard (validated on an NVIDIA L4, sm_89,
+    # torch 2.8 Triton). Triton auto-lowers a
+    # ``tl.sum(a[:, :, None] * b[None, :, :], axis=...)`` contraction to a
+    # tensor-core MMA whenever BOTH output (free) dims are >= 16. That MMA
+    # (a) defaults to TF32 -- ~2^-10 relative error, ~2e-4 absolute at the
+    # scaled inputs here, which breaks the flat 1e-5 fp32 gate -- when the
+    # contraction dim is also >= 16, and (b) HARD-CRASHES the compile with
+    # ``LLVM ERROR: Unsupported DotOp`` when the contraction dim is < 16.
+    # Both bite only at the envelope's ``k = 16`` (and, for the injection /
+    # ``v``-dim contractions, only when ``v = 16`` as well). Fix: route the
+    # MMA-shaped contractions (all three matmul dims >= 16, so the dot is
+    # both needed and legal) through an explicit ``tl.dot`` with
+    # ``input_precision="ieee"`` (bit-exact fp32 on this arch), and keep the
+    # exact elementwise-sum idiom for every case with a dim < 16, where it
+    # stays a correct FMA reduction and never triggers the MMA path. The
+    # constexpr ``k``/``v`` guards compile to a single branch per kernel
+    # specialization -- no runtime cost.
+
     @triton.jit
     def _affine_scan_fwd_kernel(
         A_ptr,
@@ -209,8 +227,16 @@ if _HAS_TRITON:
             # Composition order A_current @ A_earlier (spec §6):
             #   Abar_t[i, j] = sum_p A_t[i, p] * Abar_{t-1}[p, j]
             #   Bbar_t[i, j] = sum_p A_t[i, p] * Bbar_{t-1}[p, j] + B_t[i, j]
-            Abar = tl.sum(a[:, :, None] * Abar[None, :, :], axis=1)
-            Bbar = tl.sum(a[:, :, None] * Bbar[None, :, :], axis=1) + bt
+            # See the auto-MMA / TF32 note above: the (k, k, k) Abar product
+            # auto-MMAs at k=16; the (k, v, k) Bbar product only when v=16 too.
+            if k >= 16:
+                Abar = tl.dot(a, Abar, input_precision="ieee")
+            else:
+                Abar = tl.sum(a[:, :, None] * Abar[None, :, :], axis=1)
+            if k >= 16 and v >= 16:
+                Bbar = tl.dot(a, Bbar, input_precision="ieee") + bt
+            else:
+                Bbar = tl.sum(a[:, :, None] * Bbar[None, :, :], axis=1) + bt
 
             tl.store(Abar_ptrs, Abar)
             tl.store(Bbar_ptrs, Bbar)
@@ -423,8 +449,18 @@ if _HAS_TRITON:
             gB = tl.load(gB_ptrs).to(tl.float32)  # G^B_t (k, v)
 
             # Reverse-scan transition: Ghat_t = G_t + A_{t+1}^T @ Ghat_{t+1}.
-            AtGA = tl.sum(A_next[:, :, None] * GhatA[:, None, :], axis=0)  # (k, k)
-            AtGB = tl.sum(A_next[:, :, None] * GhatB[:, None, :], axis=0)  # (k, v)
+            # See the auto-MMA / TF32 note above: the (k, k, k) A^T@GhatA
+            # product auto-MMAs at k=16; the (k, v, k) A^T@GhatB only when
+            # v=16 too. `tl.dot` has no transpose flag, so A^T is materialized
+            # with `tl.trans`; the else-branch keeps the exact axis-0 reduce.
+            if k >= 16:
+                AtGA = tl.dot(tl.trans(A_next), GhatA, input_precision="ieee")
+            else:
+                AtGA = tl.sum(A_next[:, :, None] * GhatA[:, None, :], axis=0)  # (k, k)
+            if k >= 16 and v >= 16:
+                AtGB = tl.dot(tl.trans(A_next), GhatB, input_precision="ieee")
+            else:
+                AtGB = tl.sum(A_next[:, :, None] * GhatB[:, None, :], axis=0)  # (k, v)
             GhatA = gA + AtGA
             GhatB = gB + AtGB
 
@@ -442,9 +478,18 @@ if _HAS_TRITON:
             Bbar_prev = tl.load(Bbar_prev_ptrs, mask=prev, other=0.0).to(tl.float32)
 
             # dL/dA_t = Ghat^A_t @ Abar_{t-1}^T + Ghat^B_t @ Bbar_{t-1}^T.
-            dA = tl.sum(GhatA[:, None, :] * Abar_prev[None, :, :], axis=2) + tl.sum(
-                GhatB[:, None, :] * Bbar_prev[None, :, :], axis=2
-            )
+            # See the auto-MMA / TF32 note above: the first term (k, k, k)
+            # auto-MMAs at k=16; the second contracts over v (K=v), so it
+            # only auto-MMAs when v=16 too. `tl.dot` needs the ^T explicit.
+            if k >= 16:
+                dA_A = tl.dot(GhatA, tl.trans(Abar_prev), input_precision="ieee")
+            else:
+                dA_A = tl.sum(GhatA[:, None, :] * Abar_prev[None, :, :], axis=2)
+            if k >= 16 and v >= 16:
+                dA_B = tl.dot(GhatB, tl.trans(Bbar_prev), input_precision="ieee")
+            else:
+                dA_B = tl.sum(GhatB[:, None, :] * Bbar_prev[None, :, :], axis=2)
+            dA = dA_A + dA_B
             tl.store(dA_ptrs, dA)
             tl.store(dB_ptrs, GhatB)  # dL/dB_t = Ghat^B_t
 
@@ -709,7 +754,19 @@ if _HAS_TRITON:
             else:
                 v0s = hprev
             vv = [v0s]
-            for r in range(R):
+            # `tl.static_range`, NOT `range`: this loop indexes the Python
+            # list `vv` by the loop variable (`vv[r]`) and grows it per round,
+            # both of which require `r` to be a compile-time int. A plain
+            # `range(R)` (even with constexpr R) is lowered to a runtime
+            # `scf.for`, making `r` a runtime value and `vv[r]` a Python-list
+            # index by a Triton value -- a frontend AssertionError.
+            # `static_range` unrolls at compile time so `r` is a Python int.
+            # The list is grown by CONCATENATION (`vv = vv + [..]`), not
+            # `vv.append(..)`: Triton's static-unrolled list type rejects
+            # in-place `.append` ("'append' is not in list") but supports
+            # `+`. (The forward kernel's R-loop carries a single state and
+            # needs no list, so it can stay a plain `range`.)
+            for r in tl.static_range(R):
                 th = tl.load(theta_ptr + th_base + it * (n * R * half) + r * half + ar_h).to(tl.float32)
                 ch = tl.cos(th)
                 sh = tl.sin(th)
@@ -720,8 +777,9 @@ if _HAS_TRITON:
                 perm_r = tl.load(perm_ptr + r * k + ar_k)
                 sgn_r = tl.load(sgn_ptr + r * k + ar_k).to(tl.float32)
                 Pm = (perm_r[:, None] == ar_k[None, :]).to(tl.float32)
-                vp = tl.sum(Pm * vv[r][None, :], axis=1)
-                vv.append(cos_pos * vv[r] + sgn_r * sin_pos * vp)
+                vr = vv[r]
+                vp = tl.sum(Pm * vr[None, :], axis=1)
+                vv = vv + [cos_pos * vr + sgn_r * sin_pos * vp]
             rot = vv[R]
 
             # --- adjoints ---
@@ -735,8 +793,15 @@ if _HAS_TRITON:
             else:
                 a = gbar
 
-            for r in range(R):
-                rr = R - 1 - r
+            # `tl.static_range` with a DOWN-counting loop variable so `rr`
+            # itself is the bare loop var (R-1 .. 0). Indexing the Python list
+            # `vv[rr]` with the bare loop variable is the only list-subscript
+            # form Triton accepts inside this runtime `for _step` loop body:
+            # a COMPUTED index such as `vv[R - 1 - r]` (R is a constexpr) is
+            # rejected with a frontend AssertionError here, even though it
+            # compiles fine outside a runtime loop. Down-counting the range
+            # sidesteps that entirely and doubles as the pointer/load index.
+            for rr in tl.static_range(R - 1, -1, -1):
                 th = tl.load(theta_ptr + th_base + it * (n * R * half) + rr * half + ar_h).to(tl.float32)
                 ch = tl.cos(th)
                 sh = tl.sin(th)
@@ -1416,6 +1481,40 @@ def _max_abs_rel(out: torch.Tensor, ref: torch.Tensor) -> tuple[float, float]:
     return abs_err.max().item(), rel_err.max().item()
 
 
+def _parity_row(
+    op: str,
+    shape: str,
+    dtype_sample: torch.Tensor,
+    direction: str,
+    gate_atol: float,
+    gate_rtol: float,
+    max_abs_err: float | None,
+    max_rel_err: float | None,
+    passed: bool,
+) -> dict:
+    """Build one parity-conformance artifact row (shared by all three runners).
+
+    One dict per GATED case (never the informational bf16 rows -- those have
+    no pass/fail verdict and are not part of the persisted parity-conformance
+    artifact). ``shape`` is the same descriptive tag string each runner
+    already prints (e.g. ``"B=2 T=64 k=16 v=16"``) -- reusing it rather than
+    re-deriving a separate structured shape dict avoids a second shape
+    representation to keep in sync with the console output. ``dtype_sample``
+    is any tensor from this case's inputs; only its dtype is read.
+    """
+    return {
+        "op": op,
+        "shape": shape,
+        "dtype": str(dtype_sample.dtype).replace("torch.", ""),
+        "direction": direction,
+        "gate_atol": gate_atol,
+        "gate_rtol": gate_rtol,
+        "max_abs_err": max_abs_err,
+        "max_rel_err": max_rel_err,
+        "pass": passed,
+    }
+
+
 def _rand_contractive_matrix(shape: tuple[int, ...], k: int, device) -> torch.Tensor:
     """Random square-transition tensor scaled to keep the T-product bounded.
 
@@ -1491,8 +1590,17 @@ _PARITY_TS = (1, 13, 64, 128, 1024)
 _PARITY_BS = (2, 128)
 
 
-def _run_forward_parity() -> int:
-    """Run the §9.1 forward-parity matrix; return process exit code."""
+def _run_forward_parity(collect: list[dict] | None = None) -> int:
+    """Run the §9.1 forward-parity matrix; return process exit code.
+
+    ``collect``, when not ``None``, is a caller-owned list that this sweep
+    APPENDS one row dict to per GATED case (never the informational bf16
+    rows, which have no pass/fail verdict) -- the parity-conformance
+    artifact seam (Task 7 follow-up). Defaults to ``None`` so
+    ``python triton_scans.py``'s own selftest invocation (and any other
+    caller that doesn't pass it) is byte-identical to before this seam
+    existed: nothing is collected, nothing else changes.
+    """
     import os
 
     os.environ["MINGRU_SCAN"] = "eager"  # force the eager reference path
@@ -1536,6 +1644,10 @@ def _run_forward_parity() -> int:
         except Exception as exc:  # ScanFallback or a kernel launch/compile error
             failures.append(f"{label}: Triton path raised {type(exc).__name__}: {exc}")
             print(f"  [FAIL] {label}: {type(exc).__name__}: {exc}")
+            if collect is not None and not informational:
+                collect.append(_parity_row(
+                    name, tag, inputs[0], "fwd", case_atol, case_rtol, None, None, False
+                ))
             return
         ref = getattr(min_gru, name)(*inputs)
         # Ops return either a pair (the affine scans) or a single tensor
@@ -1562,6 +1674,11 @@ def _run_forward_parity() -> int:
             rel_str = ", ".join(f"{r:.2e}" for r in rels)
             failures.append(f"{label}: max_abs={abs_err:.2e} (rel={rel_str})")
             print(f"  [FAIL] {label}: max_abs={abs_err:.2e}")
+        if collect is not None:
+            collect.append(_parity_row(
+                name, tag, inputs[0], "fwd", case_atol, case_rtol,
+                abs_err, max(rels) if rels else None, ok,
+            ))
 
     # parallel_scan_log tolerance is the log-space exception to the flat
     # atol=1e-5 fp32 gate, and it is NOT a loosening of that gate (which
@@ -1663,7 +1780,7 @@ def _run_forward_parity() -> int:
     return 0
 
 
-def _run_grad_parity() -> int:
+def _run_grad_parity(collect: list[dict] | None = None) -> int:
     """Run the §9.1 gradient-parity matrix; return process exit code.
 
     For every op the Triton path is now differentiable (Task 4:
@@ -1673,6 +1790,9 @@ def _run_grad_parity() -> int:
     then compares the resulting INPUT gradients. The gate is the plan's
     parameter-grad bound (``atol=1e-3``); it exercises the reversed-scan
     adjoint kernels (affine, k=1) and the log op's recompute backward.
+
+    ``collect``: see ``_run_forward_parity`` -- same optional append-only
+    parity-conformance-artifact seam, same ``None``-default no-op contract.
     """
     import os
 
@@ -1707,6 +1827,10 @@ def _run_grad_parity() -> int:
         except Exception as exc:  # ScanFallback or a kernel launch/compile error
             failures.append(f"{label}: Triton path raised {type(exc).__name__}: {exc}")
             print(f"  [FAIL] {label}: {type(exc).__name__}: {exc}")
+            if collect is not None:
+                collect.append(_parity_row(
+                    name, tag, inputs[0], "grad", atol, rtol, None, None, False
+                ))
             return
         out_e = getattr(min_gru, name)(*eager_inputs)
         outs_t = out_t if isinstance(out_t, tuple) else (out_t,)
@@ -1721,6 +1845,7 @@ def _run_grad_parity() -> int:
         loss_e.backward()
 
         max_err = 0.0
+        max_rel = 0.0
         ok = True
         for tri_in, eager_in in zip(tri_inputs, eager_inputs):
             gt = tri_in.grad
@@ -1731,14 +1856,19 @@ def _run_grad_parity() -> int:
                     ok = False
                     failures.append(f"{label}: grad presence mismatch (triton={gt is not None})")
                 continue
-            err, _ = _max_abs_rel(gt, ge)
+            err, rel = _max_abs_rel(gt, ge)
             max_err = max(max_err, err)
+            max_rel = max(max_rel, rel)
             ok = ok and torch.allclose(gt.float(), ge.float(), atol=atol, rtol=rtol)
         if ok:
             n_pass += 1
         else:
             failures.append(f"{label}: max_grad_abs={max_err:.2e}")
             print(f"  [FAIL] {label}: max_grad_abs={max_err:.2e}")
+        if collect is not None:
+            collect.append(_parity_row(
+                name, tag, inputs[0], "grad", atol, rtol, max_err, max_rel, ok
+            ))
 
     print("grad parallel_scan_log (recompute backward):")
     for B in Bs:
@@ -1788,8 +1918,16 @@ def _run_grad_parity() -> int:
     return 0
 
 
-def _run_angle_fused_parity() -> int:
+def _run_angle_fused_parity(collect: list[dict] | None = None) -> int:
     """Module-level output+grad parity for the angle-fused path (spec §9.2).
+
+    ``collect``: see ``_run_forward_parity`` -- same optional append-only
+    parity-conformance-artifact seam, same ``None``-default no-op contract.
+    Each mixer case appends TWO rows (this runner checks both output and
+    grad parity per case, unlike the single-direction sweeps above): one
+    ``direction="fwd"`` row for the output comparison, one
+    ``direction="grad"`` row for the parameter-grad comparison, both keyed
+    by the same ``op`` (mixer case name) and ``shape``.
 
     Builds each rotation-family mixer on CUDA and compares its forward output
     and every parameter gradient between the eager path (``MINGRU_SCAN=eager``,
@@ -1809,8 +1947,27 @@ def _run_angle_fused_parity() -> int:
     import min_gru
 
     device = "cuda"
-    # Module-output bound: the affine flat fp32 gate; parameter grads <= 1e-3.
-    out_atol, grad_atol = 1e-5, 1e-3
+    # Module-output bound: the affine flat fp32 gate (unchanged). Parameter
+    # grads: mixed (atol=1e-3, rtol=1e-3), NOT the flat atol=1e-3/rtol=0 bound
+    # the affine-op grad sweep uses -- this is the log-op-forward precedent
+    # applied to a second physically-unmeetable-at-flat-atol case, not a
+    # general loosening. Cause: the no-decay Givens case is norm-preserving
+    # (orthogonal), so its theta gradients accumulate unchecked over T and
+    # reach |grad| ~ 1704 at this lab shape/seed; a flat 1e-3 ABSOLUTE gate
+    # there is below fp32 ULP resolution at that magnitude (~10 ULP), so two
+    # numerically-independent-but-both-correct implementations (eager
+    # materializes transition matrices; Triton applies factored rotations)
+    # cannot agree to it. Measured graze was max_abs=1.98e-3 at
+    # rel=1.8e-4 -- comfortably inside the mixed bound. Every other
+    # angle-fused case (including the class-default decay=learnable Givens
+    # and all RotationMinGRU cases) already passes far inside 1e-3 flat, so
+    # this bound still catches a real kernel defect (an O(1) sign/index
+    # error, a dropped term) while honoring fp32 physics for the one
+    # genuinely unbounded-magnitude gradient. User-ratified 2026-07-16
+    # (Task 7 cloud validation), same precedent as parallel_scan_log's
+    # forward gate (see ``_run_forward_parity``).
+    out_atol = 1e-5
+    grad_atol, grad_rtol = 1e-3, 1e-3
     failures: list[str] = []
     n_pass = 0
 
@@ -1823,6 +1980,7 @@ def _run_angle_fused_parity() -> int:
         torch.manual_seed(0)
         mixer = mixer_fn().to(device)
         B, T = 4, 96
+        shape = f"B={B} T={T} input_size={mixer.input_size} hidden_size={mixer.hidden_size}"
         x = torch.randn(B, T, mixer.input_size, device=device)
         dt = None
         if delta_scale is not None:
@@ -1844,29 +2002,47 @@ def _run_angle_fused_parity() -> int:
             failures.append(f"{name}: fused forward raised {type(exc).__name__}: {exc}")
             print(f"  [FAIL] {name}: {type(exc).__name__}: {exc}")
             os.environ["MINGRU_SCAN"] = "eager"
+            if collect is not None:
+                collect.append(_parity_row(
+                    name, shape, x, "fwd", out_atol, 0.0, None, None, False
+                ))
+                collect.append(_parity_row(
+                    name, shape, x, "grad", grad_atol, grad_rtol, None, None, False
+                ))
             return
         (cot * out_t).sum().backward()
         grads_t = {nm: p.grad.detach().clone() for nm, p in mixer.named_parameters()}
         os.environ["MINGRU_SCAN"] = "eager"
 
-        out_err, _ = _max_abs_rel(out_t, out_e)
-        ok = torch.allclose(out_t.float(), out_e.float(), atol=out_atol, rtol=0.0)
+        out_err, out_rel = _max_abs_rel(out_t, out_e)
+        out_ok = torch.allclose(out_t.float(), out_e.float(), atol=out_atol, rtol=0.0)
         grad_err = 0.0
+        grad_rel = 0.0
+        grad_ok = True
         for nm in grads_e:
             ge, gt = grads_e[nm], grads_t.get(nm)
             if gt is None:
-                ok = False
+                grad_ok = False
                 failures.append(f"{name}: missing fused grad for {nm}")
                 continue
-            err, _ = _max_abs_rel(gt, ge)
+            err, rel = _max_abs_rel(gt, ge)
             grad_err = max(grad_err, err)
-            ok = ok and torch.allclose(gt.float(), ge.float(), atol=grad_atol, rtol=0.0)
+            grad_rel = max(grad_rel, rel)
+            grad_ok = grad_ok and torch.allclose(gt.float(), ge.float(), atol=grad_atol, rtol=grad_rtol)
+        ok = out_ok and grad_ok
         if ok:
             n_pass += 1
             print(f"  [ok]   {name}: out={out_err:.2e} grad={grad_err:.2e}")
         else:
             failures.append(f"{name}: out={out_err:.2e} grad={grad_err:.2e}")
             print(f"  [FAIL] {name}: out={out_err:.2e} grad={grad_err:.2e}")
+        if collect is not None:
+            collect.append(_parity_row(
+                name, shape, x, "fwd", out_atol, 0.0, out_err, out_rel, out_ok
+            ))
+            collect.append(_parity_row(
+                name, shape, x, "grad", grad_atol, grad_rtol, grad_err, grad_rel, grad_ok
+            ))
 
     print("angle-fused GivensMinGRU (k=8, rounds=3, exact stored-state backward):")
     check_mixer(
@@ -1904,7 +2080,8 @@ def _run_angle_fused_parity() -> int:
         return 1
     print(
         f"ANGLE-FUSED PARITY PASSED: {n_pass} case(s) -- outputs within "
-        f"atol={out_atol:.0e}, parameter grads within atol={grad_atol:.0e}"
+        f"atol={out_atol:.0e}, parameter grads within "
+        f"atol={grad_atol:.0e} rtol={grad_rtol:.0e}"
     )
     return 0
 

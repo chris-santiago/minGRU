@@ -13,7 +13,13 @@ orchestrates what already exists and adds timing/memory measurement:
     below ``triton_scans``'s ``torch>=2.8`` floor -- a vacuous pass would
     be a bug. This is the parity half of the design spec's "done bar"
     (``.claude/output/specs/2026-07-16-triton-scan-kernels-design.md``
-    §9.1-9.2).
+    §9.1-9.2). Also persists a parity-conformance artifact (one row per
+    GATED case -- op/mixer-case, shape, dtype, direction, gate, measured
+    max abs/rel error, pass) to ``experiments/bench/scan_parity.json`` /
+    ``.md``, by passing an accumulator list into each runner's optional
+    ``collect`` parameter -- the runners already measure this per case
+    (printed on failure); this only persists what they already measured,
+    including for passing cases.
 
 ``--bench``
     Times the four scan functions (``linear_scan``, ``matrix_scan``,
@@ -66,8 +72,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -124,6 +132,8 @@ _BENCH_JSON = _OUT_DIR / "scan_bench.json"
 _BENCH_MD = _OUT_DIR / "scan_bench.md"
 _MEMORY_JSON = _OUT_DIR / "scan_memory.json"
 _MEMORY_MD = _OUT_DIR / "scan_memory.md"
+_PARITY_JSON = _OUT_DIR / "scan_parity.json"
+_PARITY_MD = _OUT_DIR / "scan_parity.md"
 
 # Two bench shapes (spec §9.3 / this task's brief): lab and long-T. Only
 # B, T vary between them; d (elementwise channel width / block-mixer hidden
@@ -203,12 +213,129 @@ def _loud_skip(reason: str) -> int:
 # --- --check ------------------------------------------------------------
 
 
+def _nvidia_driver_version() -> str | None:
+    """Best-effort NVIDIA driver version string, or ``None`` if unavailable.
+
+    No torch API exposes this (``torch.version.cuda`` is the CUDA
+    runtime/toolkit version, not the driver), so this shells out to
+    ``nvidia-smi``. Never raises: a driver string is convenience metadata
+    for the parity artifact, not something ``--check`` should depend on to
+    run -- a missing/failing ``nvidia-smi`` degrades to ``None``.
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=True,
+        )
+        return out.stdout.strip().splitlines()[0].strip()
+    except Exception:
+        return None
+
+
+def _triton_version() -> str | None:
+    """The installed ``triton`` package version, or ``None`` if not importable."""
+    try:
+        import triton
+
+        return triton.__version__
+    except ImportError:
+        return None
+
+
+def _git_commit_sha() -> str | None:
+    """The current commit SHA of this checkout, or ``None`` if unavailable."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=_REPO_ROOT,
+            timeout=10,
+            check=True,
+        )
+        return out.stdout.strip()
+    except Exception:
+        return None
+
+
+def _parity_counts(rows: list[dict]) -> dict:
+    """Pass/fail counts overall and per ``direction`` (fwd/grad)."""
+    by_direction: dict[str, dict] = {}
+    for direction in ("fwd", "grad"):
+        d_rows = [r for r in rows if r["direction"] == direction]
+        by_direction[direction] = {
+            "total": len(d_rows),
+            "passed": sum(1 for r in d_rows if r["pass"]),
+            "failed": sum(1 for r in d_rows if not r["pass"]),
+        }
+    return {
+        "total": len(rows),
+        "passed": sum(1 for r in rows if r["pass"]),
+        "failed": sum(1 for r in rows if not r["pass"]),
+        "by_direction": by_direction,
+    }
+
+
+def _render_parity_markdown(rows: list[dict], meta: dict) -> str:
+    """One markdown table: one row per gated parity case, plus the meta block."""
+    lines = [
+        "# Scan kernel parity conformance",
+        "",
+        f"torch {meta['torch_version']}, triton {meta['triton_version']}, "
+        f"device {meta['gpu_name']}, driver {meta['driver_version']}, "
+        f"commit {meta['git_commit']}, generated {meta['timestamp']}.",
+        "",
+        "| op | shape | dtype | direction | gate atol | gate rtol | max abs err | max rel err | pass |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    ]
+    for row in rows:
+        abs_str = f"{row['max_abs_err']:.2e}" if row["max_abs_err"] is not None else "n/a"
+        rel_str = f"{row['max_rel_err']:.2e}" if row["max_rel_err"] is not None else "n/a"
+        lines.append(
+            f"| {row['op']} | {row['shape']} | {row['dtype']} | {row['direction']} | "
+            f"{row['gate_atol']:.0e} | {row['gate_rtol']:.0e} | {abs_str} | {rel_str} | "
+            f"{'PASS' if row['pass'] else 'FAIL'} |"
+        )
+    lines.append("")
+    lines.append(f"Counts: {json.dumps(meta['counts'])}")
+    return "\n".join(lines) + "\n"
+
+
+def _write_parity_artifacts(rows: list[dict]) -> None:
+    """Write the parity-conformance JSON + markdown artifacts (Task 7 follow-up).
+
+    Always writes (even if some/all cases failed) -- the conformance
+    artifact's job is to document exactly what was measured, gate, and
+    outcome, for every gated case, not only the passing ones.
+    """
+    meta = {
+        "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "driver_version": _nvidia_driver_version(),
+        "torch_version": torch.__version__,
+        "triton_version": _triton_version(),
+        "git_commit": _git_commit_sha(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "counts": _parity_counts(rows),
+    }
+    _OUT_DIR.mkdir(parents=True, exist_ok=True)
+    _PARITY_JSON.write_text(json.dumps({"meta": meta, "rows": rows}, indent=2) + "\n")
+    _PARITY_MD.write_text(_render_parity_markdown(rows, meta))
+    print(f"wrote {_PARITY_JSON} and {_PARITY_MD} ({len(rows)} row(s))")
+
+
 def run_check() -> int:
     """Run the full equivalence suite via ``triton_scans``'s own runners.
 
     Mirrors ``triton_scans.py``'s own ``__main__`` block exactly (same
     skip convention, same three runners, same exit-code combination) --
-    this does not reimplement any parity sweep or tolerance.
+    this does not reimplement any parity sweep or tolerance. Additionally
+    passes a shared ``collect`` accumulator list into each runner (an
+    optional parameter on all three, defaulting to ``None`` so
+    ``triton_scans.py``'s own ``__main__`` invocation is unaffected) and
+    persists the collected rows as the parity-conformance artifact.
     """
     if triton_scans is None:
         return _loud_skip(
@@ -218,11 +345,15 @@ def run_check() -> int:
     if status is not True:
         return _loud_skip(str(status))
 
-    fwd = triton_scans._run_forward_parity()
+    parity_rows: list[dict] = []
+    fwd = triton_scans._run_forward_parity(collect=parity_rows)
     print()
-    grad = triton_scans._run_grad_parity()
+    grad = triton_scans._run_grad_parity(collect=parity_rows)
     print()
-    angle = triton_scans._run_angle_fused_parity()
+    angle = triton_scans._run_angle_fused_parity(collect=parity_rows)
+
+    _write_parity_artifacts(parity_rows)
+
     return fwd or grad or angle
 
 
