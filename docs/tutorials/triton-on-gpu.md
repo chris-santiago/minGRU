@@ -16,6 +16,8 @@ There is no separate Triton install step. `triton` ships as a dependency of the 
 
 So on a standard Linux CUDA box you already have everything. On macOS, Windows, or a CPU-only PyTorch, the library still works — it just always runs the eager scans.
 
+One recovery case: a CUDA-capable torch from a channel that didn't bundle triton (some conda or hand-rolled environments). `pip install "mingru-scans[triton]"` installs an unpinned `triton` as a convenience — pip resolves it to torch's own pin wherever torch declares one. If your torch declares none and the latest triton mismatches it (kernel-compile errors), install the exact version your torch build was compiled against, e.g. `pip install "triton==3.4"` for torch 2.8 — the pairing is recorded in the metadata of the matching torch wheel on PyPI.
+
 ## Step 2 — Check availability from Python
 
 `mingru.available()` reports the status. It returns `True` only when a CUDA device is present **and** `triton` is importable; otherwise it returns a human-readable reason string.

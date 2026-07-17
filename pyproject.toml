@@ -24,6 +24,15 @@ classifiers = [
 ]
 dependencies = ["torch>=2.8"]
 
+# Convenience extra for the just-in-case: a CUDA-capable torch from a channel
+# that didn't bundle triton (torch's own Linux CUDA wheels already pin and
+# install the matching triton, so most users never need this). Deliberately
+# unpinned -- pip unions constraints, so wherever torch pins an exact triton
+# this resolves to torch's pin; where torch declares none, prefer installing
+# the version your torch build was compiled against (see the install docs).
+[project.optional-dependencies]
+triton = ["triton"]
+
 [project.urls]
 Homepage = "https://github.com/chris-santiago/minGRU"
 Repository = "https://github.com/chris-santiago/minGRU"

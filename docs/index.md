@@ -18,6 +18,8 @@ Until the first PyPI release lands, install from the repository: `pip install gi
 
 Requires Python 3.10+ and `torch>=2.8`. The import name is `mingru`.
 
+On Linux with the default PyPI torch, the Triton backend arrives automatically (torch's CUDA wheels pin and install the matching `triton`). If your torch is CUDA-capable but came from a channel that omitted triton — `mingru.available()` will say so — install the extra as a fallback: `pip install "mingru-scans[triton]"`. The extra is deliberately unpinned; if the resolved triton mismatches your torch build, install the exact version your torch was compiled against instead (see [Triton on GPU](tutorials/triton-on-gpu.md)).
+
 ## Where to go
 
 - **New here?** [Start with the tutorial](tutorials/getting-started.md) — install, build a model, train it on real data.
