@@ -2,3 +2,10 @@ __pycache__/
 .claude/
 .ruff_cache/
 .DS_Store
+
+# Python packaging / tooling
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.venv/

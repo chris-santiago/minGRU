@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mingru-scans"
+dynamic = ["version"]
+description = "Parallel-scan minGRU variants (log-space, signed, rotation, Givens) with an optional Triton scan backend."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Chris Santiago", email = "cjsantiago@gatech.edu" }]
+keywords = ["minGRU", "rnn", "parallel-scan", "triton", "pytorch", "sequence-model"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+dependencies = ["torch>=2.8"]
+
+[project.urls]
+Homepage = "https://github.com/chris-santiago/minGRU"
+Repository = "https://github.com/chris-santiago/minGRU"
+Issues = "https://github.com/chris-santiago/minGRU/issues"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+]
+
+[tool.hatch.version]
+path = "src/mingru/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mingru"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/mingru", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+# The distributed package plus its packaging scaffolding are held to the lint
+# bar. The frozen research/evidence code (probes.py, experiments/, the
+# bench_scans harness) predates this config and is out of scope to reformat
+# (design spec section 3: no docstring/style pass there); recorded commands
+# run those files verbatim.
+extend-exclude = ["experiments", "probes.py", "scripts/bench_scans.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+# Evidence drivers: re-export shims and relocated selftest blocks. Star
+# re-exports, late (in-__main__) imports, the module-level __getattr__
+# delegation, and the frozen selftest bodies' own import ordering are
+# intentional (the block is byte-frozen vs `main`), not lint smells.
+"min_gru.py" = ["F401", "F403", "F405", "E402", "I001"]
+"triton_scans.py" = ["F401", "F403", "F405", "E402", "I001"]
+"src/mingru/__init__.py" = ["F401", "F403"]
+# Frozen library modules (Phase-4 packaging move): executable content is
+# AST-identical to `main` and must not change this phase. B905 (zip strict=)
+# would alter the executable call; E501 lines predate the ruff config. Both
+# are enforced on new code but waived on the frozen bodies.
+"src/mingru/min_gru.py" = ["B905"]
+"src/mingru/triton_scans.py" = ["B905", "E501"]
