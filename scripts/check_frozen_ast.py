@@ -9,7 +9,7 @@ syntax tree with docstrings stripped (comments are already absent from the
 AST). Three checks, each a hard stop (nonzero exit) on violation:
 
 (a) **Library freeze.** ``src/mingru/min_gru.py`` must be executable-identical
-    to ``git show main:min_gru.py`` with its ``__main__`` block removed, the
+    to `the frozen baseline (`FROZEN_BASELINE:min_gru.py`)` with its ``__main__`` block removed, the
     single permitted delta being the dispatch-import retarget
     (``import triton_scans`` -> ``from mingru import triton_scans``). This
     whole-file equality subsumes -- and is strictly stronger than -- "the
@@ -17,14 +17,15 @@ AST). Three checks, each a hard stop (nonzero exit) on violation:
 
 (b) **min_gru selftest relocation.** The ``__main__`` block of the root
     ``min_gru.py`` driver must be executable-identical to the ``__main__``
-    block of ``git show main:min_gru.py`` modulo the two permitted
+    block of `the frozen baseline (`FROZEN_BASELINE:min_gru.py`)` modulo the two permitted
     driver-contract adaptations (spec section 6): a leading import header, and
     the module-name string ``"triton_scans"`` -> ``"mingru.triton_scans"`` in
     the ``sys.modules`` pops/asserts and their messages.
 
 (c) **triton_scans selftest relocation.** The ``__main__`` block of the root
     ``triton_scans.py`` driver must be executable-identical to the
-    ``__main__`` block of ``git show main:triton_scans.py`` modulo the same
+    ``__main__`` block of the pinned ``FROZEN_BASELINE`` revision of
+    ``triton_scans.py`` modulo the same
     driver-contract adaptations; this block has no ``sys.modules`` "triton_scans"
     string to substitute, so only the leading import header may differ.
 
@@ -38,6 +39,15 @@ import ast
 import subprocess
 import sys
 from pathlib import Path
+
+# The evidence-frozen baseline: the last pre-packaging commit, where
+# min_gru.py / triton_scans.py were the monolithic root modules whose eager
+# behavior the replication evidence certifies. Pinned to an immutable SHA
+# (NOT a moving ref like `main`): after the packaging branch merges, `main`'s
+# root files are the evidence drivers, and comparing against them would be
+# self-referential.
+FROZEN_BASELINE = "d67002ad588f2fb8e19cadfa62a8d9af50e6e927"
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PKG_MIN_GRU = REPO_ROOT / "src" / "mingru" / "min_gru.py"
@@ -173,7 +183,7 @@ def _first_divergence(a: str, b: str) -> str:
 def check_library_freeze() -> list[str]:
     """(a) packaged library == main minus __main__, modulo the retarget."""
     errors: list[str] = []
-    main_tree = ast.parse(_git_show("main:min_gru.py"))
+    main_tree = ast.parse(_git_show(f"{FROZEN_BASELINE}:min_gru.py"))
     pkg_tree = ast.parse(PKG_MIN_GRU.read_text())
 
     main_lib = _without_main_block(main_tree)
@@ -192,7 +202,7 @@ def check_library_freeze() -> list[str]:
     if main_dump != pkg_dump:
         errors.append(
             "library freeze: src/mingru/min_gru.py executable content diverges "
-            "from `git show main:min_gru.py` beyond the permitted dispatch "
+            "from the frozen baseline (`FROZEN_BASELINE:min_gru.py`) beyond the permitted dispatch "
             "retarget + __main__ removal.\n" + _first_divergence(main_dump, pkg_dump)
         )
     return errors
@@ -206,7 +216,7 @@ def check_selftest_relocation(
     Parameters
     ----------
     main_ref : str
-        The ``git show`` path for the pre-move module, e.g. ``"main:min_gru.py"``.
+        The ``git show`` path for the pre-move module, e.g. ``f"{FROZEN_BASELINE}:min_gru.py"``.
     driver_path : Path
         The repo-root evidence driver to check, e.g. ``ROOT_MIN_GRU_DRIVER``.
     driver_name : str
@@ -246,7 +256,7 @@ def main() -> int:
     errors: list[str] = []
     errors += check_library_freeze()
     errors += check_selftest_relocation(
-        main_ref="main:min_gru.py",
+        main_ref=f"{FROZEN_BASELINE}:min_gru.py",
         driver_path=ROOT_MIN_GRU_DRIVER,
         driver_name="min_gru.py",
         # `import os` / `import torch` / `import torch.nn as nn` /
@@ -254,7 +264,7 @@ def main() -> int:
         header_import_count=4,
     )
     errors += check_selftest_relocation(
-        main_ref="main:triton_scans.py",
+        main_ref=f"{FROZEN_BASELINE}:triton_scans.py",
         driver_path=ROOT_TRITON_SCANS_DRIVER,
         driver_name="triton_scans.py",
         # `import torch` / `import torch.nn.functional as F` /
@@ -272,11 +282,11 @@ def main() -> int:
         return 1
 
     print("frozen-AST check OK:")
-    print("  (a) src/mingru/min_gru.py library frozen vs main (only the dispatch")
+    print("  (a) src/mingru/min_gru.py library frozen vs the pinned baseline (only the dispatch")
     print("      retarget + __main__ removal differ)")
-    print("  (b) root min_gru.py __main__ selftest relocated verbatim vs main")
+    print("  (b) root min_gru.py __main__ selftest relocated verbatim vs the pinned baseline")
     print("      (only the import header + module-name strings differ)")
-    print("  (c) root triton_scans.py __main__ selftest relocated verbatim vs main")
+    print("  (c) root triton_scans.py __main__ selftest relocated verbatim vs the pinned baseline")
     print("      (only the import header differs)")
     return 0
 
