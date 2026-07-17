@@ -30,7 +30,7 @@ Initial release of `mingru-scans`.
 - **Release tooling.** Docs deploy on push to main (`docs.yml`) and PyPI
   trusted-publishing on GitHub Release (`publish.yaml`); a `check_wheel.sh`
   wheel-and-install proof against a fresh venv; nox sessions (`lint`,
-  `freeze`, `test`, `doctests`, `evidence`, `wheel`, `build`, `docs`) as the
+  `freeze`, `test`, `doctests`, `evidence`, `wheel`, `gpu`, `build`, `docs`) as the
   local gate suite run before every release.
 - **Optional `[triton]` extra.** Unpinned convenience extra for CUDA-capable
   torch builds from channels that omit triton; torch's own Linux CUDA wheels
