@@ -3,6 +3,10 @@ name: publish
 # Build and publish mingru-scans to PyPI when a GitHub Release is published.
 # Uses PyPI trusted publishing (OIDC) -- no API tokens or secrets. Configure the
 # `pypi` environment as a trusted publisher on PyPI before the first release.
+#
+# The test job gates the upload: the release cannot publish unless the frozen-AST
+# gate and the full CPU suite pass via nox on the release ref. (There is no
+# separate per-push test workflow by design; this is the CI test gate.)
 
 on:
   release:
@@ -13,7 +17,22 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      UV_TORCH_BACKEND: cpu  # CPU torch wheel on the runner, not the CUDA build
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # freeze gate reads the pinned baseline commit via `git show`
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Frozen-AST gate + CPU test suite (nox)
+        run: uvx nox -s freeze test
+
   publish:
+    needs: test
     runs-on: ubuntu-latest
     environment:
       name: pypi
