@@ -45,9 +45,10 @@ nav = [
     ] },
 
     { "Explanation" = [
-        { "Overview"               = "explanation/index.md" },
-        { "GivensMinGRU deep dive" = "explanation/givens-mingru.md" },
-        { "Triton scan kernels"    = "explanation/triton-scans.md" },
+        { "Overview"                    = "explanation/index.md" },
+        { "Expressivity and the ladder" = "explanation/expressivity-ladder.md" },
+        { "GivensMinGRU deep dive"      = "explanation/givens-mingru.md" },
+        { "Triton scan kernels"         = "explanation/triton-scans.md" },
     ] },
 
     { "Slides" = "slides/index.md" },
