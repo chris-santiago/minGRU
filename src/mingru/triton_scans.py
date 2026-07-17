@@ -1,11 +1,10 @@
 """Triton kernels for `min_gru.py`'s four scan functions.
 
 Lazily imported by `min_gru._dispatch_scan` only (never at `min_gru.py`
-import time); see that function's docstring and the design spec
-(`.claude/output/specs/2026-07-16-triton-scan-kernels-design.md`) for the
-full dispatch contract. Development is GPU-blind locally (this module
-requires a CUDA device and Triton to do anything useful); correctness
-and benchmarks land on a cloud GPU.
+import time); see that function's docstring for the full dispatch
+contract. Development is GPU-blind locally (this module requires a CUDA
+device and Triton to do anything useful); correctness and benchmarks land
+on a cloud GPU.
 
 `min_gru.py`'s recorded lab evidence stays pinned to `torch==2.5.1` CPU
 and never imports this module. This module targets `torch>=2.8` (mature
@@ -13,40 +12,39 @@ and never imports this module. This module targets `torch>=2.8` (mature
 `ImportError` below that floor, rather than failing confusingly deep
 inside kernel registration.
 
-Tasks 2-3 (this module): the generic affine-scan FORWARD core (spec §5,
-Kernel 1) plus wrappers mapping three of the four scan ops onto it --
+Contents
+--------
+Forward cores (Kernel 1, Kernel 2). The generic affine-scan FORWARD core
+(Kernel 1) plus wrappers mapping three of the four scan ops onto it --
 `linear_scan` (k=1, channel-tiled), `matrix_scan` (k=2, v=1), and
 `matrix_affine_scan` (generic k, v) -- and the fused log-space FORWARD
-scan (spec §5, Kernel 2) for `parallel_scan_log` (channel-tiled lanes
-carrying a running log-coefficient cumsum plus an online max-shifted
-log-sum-exp accumulator, writing h = exp(.) directly). All four scan
-ops therefore have an entry in `SCAN_IMPLS`. Kernels accumulate in fp32
-regardless of input dtype and are registered via
-`torch.library.triton_op` so `torch.compile` sees them without graph
-breaks.
+scan (Kernel 2) for `parallel_scan_log` (channel-tiled lanes carrying a
+running log-coefficient cumsum plus an online max-shifted log-sum-exp
+accumulator, writing h = exp(.) directly). All four scan ops therefore
+have an entry in `SCAN_IMPLS`. Kernels accumulate in fp32 regardless of
+input dtype and are registered via `torch.library.triton_op` so
+`torch.compile` sees them without graph breaks.
 
-Task 4 (this module): BACKWARD, making every Triton path trainable
-(spec §5 Kernel 3, §6 adjoint recurrences). The generic core's adjoint
-is one reverse-direction scan (`_affine_scan_bwd_kernel`) that reads
-ONLY the forward's inputs and outputs -- it reverse-scans the incoming
-output grads with A_{t+1}^T, then forms dL/dA_t from the forward outputs
-Abar_{t-1}/Bbar_{t-1} (seeded with I/0 at t=1) and dL/dB_t directly.
-That zero-extra-saved-tensors property is the point of the reversed-scan
-design. `linear_scan` gets the channel-tiled k=1 specialization
-(`_linear_scan_bwd_kernel`); `matrix_scan`/`matrix_affine_scan` share
-the generic kernel through the same unsqueeze/`affine_scan_fwd` seam as
-the forward. `parallel_scan_log`'s backward is autograd-through-
-recomputation: it saves only its two forward INPUTS (log_coeffs,
-log_values) and re-derives the grad through the eager log-space math
-(exact-to-eager, no hand-derived log-space adjoint kernel to get wrong
-blind) -- also zero extra saved tensors beyond the forward inputs. All
-four ops are wired via `torch.library.register_autograd` on their
-forward `triton_op` (the torch 2.8-idiomatic route for a `triton_op`:
-the backward composes with `torch.compile`'s tracing and dispatcher,
-which an `autograd.Function` wrapper around the op would not).
+Backward cores (Kernel 3, adjoint recurrences). Every Triton path is
+trainable. The generic core's adjoint is one reverse-direction scan
+(`_affine_scan_bwd_kernel`) that reads ONLY the forward's inputs and
+outputs -- it reverse-scans the incoming output grads with A_{t+1}^T,
+then forms dL/dA_t from the forward outputs Abar_{t-1}/Bbar_{t-1} (seeded
+with I/0 at t=1) and dL/dB_t directly. That zero-extra-saved-tensors
+property is the point of the reversed-scan design. `linear_scan` gets the
+channel-tiled k=1 specialization (`_linear_scan_bwd_kernel`);
+`matrix_scan`/`matrix_affine_scan` share the generic kernel through the
+same unsqueeze/`affine_scan_fwd` seam as the forward. `parallel_scan_log`'s
+backward is autograd-through-recomputation: it saves only its two forward
+INPUTS (log_coeffs, log_values) and re-derives the grad through the eager
+log-space math (exact-to-eager, no hand-derived log-space adjoint kernel
+to get wrong blind) -- also zero extra saved tensors beyond the forward
+inputs. All four ops are wired via `torch.library.register_autograd` on
+their forward `triton_op` (the torch 2.8-idiomatic route for a
+`triton_op`: the backward composes with `torch.compile`'s tracing and
+dispatcher, which an `autograd.Function` wrapper around the op would not).
 
-Task 5 (this module): the angle-fused Kernel 4 (spec §5 K4, §6 reversal
-rule, amended in "Fix round 2") -- `angle_scan_fwd`/`angle_scan_bwd`, a
+Angle-fused path (Kernel 4). `angle_scan_fwd`/`angle_scan_bwd`, a
 module-level fast path (not one of the four scan ops) that `GivensMinGRU`
 and `RotationMinGRU` route their forwards through on CUDA. The forward
 carries the state vector in registers and applies factored plane
@@ -56,22 +54,20 @@ recomputation (every `h_{t-1}` read from the forward output, never
 reconstructed by inverting the forward step) accumulating the grads of
 the angles, scale channel, injection, decay, and h0. It is generic over
 (block size, rounds, scale channel): Givens (k=8, `rounds`, no per-block
-scale) and Rotation (k=2, one plane, post-snap angles, tanh(u) scale). An
-earlier design let the backward divide by `gamma`/`tanh(u)` to reverse
-across a multi-step checkpoint chunk; a blind CPU probe showed that
-division amplifies roundoff by roughly `sigma_min^{-chunklen}`, blowing
-past the grad tolerance even at ordinary decay/init strengths (including
-`GivensMinGRU`'s class-default `decay_rate=1.0`) -- the user's ruling
-rejected division-based reversal entirely, so BOTH mixers now use exact
-per-step recompute and no interval parameter exists to re-enable it (see
-the Task-5 report, "Fix round 2"). Registered via
-`torch.library.register_autograd` like the four scan ops.
+scale) and Rotation (k=2, one plane, post-snap angles, tanh(u) scale).
+Division-based reversal across a multi-step checkpoint chunk (dividing the
+backward by `gamma`/`tanh(u)`) is deliberately NOT used: a blind CPU probe
+showed that division amplifies roundoff by roughly `sigma_min^{-chunklen}`,
+blowing past the grad tolerance even at ordinary decay/init strengths
+(including `GivensMinGRU`'s class-default `decay_rate=1.0`), so BOTH mixers
+use exact per-step recompute and no interval parameter exists to re-enable
+division-based reversal. Registered via `torch.library.register_autograd`
+like the four scan ops.
 
-Envelope (spec §4): k, v in {1, 2, 4, 8, 16}, any T >= 1 including
-non-power-of-two. Out-of-envelope shapes raise `ScanFallback`, which
-`min_gru._dispatch_scan` turns into a loud eager fallback under `auto`
-(and a raised error under `triton`) -- never a wrong result, never a
-crash.
+Envelope: k, v in {1, 2, 4, 8, 16}, any T >= 1 including non-power-of-two.
+Out-of-envelope shapes raise `ScanFallback`, which `min_gru._dispatch_scan`
+turns into a loud eager fallback under `auto` (and a raised error under
+`triton`) -- never a wrong result, never a crash.
 """
 
 import contextlib
@@ -125,14 +121,14 @@ class ScanFallback(Exception):
     """
 
 
-# Kernel envelope for the state block size ``k`` and injection width ``v``
-# (spec §4). All members are powers of two, so the kernels tile ``k``/``v``
-# exactly with no masking; a shape outside this set raises ``ScanFallback``.
+# Kernel envelope for the state block size ``k`` and injection width ``v``.
+# All members are powers of two, so the kernels tile ``k``/``v`` exactly
+# with no masking; a shape outside this set raises ``ScanFallback``.
 _ENVELOPE = frozenset({1, 2, 4, 8, 16})
 
 # Channel-tile width for the two elementwise-in-D kernels (`linear_scan`
 # and `parallel_scan_log`): each program walks the full T sequence for
-# BLOCK_D channels at once, keeping lanes wide (spec §5). A safe default;
+# BLOCK_D channels at once, keeping lanes wide. A safe default;
 # the cloud benchmark phase may autotune it.
 _LINEAR_BLOCK_D = 128
 
@@ -305,7 +301,7 @@ if _HAS_TRITON:
             a = tl.load(A_ptrs).to(tl.float32)  # (k, k) = A_t, indexed [i, p]
             bt = tl.load(B_ptrs).to(tl.float32)  # (k, v) = B_t
 
-            # Composition order A_current @ A_earlier (spec §6):
+            # Composition order A_current @ A_earlier:
             #   Abar_t[i, j] = sum_p A_t[i, p] * Abar_{t-1}[p, j]
             #   Bbar_t[i, j] = sum_p A_t[i, p] * Bbar_{t-1}[p, j] + B_t[i, j]
             # See the auto-MMA / TF32 note above: the (k, k, k) Abar product
@@ -387,7 +383,7 @@ if _HAS_TRITON:
         D,
         BLOCK_D: tl.constexpr,
     ):
-        """Channel-tiled fused log-space scan (spec §5, Kernel 2).
+        """Channel-tiled fused log-space scan (Kernel 2).
 
         Solves ``h_t = a_t * h_{t-1} + b_t`` in log space (Heinsen 2023),
         given ``log_coeffs = log(a_t)`` ``(B, T, D)`` and ``log_values``
@@ -462,13 +458,13 @@ if _HAS_TRITON:
         k: tl.constexpr,
         v: tl.constexpr,
     ):
-        """Reverse-direction adjoint of the generic affine prefix scan (spec §6).
+        """Reverse-direction adjoint of the generic affine prefix scan.
 
         The exact backward of ``_affine_scan_fwd_kernel``. For the forward
         recurrence ``Abar_t = A_t @ Abar_{t-1}`` (``Abar_0 = I``) and
         ``Bbar_t = A_t @ Bbar_{t-1} + B_t`` (``Bbar_0 = 0``), with incoming
         output grads ``G^A_t = dL/dAbar_t`` and ``G^B_t = dL/dBbar_t``, the
-        adjoint is (spec §6)::
+        adjoint recurrence is::
 
             Ghat^A_t = G^A_t + A_{t+1}^T @ Ghat^A_{t+1}   (reverse scan)
             Ghat^B_t = G^B_t + A_{t+1}^T @ Ghat^B_{t+1}   (Ghat_{T+1} = 0)
@@ -682,7 +678,7 @@ if _HAS_TRITON:
         HAS_SCALE: tl.constexpr,
         HAS_DECAY: tl.constexpr,
     ):
-        """Angle-fused forward recurrence for one (batch, block) lane (spec §5 K4).
+        """Angle-fused forward recurrence for one (batch, block) lane (Kernel 4).
 
         Carries the state ``h`` (a ``k``-vector) in registers across the whole
         T sequence, applying per step the per-block scale (rotation: multiply
@@ -774,7 +770,7 @@ if _HAS_TRITON:
         HAS_SCALE: tl.constexpr,
         HAS_DECAY: tl.constexpr,
     ):
-        """Exact stored-state reversible backward of ``_angle_scan_fwd_kernel`` (spec §6).
+        """Exact stored-state reversible backward of ``_angle_scan_fwd_kernel``.
 
         One program owns a ``(b, n)`` lane and walks ``t = T .. 1``, carrying
         the state adjoint ``ghat`` (the future steps' contribution to
@@ -920,7 +916,7 @@ if _HAS_TRITON:
     def affine_scan_fwd(
         A: torch.Tensor, Bm: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Generic k x k affine prefix scan (spec §5, Kernel 1).
+        """Generic k x k affine prefix scan (Kernel 1).
 
         ``A`` is ``(B, T, n, k, k)``, ``Bm`` is ``(B, T, n, k, v)``. Returns
         ``(Abar, Bbar)`` with the same shapes, where ``Abar_t`` is the
@@ -947,7 +943,7 @@ if _HAS_TRITON:
     def linear_scan_fwd(
         a: torch.Tensor, b: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Channel-tiled k=1 affine prefix scan (spec §5, Kernel 1).
+        """Channel-tiled k=1 affine prefix scan (Kernel 1).
 
         ``a`` and ``b`` are ``(B, T, D)``. Returns ``(A, Bc)`` of the same
         shape, where ``A_t`` is the running product of ``a`` and ``Bc_t``
@@ -967,7 +963,7 @@ if _HAS_TRITON:
     def parallel_scan_log_fwd(
         log_coeffs: torch.Tensor, log_values: torch.Tensor
     ) -> torch.Tensor:
-        """Fused log-space forward scan (spec §5, Kernel 2).
+        """Fused log-space forward scan (Kernel 2).
 
         ``log_coeffs`` is ``(B, T, D)`` and ``log_values`` is ``(B, T+1,
         D)`` (slot 0 = ``log(h_0)``, slots ``1..T`` = ``log(b_t)``).
@@ -996,7 +992,7 @@ if _HAS_TRITON:
         gAbar: torch.Tensor,
         gBbar: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Generic k x k affine-scan adjoint (spec §5 Kernel 3, §6).
+        """Generic k x k affine-scan adjoint (Kernel 3).
 
         Reads the forward input ``A`` ``(B, T, n, k, k)`` and the forward
         outputs ``Abar`` ``(B, T, n, k, k)`` / ``Bbar`` ``(B, T, n, k, v)``,
@@ -1031,7 +1027,7 @@ if _HAS_TRITON:
         gA: torch.Tensor,
         gBc: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Channel-tiled k=1 affine-scan adjoint (spec §6).
+        """Channel-tiled k=1 affine-scan adjoint.
 
         Reads the forward input ``a`` ``(B, T, D)`` and outputs ``A`` /
         ``Bc`` ``(B, T, D)``, plus incoming grads ``gA`` / ``gBc``. Returns
@@ -1052,7 +1048,7 @@ if _HAS_TRITON:
         )
         return da, db
 
-    # --- Autograd registration (spec §5 Kernel 3; torch 2.8 route) ----------
+    # --- Autograd registration (Kernel 3; torch 2.8 route) ----------
     #
     # `torch.library.register_autograd` on each forward `triton_op` is the
     # idiomatic torch 2.8 way to make a `triton_op` differentiable: the
@@ -1225,7 +1221,7 @@ if _HAS_TRITON:
         has_scale: int,
         has_decay: int,
     ) -> torch.Tensor:
-        """Angle-fused forward (spec §5 Kernel 4). Returns states ``h`` ``(B,T,n,k)``.
+        """Angle-fused forward (Kernel 4). Returns states ``h`` ``(B,T,n,k)``.
 
         Same traced-body fake-meta contract as the scan ops (``.contiguous`` +
         ``empty_like`` + one ``wrap_triton`` launch), so ``torch.compile`` sees
@@ -1266,7 +1262,7 @@ if _HAS_TRITON:
     ) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
     ]:
-        """Angle-fused exact stored-state reversible backward (spec §6).
+        """Angle-fused exact stored-state reversible backward.
 
         Reads the forward inputs, the forward output ``out`` (the source of
         every ``h_{t-1}``), and the incoming state grads ``grad_out``. Returns
@@ -1585,7 +1581,7 @@ if _HAS_TRITON:
     ]
 
 
-# --- Forward-parity selftest (spec §9.1, §10) -------------------------------
+# --- Forward-parity selftest -------------------------------
 #
 # Runs only when CUDA + Triton are present; otherwise skips LOUDLY (prints
 # the reason, exits 0) -- a vacuous pass is a bug. The reference is always
@@ -1703,7 +1699,7 @@ def _matrix_affine_scan_inputs(
     return A, Bm
 
 
-# Shape matrix shared by both parity sweeps (spec §9.1): T=1 exercises a
+# Shape matrix shared by both parity sweeps: T=1 exercises a
 # program that never traverses the loop-increment path (a single timestep);
 # the rest covers non-power-of-two lengths and the long-T end. Defined once
 # so ``_run_forward_parity`` and ``_run_grad_parity`` cannot silently diverge.
@@ -1712,12 +1708,12 @@ _PARITY_BS = (2, 128)
 
 
 def _run_forward_parity(collect: list[dict] | None = None) -> int:
-    """Run the §9.1 forward-parity matrix; return process exit code.
+    """Run the forward-parity matrix; return process exit code.
 
     ``collect``, when not ``None``, is a caller-owned list that this sweep
     APPENDS one row dict to per GATED case (never the informational bf16
     rows, which have no pass/fail verdict) -- the parity-conformance
-    artifact seam (Task 7 follow-up). Defaults to ``None`` so
+    artifact seam. Defaults to ``None`` so
     ``python triton_scans.py``'s own selftest invocation (and any other
     caller that doesn't pass it) is byte-identical to before this seam
     existed: nothing is collected, nothing else changes.
@@ -1732,14 +1728,14 @@ def _run_forward_parity(collect: list[dict] | None = None) -> int:
 
 
 def _run_forward_parity_body(collect: list[dict] | None = None) -> int:
-    """The §9.1 forward-parity sweep itself; see ``_run_forward_parity``."""
+    """The forward-parity sweep itself; see ``_run_forward_parity``."""
     from mingru import min_gru
 
     device = "cuda"
     torch.manual_seed(0)
-    # Flat spec bound (design spec §7 / plan constraints): outputs <= 1e-5
-    # for fp32. rtol=0 so this is exactly max_abs_err <= atol, not a looser
-    # relative gate -- do not reintroduce a nonzero rtol here.
+    # Flat conformance bound: outputs <= 1e-5 for fp32. rtol=0 so this is
+    # exactly max_abs_err <= atol, not a looser relative gate -- do not
+    # reintroduce a nonzero rtol here.
     atol, rtol = 1e-5, 0.0
     Ts, Bs = _PARITY_TS, _PARITY_BS
 
@@ -1760,7 +1756,7 @@ def _run_forward_parity_body(collect: list[dict] | None = None) -> int:
         error is reported as a per-case failure (loud, but not aborting the
         whole sweep) rather than a bare traceback.
 
-        ``case_atol``/``case_rtol`` default to the flat spec bound
+        ``case_atol``/``case_rtol`` default to the flat conformance bound
         (``atol=1e-5, rtol=0``) that governs the affine ops; a case may
         override them where that flat bound is not physically meetable in
         fp32 (see the ``parallel_scan_log`` section for the log-space
@@ -1820,8 +1816,8 @@ def _run_forward_parity_body(collect: list[dict] | None = None) -> int:
     # fp32 kernel can match a co-noisy fp32 reference to 1e-5 at that
     # length. The gate therefore uses the mixed (atol=1e-4, rtol=1e-4)
     # bound -- the same tolerance min_gru.py's own parallel-scan parity
-    # self-tests use, which spec §7 cites as "matching existing selftest
-    # standards" -- so it still catches any real kernel defect (off by
+    # self-tests use, matching those existing selftest standards -- so it
+    # still catches any real kernel defect (off by
     # O(1), a shifted index, a dropped term) while honoring fp32 physics.
     _LOG_SCAN_ATOL, _LOG_SCAN_RTOL = 1e-4, 1e-4
     print("parallel_scan_log (log-space, elementwise in D):")
@@ -1869,7 +1865,7 @@ def _run_forward_parity_body(collect: list[dict] | None = None) -> int:
             A, Bm = _matrix_affine_scan_inputs(B, T, n, k, v, device)
             check("matrix_affine_scan", f"B={B} T={T} n={n} k={k} v={v}", A, Bm)
 
-    print("bf16-input rows (informational, spec §9.1):")
+    print("bf16-input rows (informational):")
     B, T = 2, 64
     lc32, lv32 = _log_space_inputs(B, T, 64, device)
     check(
@@ -1910,13 +1906,13 @@ def _run_forward_parity_body(collect: list[dict] | None = None) -> int:
 
 
 def _run_grad_parity(collect: list[dict] | None = None) -> int:
-    """Run the §9.1 gradient-parity matrix; return process exit code.
+    """Run the gradient-parity matrix; return process exit code.
 
-    For every op the Triton path is now differentiable (Task 4:
-    ``register_autograd`` on each forward ``triton_op``). This sweep drives
+    For every op the Triton path is differentiable
+    (``register_autograd`` on each forward ``triton_op``). This sweep drives
     a scalar loss ``sum(cotangent * output)`` through both the Triton path
     and the eager reference on identical inputs and identical cotangents,
-    then compares the resulting INPUT gradients. The gate is the plan's
+    then compares the resulting INPUT gradients. The gate is the
     parameter-grad bound (``atol=1e-3``); it exercises the reversed-scan
     adjoint kernels (affine, k=1) and the log op's recompute backward.
 
@@ -1932,7 +1928,7 @@ def _run_grad_parity(collect: list[dict] | None = None) -> int:
 
 
 def _run_grad_parity_body(collect: list[dict] | None = None) -> int:
-    """The §9.1 gradient-parity sweep itself; see ``_run_grad_parity``."""
+    """The gradient-parity sweep itself; see ``_run_grad_parity``."""
     from mingru import min_gru
 
     device = "cuda"
@@ -2055,7 +2051,7 @@ def _run_grad_parity_body(collect: list[dict] | None = None) -> int:
 
 
 def _run_angle_fused_parity(collect: list[dict] | None = None) -> int:
-    """Module-level output+grad parity for the angle-fused path (spec §9.2).
+    """Module-level output+grad parity for the angle-fused path.
 
     ``collect``: see ``_run_forward_parity`` -- same optional append-only
     parity-conformance-artifact seam, same ``None``-default no-op contract.
@@ -2111,7 +2107,7 @@ def _run_angle_fused_parity_body(collect: list[dict] | None = None) -> int:
     # this bound still catches a real kernel defect (an O(1) sign/index
     # error, a dropped term) while honoring fp32 physics for the one
     # genuinely unbounded-magnitude gradient. User-ratified 2026-07-16
-    # (Task 7 cloud validation), same precedent as parallel_scan_log's
+    # (cloud validation), same precedent as parallel_scan_log's
     # forward gate (see ``_run_forward_parity``).
     out_atol = 1e-5
     grad_atol, grad_rtol = 1e-3, 1e-3

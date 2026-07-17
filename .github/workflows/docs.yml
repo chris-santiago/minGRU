@@ -23,11 +23,15 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: actions/configure-pages@v6
-      - uses: actions/setup-python@v6
+      - uses: astral-sh/setup-uv@v6
         with:
-          python-version: 3.x
-      - run: pip install zensical mkdocstrings mkdocstrings-python
-      - run: zensical build --clean
+          python-version: "3.12"
+      # Pinned docs toolchain from pyproject's `docs` group. `--only-group`
+      # installs just those tools (no project, no torch): griffe reads the
+      # src-layout package statically, so the API reference renders without
+      # importing mingru.
+      - name: Build the docs site (pinned docs toolchain)
+        run: uv run --only-group docs zensical build --clean
       - uses: actions/upload-pages-artifact@v5
         with:
           path: site

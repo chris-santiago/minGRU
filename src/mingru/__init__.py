@@ -38,22 +38,14 @@ from .min_gru import __all__ as _min_gru_all
 
 __version__ = "0.1.0"
 
-# Names of :mod:`mingru.triton_scans` reachable lazily via `__getattr__`.
-# Listed statically (rather than read off the module's ``__all__``) so that
-# ``import mingru`` need not import the Triton module to resolve this tuple --
-# the whole point of the PEP 562 lazy path. All eleven are deliberately
-# excluded from ``__all__`` below: resolving any of them imports
-# :mod:`mingru.triton_scans`, and that import raises ``ImportError`` below the
-# module's torch>=2.8 floor (the torch==2.5.1 evidence pin) -- a failure mode
-# ``__all__``/``__dir__``/``from mingru import *`` must never trigger. Only
-# the first three (``available``/``ScanFallback``/``SCAN_IMPLS``) are defined
-# unconditionally in ``triton_scans`` and so resolve on every torch>=2.8
-# install; the remaining eight (the raw kernel wrappers) are defined only
-# under that module's ``if _HAS_TRITON:`` block and raise ``AttributeError``
-# -- not ``ImportError`` -- via `getattr` below on a torch>=2.8 install
-# without a working Triton (e.g. macOS, Windows, or Linux CPU-only). Each
-# name still resolves individually via `mingru.<name>` attribute access where
-# its platform requirements are met.
+# Names of :mod:`mingru.triton_scans` reachable lazily via `__getattr__`,
+# listed statically so resolving this tuple need not import the Triton module
+# (the point of the PEP 562 lazy path). All are deliberately kept out of
+# ``__all__`` below; the module docstring above is the authoritative account
+# of why, and of the per-platform resolution rules. In short: the first three
+# (``available``/``ScanFallback``/``SCAN_IMPLS``) are unconditional on
+# torch>=2.8, the remaining eight (raw kernel wrappers) additionally require a
+# working Triton install.
 _TRITON_EXPORTS = (
     "available",
     "ScanFallback",

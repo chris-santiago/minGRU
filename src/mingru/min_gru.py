@@ -91,10 +91,10 @@ Decay = Literal["fixed", "learnable"] | None
 #       imported.
 #   "triton" -- always a Triton kernel; raises rather than silently
 #       falling back to eager if one isn't available.
-# See triton_scans.py and the design spec
-# (.claude/output/specs/2026-07-16-triton-scan-kernels-design.md) §4 for
-# the full contract. triton_scans is imported lazily, only from within
-# this function, so importing/running min_gru.py never attempts it.
+# See the ``mingru.triton_scans`` module docstring (and the project docs
+# site) for the full dispatch contract and shape envelope. triton_scans is
+# imported lazily, only from within this function, so importing/running
+# min_gru.py never attempts it.
 #
 # Disclosure: for `parallel_scan_log` specifically (the `MinGRU`/
 # `SignedMinGRU` path), "auto" routing the fwd+bwd of a training step to
@@ -792,7 +792,7 @@ class DecayMixin:
             ``"learnable"``; or if decay is enabled and ``decay_rate <=
             0``. ``lambda`` must be strictly positive in both modes for
             ``gamma = exp(-lambda * f(delta_t)) in (0, 1]`` to hold for
-            all ``delta_t >= 0`` (spec §7): a non-positive fixed
+            all ``delta_t >= 0``: a non-positive fixed
             ``decay_rate`` is used directly as ``lambda`` and would let
             ``gamma`` reach or exceed 1 (amplification); a non-positive
             ``decay_rate`` in learnable mode has no valid ``rho``

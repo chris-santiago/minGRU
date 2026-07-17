@@ -34,6 +34,15 @@ dev = [
     "pytest>=8",
     "ruff>=0.6",
 ]
+# Documentation toolchain, pinned to the versions the site currently builds
+# with. griffe reads the src-layout package statically (see zensical.toml), so
+# this group needs neither the project nor torch installed to render the API
+# reference.
+docs = [
+    "zensical==0.0.43",
+    "mkdocstrings==1.0.6",
+    "mkdocstrings-python==2.0.5",
+]
 
 [tool.hatch.version]
 path = "src/mingru/__init__.py"

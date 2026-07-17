@@ -12,6 +12,9 @@ Sections
 4. Lazy Triton import -- ``import mingru`` leaves the Triton module out of
    sys.modules; touching a Triton name pulls it in
 5. Driver re-export identity -- ``min_gru.X is mingru.min_gru.X``
+6. Triton ``__all__`` drift guard -- the one place we import
+   ``mingru.triton_scans`` directly, to hold ``mingru._TRITON_EXPORTS`` and
+   ``triton_scans.__all__`` in sync
 """
 
 from __future__ import annotations
@@ -30,21 +33,11 @@ from mingru import min_gru as packaged_min_gru
 SEED = 42
 
 _SRC_DIR = Path(__file__).resolve().parent.parent / "src"
-# The eleven Triton-backed names must stay lazy: none may appear in the
-# eager public surface.
-_TRITON_NAMES = (
-    "available",
-    "ScanFallback",
-    "SCAN_IMPLS",
-    "angle_scan_impl",
-    "affine_scan_fwd",
-    "linear_scan_fwd",
-    "parallel_scan_log_fwd",
-    "affine_scan_bwd",
-    "linear_scan_bwd",
-    "angle_scan_fwd",
-    "angle_scan_bwd",
-)
+# The Triton-backed names must stay lazy: none may appear in the eager public
+# surface. Read off the package's own registry (rather than hand-copied here)
+# so this test and ``mingru._TRITON_EXPORTS`` cannot silently drift apart;
+# ``TestTritonAllDriftGuard`` closes the loop back to ``triton_scans.__all__``.
+_TRITON_NAMES = mingru._TRITON_EXPORTS
 
 
 # ===========================================================================
@@ -165,3 +158,34 @@ class TestDriverIdentity:
         import min_gru as driver
 
         assert list(driver.__all__) == list(packaged_min_gru.__all__)
+
+
+# ===========================================================================
+# 6. Triton __all__ drift guard
+# ===========================================================================
+
+
+class TestTritonAllDriftGuard:
+    """Import ``mingru.triton_scans`` directly and pin it to ``_TRITON_EXPORTS``.
+
+    This is the ONE legitimate place in the suite to import the Triton module
+    eagerly: the test exists precisely to guard ``mingru._TRITON_EXPORTS`` (the
+    hand-maintained lazy registry that every other name check derives from)
+    against drifting from ``triton_scans.__all__`` (the module's own export
+    list). Every other test keeps the module lazy (see ``TestLazyImport``).
+
+    Requires torch>=2.8, under which ``mingru.triton_scans`` imports on every
+    platform. Whether a local Triton install is present only changes
+    ``triton_scans.__all__`` between its three unconditional names and the full
+    eleven; both cases must satisfy the invariants below.
+    """
+
+    def test_triton_all_is_subset_of_exports(self):
+        from mingru import triton_scans
+
+        assert set(triton_scans.__all__) <= set(mingru._TRITON_EXPORTS)
+
+    def test_unconditional_names_always_exported(self):
+        from mingru import triton_scans
+
+        assert {"available", "ScanFallback", "SCAN_IMPLS"} <= set(triton_scans.__all__)
