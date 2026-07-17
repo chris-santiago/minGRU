@@ -4,7 +4,7 @@ PyTorch implementation of the minGRU from Feng, Tung, Ahmed, Bengio &
 Hajimirsadeghi, *Were RNNs All We Needed?* (arXiv:2410.01201) — a recurrent
 layer whose gates depend only on the current input, so the whole sequence
 trains in one parallel scan instead of step-by-step backpropagation through
-time (BPTT). Single file, no dependencies beyond `torch`.
+time (BPTT). The library is the `mingru` package (pip name `mingru-scans`); pure PyTorch, no dependencies beyond `torch`.
 
 This repo ships the base minGRU plus three variants that each fix a specific
 gap in it: **`SignedMinGRU`** (state can flip sign, not just decay toward
@@ -35,7 +35,13 @@ x = torch.randn(4, 10, 32)
 y, state = stack(x)   # (B, T, 32) -> (B, T, 256), per-block states
 ```
 
-The optional Triton scan backend is imported lazily on first use of a Triton-backed symbol, so `import mingru` works on CPU-only installs; the `MINGRU_SCAN` control and GPU path are documented on the docs site. Full documentation, including the GivensGRU and Triton-scans deep dives, lives at <https://chris-santiago.github.io/minGRU/>.
+The optional Triton scan backend is imported lazily on first use of a Triton-backed symbol, so `import mingru` works on CPU-only installs; the `MINGRU_SCAN` control and GPU path are documented on the docs site. On Linux the default PyPI torch bundles the matching Triton automatically; if your CUDA-capable torch came without it (`mingru.available()` reports this), `pip install "mingru-scans[triton]"` is an unpinned fallback. Full documentation, including the GivensGRU and Triton-scans deep dives, lives at <https://chris-santiago.github.io/minGRU/>.
+
+## GPU acceleration (fused Triton kernels)
+
+An optional Triton backend supplies fused forward+backward GPU kernels for all four scan primitives (`linear_scan`, `matrix_scan`, `matrix_affine_scan`, `parallel_scan_log`) plus an angle-fused rotation path for `GivensMinGRU`. It sits behind a zero-config dispatch seam set by `MINGRU_SCAN`: `auto` (default: use Triton when a CUDA GPU and a working Triton install are present, else the pure-PyTorch eager path), `eager`, or `triton` (force it). CPU-only installs never import Triton.
+
+The win is concentrated in the matrix/block ops. Measured on an NVIDIA L4 (torch 2.8.0+cu128, Triton 3.4.0), forward+backward the Triton kernels run 39x–168x faster than eager on `matrix_scan`/`matrix_affine_scan`, and the angle-fused `GivensMinGRU` backward cuts peak memory from 395 MB to 38 MB. The log-space `parallel_scan_log` is the exception. Its recompute-in-backward kernel is 0.70x–0.80x *slower* than eager forward+backward, so eager stays the right default for the baseline `MinGRU`/`SignedMinGRU` mixers. All 590 CPU-vs-GPU parity checks pass. Kernel design and the full benchmark tables are in the [Triton scan kernels explanation](https://chris-santiago.github.io/minGRU/explanation/triton-scans/) and `experiments/bench/` (`scan_bench.md`, `scan_memory.md`, `scan_parity.md`).
 
 ## What this shows
 
@@ -245,7 +251,7 @@ block; `mixer_kwargs` keyed by type instead of flat):
 
 ```python
 import torch
-from min_gru import MinGRUStack
+from mingru import MinGRUStack
 
 hetero_stack = MinGRUStack(
     32, 256, n_layers=2, mixer=["signed", "rotation"],
@@ -331,7 +337,7 @@ All exposed state is **real hidden state** — an output of `forward()` or
   axis collapses reflections onto rotations.
 
 The full derivation and code path for each rule above is in the
-corresponding docstrings in `min_gru.py` (`forward`, `step`, `log_g`).
+corresponding docstrings in the `mingru` package (`forward`, `step`, `log_g`).
 
 ## Implementation notes
 
@@ -1134,7 +1140,7 @@ time-decayed RNNs commonly make them differently:
    first one.
 
 ```python
-from min_gru import MinGRUStack
+from mingru import MinGRUStack
 import torch
 
 stack = MinGRUStack(
