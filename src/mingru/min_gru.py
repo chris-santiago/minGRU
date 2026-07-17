@@ -38,6 +38,12 @@ states, and the MLP provides cross-channel interaction that a diagonal
 scan cannot. `MinGRUStack` stacks N blocks under a single `mixer`
 selection and supports both parallel training-mode forward and
 O(1)-memory streaming via step().
+
+References
+----------
+Feng et al., "Were RNNs All We Needed?", arXiv:2410.01201.
+Heinsen (2023) -- the log-space parallel scan used by the log-space
+minGRU's parallel training-mode forward.
 """
 
 import math
@@ -489,6 +495,22 @@ def parallel_scan_log(log_coeffs: torch.Tensor, log_values: torch.Tensor) -> tor
     -------
     torch.Tensor
         Shape ``(B, T, D)``. The states ``h_1..h_T``.
+
+    References
+    ----------
+    Heinsen (2023), "Efficient Parallelization of a Ubiquitous Sequential
+    Computation" -- the log-space cumulative-sum / logcumsumexp scan.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from mingru import parallel_scan_log
+    >>> B, T, D = 2, 5, 3
+    >>> log_coeffs = -torch.rand(B, T, D)          # log(a_t), a_t in (0, 1)
+    >>> log_values = -torch.rand(B, T + 1, D)      # log(h_0) and log(b_t)
+    >>> h = parallel_scan_log(log_coeffs, log_values)
+    >>> tuple(h.shape)
+    (2, 5, 3)
     """
     result = _dispatch_scan("parallel_scan_log", log_coeffs, log_values)
     if result is not None:
@@ -922,6 +944,24 @@ class MinGRU(DecayMixin, nn.Module):
     non-negative values; the courtesy warning about them is CPU-only
     (silent on CUDA, avoiding a host sync) — the sanitizing clamp
     itself always applies, on every device.
+
+    References
+    ----------
+    Feng et al., "Were RNNs All We Needed?", arXiv:2410.01201.
+    Heinsen (2023) -- the log-space parallel scan used by ``forward``.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from mingru import MinGRU
+    >>> layer = MinGRU(input_size=32, hidden_size=64)
+    >>> x = torch.randn(4, 128, 32)
+    >>> h = layer(x)                       # parallel training-mode forward
+    >>> tuple(h.shape)
+    (4, 128, 64)
+    >>> h_t = layer.step(x[:, 0])          # one O(1)-memory streaming step
+    >>> tuple(h_t.shape)
+    (4, 64)
     """
 
     def __init__(
@@ -1117,6 +1157,16 @@ def linear_scan(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.T
     this repo targets (probes train at T=64), and no stable
     ``torch.associative_scan`` primitive exists to lean on. Revisit for
     long-sequence training.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from mingru import linear_scan
+    >>> a = torch.rand(2, 5, 3) * 2 - 1        # a_t in (-1, 1), signed
+    >>> b = torch.randn(2, 5, 3)
+    >>> A, Bc = linear_scan(a, b)
+    >>> tuple(A.shape), tuple(Bc.shape)
+    ((2, 5, 3), (2, 5, 3))
     """
     result = _dispatch_scan("linear_scan", a, b)
     if result is not None:
@@ -1175,6 +1225,17 @@ def matrix_scan(M: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.T
     O(log T) full ``(B, T, n, 2, 2)`` tensors for autograd. Fine at
     the short training lengths this repo targets (probes train at
     T=64); revisit for long-sequence training.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from mingru import matrix_scan
+    >>> B, T, n = 2, 5, 4
+    >>> M = torch.eye(2).expand(B, T, n, 2, 2)     # identity transitions
+    >>> b = torch.randn(B, T, n, 2)
+    >>> A, Bc = matrix_scan(M, b)
+    >>> tuple(A.shape), tuple(Bc.shape)
+    ((2, 5, 4, 2, 2), (2, 5, 4, 2))
     """
     result = _dispatch_scan("matrix_scan", M, b)
     if result is not None:
@@ -1243,6 +1304,17 @@ def matrix_affine_scan(
     a distinct helper beside ``matrix_scan`` (rather than a
     generalization of it) so the recorded 2x2 rotation evidence's
     floating-point path is preserved byte-for-byte.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from mingru import matrix_affine_scan
+    >>> B, T, n, k, v = 2, 5, 4, 8, 1
+    >>> A = torch.eye(k).expand(B, T, n, k, k)     # identity transitions
+    >>> Bm = torch.randn(B, T, n, k, v)
+    >>> Abar, Bbar = matrix_affine_scan(A, Bm)
+    >>> tuple(Abar.shape), tuple(Bbar.shape)
+    ((2, 5, 4, 8, 8), (2, 5, 4, 8, 1))
     """
     result = _dispatch_scan("matrix_affine_scan", A, Bm)
     if result is not None:
@@ -1350,6 +1422,22 @@ class SignedMinGRU(DecayMixin, nn.Module):
     to finite, non-negative values; the courtesy warning about them is
     CPU-only (silent on CUDA, avoiding a host sync) — the sanitizing
     clamp itself always applies, on every device.
+
+    References
+    ----------
+    Merrill, Petty & Sabharwal (2024) -- expressivity gains from signed
+    (negative-eigenvalue) diagonal linear recurrences.
+    Grazzi et al. (2025) -- sign-alternation / parity dynamics enabled by
+    negative transition eigenvalues.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from mingru import SignedMinGRU
+    >>> layer = SignedMinGRU(input_size=32, hidden_size=64)  # decoupled default
+    >>> x = torch.randn(4, 128, 32)
+    >>> tuple(layer(x).shape)
+    (4, 128, 64)
     """
 
     def __init__(
@@ -1637,6 +1725,21 @@ class RotationMinGRU(DecayMixin, nn.Module):
     non-negative values; the courtesy warning about them is CPU-only
     (silent on CUDA, avoiding a host sync) — the sanitizing clamp
     itself always applies, on every device.
+
+    References
+    ----------
+    Merrill, Petty & Sabharwal (2024) and Grazzi et al. (2025) -- state
+    tracking over non-abelian groups needs non-commutative (matrix)
+    transitions, which a diagonal scan cannot express.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from mingru import RotationMinGRU
+    >>> layer = RotationMinGRU(input_size=32, hidden_size=64)  # snap=(2,3,4,6)
+    >>> x = torch.randn(4, 128, 32)
+    >>> tuple(layer(x).shape)
+    (4, 128, 64)
     """
 
     def __init__(
@@ -2050,6 +2153,22 @@ class GivensMinGRU(DecayMixin, nn.Module):
     see ``_validate_delta_t_pairing``) and CPU-only invalid-entry
     warning. Parameter count is 3 linear heads (theta, z, h): the angle
     head emits ``n_blocks * rounds * (block_size / 2)`` angles.
+
+    References
+    ----------
+    Jing et al. (2017), "Tunable Efficient Unitary Neural Networks (EUNN)",
+    arXiv:1612.05231 -- the brick-wall mesh of plane rotations.
+    Clements et al. (2016) -- the rectangular (brick-wall) mesh design.
+    Golub & Van Loan, *Matrix Computations* -- Givens plane rotations.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from mingru import GivensMinGRU
+    >>> layer = GivensMinGRU(input_size=32, hidden_size=64)  # block_size=8, rounds=3
+    >>> x = torch.randn(4, 128, 32)
+    >>> tuple(layer(x).shape)
+    (4, 128, 64)
     """
 
     def __init__(
@@ -2416,6 +2535,16 @@ class MinGRUBlock(nn.Module):
     (``ValueError`` both directions, see ``_validate_delta_t_pairing``)
     is what fires whether the block is used standalone or inside a
     ``MinGRUStack``.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from mingru import MinGRUBlock
+    >>> block = MinGRUBlock(d_model=64, mixer="signed")
+    >>> x = torch.randn(4, 128, 64)
+    >>> out, state = block(x)              # always returns (output, state)
+    >>> tuple(out.shape), tuple(state.shape)
+    ((4, 128, 64), (4, 1, 64))
     """
 
     # name -> (class, accepts_learnable_h0). RotationMinGRU's and
@@ -2747,6 +2876,16 @@ class MinGRUStack(nn.Module):
     ``"givens"`` blocks do NOT warn: the warning is specific to the
     straight-through snap discontinuity, and ``GivensMinGRU`` is
     continuous (unsnapped), so it has no such discontinuity to compound.
+
+    Examples
+    --------
+    >>> import torch
+    >>> from mingru import MinGRUStack
+    >>> model = MinGRUStack(input_size=32, d_model=64, n_layers=3, mixer="log")
+    >>> x = torch.randn(4, 128, 32)
+    >>> out, state = model(x)             # state: one entry per block
+    >>> tuple(out.shape), len(state)
+    ((4, 128, 64), 3)
     """
 
     def __init__(
