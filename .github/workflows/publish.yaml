@@ -1,0 +1,31 @@
+name: publish
+
+# Build and publish mingru-scans to PyPI when a GitHub Release is published.
+# Uses PyPI trusted publishing (OIDC) -- no API tokens or secrets. Configure the
+# `pypi` environment as a trusted publisher on PyPI before the first release.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mingru-scans
+    permissions:
+      id-token: write  # required for OIDC trusted publishing
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v6
+      - name: Build wheel + sdist
+        run: uv build
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          verbose: true

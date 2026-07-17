@@ -18,6 +18,25 @@ gap between events, not just a token count (see "Time-aware decay,"
 below). What each variant actually buys you, in measured accuracy, is
 below.
 
+## Install
+
+```bash
+pip install mingru-scans
+```
+
+Requires `torch>=2.8` (CPU or CUDA); the import name is `mingru`:
+
+```python
+import torch
+from mingru import MinGRUStack
+
+stack = MinGRUStack(input_size=32, d_model=256, n_layers=4)  # mixer="log" (default)
+x = torch.randn(4, 10, 32)
+y, state = stack(x)   # (B, T, 32) -> (B, T, 256), per-block states
+```
+
+The optional Triton scan backend is imported lazily on first use of a Triton-backed symbol, so `import mingru` works on CPU-only installs; the `MINGRU_SCAN` control and GPU path are documented on the docs site. Full documentation, including the GivensGRU and Triton-scans deep dives, lives at <https://chris-santiago.github.io/minGRU/>.
+
 ## What this shows
 
 Two word-problem tasks probe exactly the gaps above (full task/eval setup
@@ -1258,6 +1277,8 @@ evaluated at T=64 (in-distribution) and longer lengths (256/512/1024,
 length generalization) — the length-gen columns are what separate
 "expresses the recurrent solution" from "learned a depth-bounded
 shortcut for the training length."
+
+**Two torch pins.** The installed package advertises a `torch>=2.8` floor so the optional Triton scan backend is available to library users. The evidence commands here run from a repo checkout, not an install: the root `min_gru.py`/`triton_scans.py` drivers re-export the packaged library from `src/`, so every recorded command reproduces verbatim under the frozen `torch==2.5.1` evidence pin with nothing installed and no Triton import attempted. Pin it explicitly with, for example, `uv run --python 3.12 --with 'torch==2.5.1' python min_gru.py` (or the `probes.py` commands below).
 
 ```
 python probes.py TASK MODEL [N_LAYERS]
