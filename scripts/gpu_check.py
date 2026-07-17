@@ -48,12 +48,12 @@ def _sh(cmd: list[str]) -> str:
 
 def build_command(repo: str, ref: str, bench: bool) -> str:
     steps = [
-        "set -euxo pipefail",
+        "set -eux",  # job shell is dash: -o pipefail unsupported (no pipes used)
         (
             "python -c 'import torch; assert torch.cuda.is_available(), "
             '"no CUDA device"; print(torch.__version__)\''
         ),
-        "python -c 'import triton' || pip install --no-cache-dir triton",
+        "(python -c 'import triton' || pip install --no-cache-dir triton)",
         f"git clone --filter=blob:none {repo} /tmp/minGRU",
         f"cd /tmp/minGRU && git checkout --detach {ref}",
         "cd /tmp/minGRU && python scripts/bench_scans.py --check",
@@ -159,7 +159,7 @@ def main() -> int:
     ok = "completed" in status.lower() or "succe" in status.lower()
     if not ok:
         try:
-            print(job.logs())
+            print(job.logs)
         except Exception as exc:  # log retrieval is best-effort
             print(f"(could not fetch logs: {exc})", file=sys.stderr)
     return 0 if ok else 1
