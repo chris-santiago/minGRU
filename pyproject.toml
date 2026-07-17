@@ -45,7 +45,11 @@ packages = ["src/mingru"]
 include = ["src/mingru", "README.md", "LICENSE"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+# "src" makes the installed-shape `mingru` package importable; "." adds the
+# repo root so the `min_gru`/`triton_scans` evidence drivers import for the
+# driver re-export identity test. Both entries are resolved relative to the
+# rootdir, so the suite has no repo-root-cwd dependence.
+pythonpath = ["src", "."]
 testpaths = ["tests"]
 
 [tool.ruff]
