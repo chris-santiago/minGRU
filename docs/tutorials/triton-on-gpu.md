@@ -74,7 +74,7 @@ The full `auto` / `eager` / `triton` semantics live in [Control scan dispatch](.
 
 ## What you gain (and where you don't)
 
-The block-structured scans — the ones behind `RotationMinGRU` and `GivensMinGRU` — are where Triton pays off, because their eager form materializes large intermediate tensors. On an NVIDIA L4 (torch 2.8, from `experiments/bench/scan_bench.md`), forward-plus-backward speedups over eager reach **39× for `matrix_affine_scan` and up to 169× for `matrix_scan`** at long sequences, and `GivensMinGRU`'s angle-fused backward cuts peak memory from 395 MB to 38 MB.
+The block-structured scans — the ones behind `RotationMinGRU` and `GivensMinGRU` — are where Triton pays off, because their eager form materializes large intermediate tensors. On an NVIDIA L4 (torch 2.8, from `experiments/bench/scan_bench.md`), speedups over eager reach **up to 39× (`matrix_affine_scan`, lab shape) and up to 169× (`matrix_scan`, long-T), forward+backward**, and `GivensMinGRU`'s angle-fused backward cuts peak memory from 395 MB to 38 MB.
 
 The elementwise log-space scan (`parallel_scan_log`, behind `MinGRU`/`SignedMinGRU`) is the honest exception: it is already memory-bound and cheap in eager form, so its Triton forward+backward measures **0.70–0.80× — slower than eager**. `auto` still runs it on GPU for consistency; if you only use the diagonal mixers, `MINGRU_SCAN=eager` is the faster choice. The full table is in [Run the benchmarks](../how-to/run-the-benchmarks.md) and [the Triton scans explanation](../explanation/triton-scans.md).
 

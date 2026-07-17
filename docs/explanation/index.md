@@ -6,8 +6,8 @@ Both articles are grounded in the committed measured evidence. Every quantitativ
 
 ## Articles
 
-- [**GivensMinGRU deep dive**](givens-mingru.md) — why the non-commutative rung of the ladder gets a richer per-token map, how the brick-wall Givens parameterization is built and why that specific mesh, what the `S3-hier` evidence does and does not demonstrate against diagonal-transition RNNs, the rounds ablation that separates map richness from block size, and the backward-pass design decision that rejected division-based reversal in favor of an exact `$C=1$` stored-state recompute.
-- [**Triton scan kernels**](triton-scans.md) — why the four scan operations are one associative-scan family, how the kernels are laid out (one program per lane, a sequential-in-`$T$` register prefix), the fp32-accumulation and TF32/IEEE precision story, the dispatch seam that keeps the kernels optional, and the measured speedups — including the honest rows where the Triton path is slower than eager.
+- [**GivensMinGRU deep dive**](givens-mingru.md) — why the non-commutative rung of the ladder gets a richer per-token map, how the brick-wall Givens parameterization is built and why that specific mesh, what the `S3-hier` evidence does and does not demonstrate against diagonal-transition RNNs, the rounds ablation that separates map richness from block size, and the backward-pass design decision that rejected division-based reversal in favor of an exact $C=1$ stored-state recompute.
+- [**Triton scan kernels**](triton-scans.md) — why the four scan operations are one associative-scan family, how the kernels are laid out (one program per lane, a sequential-in-$T$ register prefix), the fp32-accumulation and TF32/IEEE precision story, the dispatch seam that keeps the kernels optional, and the measured speedups — including the honest rows where the Triton path is slower than eager.
 
 ## Where to go next
 

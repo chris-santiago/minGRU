@@ -1,5 +1,7 @@
 # mingru-scans
 
+minGRU is the minimal GRU of [Feng et al., "Were RNNs All We Needed?", arXiv:2410.01201](https://arxiv.org/abs/2410.01201) — a GRU stripped to a scannable linear recurrence. A parallel (associative) scan solves that recurrence by combining elements pairwise instead of one at a time, so the whole sequence resolves in logarithmic depth rather than a sequential loop.
+
 `mingru-scans` is a research library of parallel-scan minGRU variants: the log-space baseline `MinGRU`, the signed-gate `SignedMinGRU`, and the rotation-family mixers `RotationMinGRU` and `GivensMinGRU`, whose recurrences run as associative scans instead of sequential loops. An optional Triton backend accelerates the scan primitives on CUDA GPUs behind a zero-config dispatch seam; on CPU, or wherever Triton is absent, the pure-PyTorch eager path runs unchanged.
 
 Use it when you want GRU-style sequence mixing that trains with parallel-scan speed, when you need state-tracking capacity beyond what diagonal-transition RNNs offer, or when you want to study the rotation-family parameterizations behind those capabilities.
@@ -9,6 +11,8 @@ Use it when you want GRU-style sequence mixing that trains with parallel-scan sp
 ```bash
 pip install mingru-scans
 ```
+
+Until the first PyPI release lands, install from the repository: `pip install git+https://github.com/chris-santiago/minGRU`.
 
 Requires Python 3.10+ and `torch>=2.8`. The import name is `mingru`.
 

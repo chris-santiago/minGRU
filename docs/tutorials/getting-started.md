@@ -11,6 +11,8 @@ This tutorial takes you from an empty environment to a trained sequence model. Y
 pip install mingru-scans
 ```
 
+Until the first PyPI release lands, install from the repository: `pip install git+https://github.com/chris-santiago/minGRU`.
+
 The distribution is `mingru-scans`; the import name is `mingru`. CPU is enough for this tutorial — no GPU or Triton install is required (see [Triton on GPU](triton-on-gpu.md) for the accelerated path).
 
 ## Step 1 — Build a layer and check its shapes
@@ -42,7 +44,7 @@ step: (4, 64)
 
 Parity is the smallest task that separates these mixers from an ordinary decaying RNN: the label is the running XOR of a bit stream, so the state has to *flip sign* on a `1` and *hold* on a `0`. The default mixer, `"log"`, keeps its state positive and cannot flip, so it stays near chance. We therefore pick `mixer="signed"`, whose transition coefficient can reach $-1$. (The [Choose a mixer](../how-to/choose-a-mixer.md) guide covers when to reach for each mixer.)
 
-Build a two-layer `MinGRUStack`, add a linear classification head over its `d_model=64` output, and train with Adam. The data generator produces fresh random batches each step, so there is no separate dataset to download.
+Build a two-layer `MinGRUStack`, add a linear classification head over its `d_model=64` output, and train with Adam. (`d_model` is the stack's per-block `hidden_size`.) The data generator produces fresh random batches each step, so there is no separate dataset to download.
 
 ```python
 import torch

@@ -1,6 +1,6 @@
 # Choose a mixer
 
-This guide picks the right `mixer=` for your problem. It assumes you have completed the [getting-started tutorial](../tutorials/getting-started.md). All accuracy figures are multi-seed means from the README's "What this shows" and `S3-hier` tables (torch 2.5.1, CPU); the [explanations](../explanation/index.md) cover *why* each mixer behaves as it does.
+This guide picks the right `mixer=` for your problem. It assumes you have completed the [getting-started tutorial](../tutorials/getting-started.md). All accuracy figures are multi-seed means from the README's "What this shows" and `S3-hier` tables (torch 2.5.1, CPU — the frozen evidence pin, see [Reproduce the evidence](reproduce-the-evidence.md)); the [explanations](../explanation/index.md) cover *why* each mixer behaves as it does.
 
 ## Decide by the shape of your state
 
@@ -42,7 +42,7 @@ Two caveats, both measured:
 
 ## GivensMinGRU — richer composer for hierarchical tasks
 
-Reach for `"givens"` when you need a *richer* non-commutative composer than a 2D rotation — typically as the upper layer of a stack whose lower layer extracts the operation from raw input. Its transitions are rotations across 8-dimensional blocks (default `block_size=8`, `rounds=3`), continuous (no angle snap), and `d_model` must be a multiple of `block_size`.
+Reach for `"givens"` when you need a *richer* non-commutative composer than a 2D rotation — typically as the upper layer of a stack whose lower layer extracts the operation from raw input. Its transitions are rotations across 8-dimensional blocks (default `block_size=8`, `rounds=3`), continuous (no angle snap), and `d_model` must be a multiple of `block_size`. (`rounds` = how many staggered layers of paired-plane rotations compose per token; see the [brick-wall Givens parameterization](../explanation/givens-mingru.md#the-brick-wall-givens-parameterization).)
 
 ```python
 model = MinGRUStack(

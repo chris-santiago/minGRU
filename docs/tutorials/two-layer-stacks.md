@@ -59,6 +59,8 @@ print("configured forward:", tuple(model(x)[0].shape))
 configured forward: (4, 128, 64)
 ```
 
+`rounds` = how many staggered layers of paired-plane rotations compose per token; see the [brick-wall Givens parameterization](../explanation/givens-mingru.md#the-brick-wall-givens-parameterization) for why that specific mesh.
+
 A flat `mixer_kwargs` dict alongside a list `mixer` (or a type-keyed dict alongside a single-string `mixer`) raises `ValueError` naming both schemas, so the two forms cannot be mixed up silently.
 
 ## Step 3 — Read the ordering warning
@@ -86,7 +88,7 @@ Treat that warning as a signal to prefer a `GivensMinGRU` composer over stacked 
 
 ## Why this order? The measured evidence
 
-Layer order on `S3-hier` is not a matter of taste — it is measured. All figures below are multi-seed means at the standard 1600-step budget with best-val@128 checkpoint selection, from `experiments/EXPERIMENTS.md` (rounds `hetero-legB-v2`, `hetero-loop-17-sg8`) and the README's `S3-hier` table. Chance is $\approx 0.167$.
+Layer order on `S3-hier` is not a matter of taste — it is measured. All figures below are multi-seed means at the standard 1600-step budget with best-val@128 checkpoint selection (best-val@128 = keep the checkpoint that scored highest on held-out length-128 validation), from `experiments/EXPERIMENTS.md` (rounds `hetero-legB-v2`, `hetero-loop-17-sg8`) and the README's `S3-hier` table. Chance is $\approx 0.167$.
 
 | stack (`mixer=`) | seeds | acc@64 | acc@256 | acc@512 | acc@1024 |
 |---|---|---|---|---|---|
