@@ -44,10 +44,6 @@ dev = [
     "pytest>=8",
     "ruff>=0.6",
     "nox",
-]
-# GPU conformance tooling only (nox -s gpu): kept out of `dev` so the default
-# dev sync stays light; the gpu session syncs this group itself.
-gpu = [
     "lightning-sdk",
 ]
 # Documentation toolchain, pinned to the versions the site currently builds

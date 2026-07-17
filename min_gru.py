@@ -524,9 +524,7 @@ if __name__ == "__main__":
     _check_decay_suite("MinGRU", {}, D_in, D_h, B=4, T=128, seed=201)
     _check_decay_suite("SignedMinGRU", {"coupled": False}, D_in, D_h, B=4, T=128, seed=202)
     _check_decay_suite("SignedMinGRU", {"coupled": True}, D_in, D_h, B=4, T=128, seed=203)
-    mr_decay_learnable = _check_decay_suite(
-        "RotationMinGRU", {}, D_in, D_h, B=4, T=128, seed=204
-    )
+    mr_decay_learnable = _check_decay_suite("RotationMinGRU", {}, D_in, D_h, B=4, T=128, seed=204)
 
     # --- RotationMinGRU: snapped angles remain exact grid multiples under active decay ---
     torch.manual_seed(205)
@@ -547,9 +545,7 @@ if __name__ == "__main__":
         m_none = cls(D_in, D_h, decay=None, **ctor_kwargs)
         try:
             m_none(x_local, delta_t=torch.rand(2, 5))
-            raise AssertionError(
-                f"{cls_name}: delta_t without decay should have raised ValueError"
-            )
+            raise AssertionError(f"{cls_name}: delta_t without decay should have raised ValueError")
         except ValueError:
             pass
         m_decay = cls(D_in, D_h, decay="fixed", **ctor_kwargs)
@@ -571,9 +567,7 @@ if __name__ == "__main__":
         _cls = globals()[_cls_name]
         try:
             _cls(D_in, D_h, decay="bogus")
-            raise AssertionError(
-                f"{_cls_name}: invalid decay string should have raised ValueError"
-            )
+            raise AssertionError(f"{_cls_name}: invalid decay string should have raised ValueError")
         except ValueError:
             pass
     print("invalid decay string raises ValueError: ok")
@@ -587,8 +581,7 @@ if __name__ == "__main__":
             try:
                 MinGRU(D_in, D_h, decay=_mode, decay_rate=_bad_rate)
                 raise AssertionError(
-                    f"MinGRU: decay={_mode!r}, decay_rate={_bad_rate} should "
-                    "have raised ValueError"
+                    f"MinGRU: decay={_mode!r}, decay_rate={_bad_rate} should have raised ValueError"
                 )
             except ValueError:
                 pass
@@ -744,7 +737,10 @@ if __name__ == "__main__":
     # --- decayed stack (signed, learnable): parallel vs streaming, random delta_t ---
     torch.manual_seed(401)
     decayed_stack = MinGRUStack(
-        D_in, D_h, 3, mixer="signed",
+        D_in,
+        D_h,
+        3,
+        mixer="signed",
         mixer_kwargs={"decay": "learnable", "decay_rate": 1.0},
     ).eval()
     dt_stack = torch.rand(B, T) * 2.0 + 1e-2
@@ -774,7 +770,10 @@ if __name__ == "__main__":
     # --- decay_layers="last": rho present/grad in EXACTLY the final block ---
     torch.manual_seed(402)
     last_stack = MinGRUStack(
-        D_in, D_h, 3, mixer="signed",
+        D_in,
+        D_h,
+        3,
+        mixer="signed",
         mixer_kwargs={"decay": "learnable", "decay_rate": 1.0},
         decay_layers="last",
     )
@@ -822,7 +821,10 @@ if __name__ == "__main__":
 
     # --- decay_layers="last" with n_layers=1: sole block is the final block ---
     single_last = MinGRUStack(
-        D_in, D_h, 1, mixer="signed",
+        D_in,
+        D_h,
+        1,
+        mixer="signed",
         mixer_kwargs={"decay": "fixed", "decay_rate": 1.0},
         decay_layers="last",
     )
@@ -834,7 +836,10 @@ if __name__ == "__main__":
     # --- decay_layers="all": rho grads reach every block ---
     torch.manual_seed(403)
     all_stack = MinGRUStack(
-        D_in, D_h, 3, mixer="signed",
+        D_in,
+        D_h,
+        3,
+        mixer="signed",
         mixer_kwargs={"decay": "learnable", "decay_rate": 1.0},
         decay_layers="all",
     )
@@ -853,9 +858,7 @@ if __name__ == "__main__":
     plain_stack = MinGRUStack(D_in, D_h, 3, mixer="signed")
     try:
         plain_stack(x, delta_t=torch.rand(B, T))
-        raise AssertionError(
-            "stack with no decayed blocks should reject delta_t with ValueError"
-        )
+        raise AssertionError("stack with no decayed blocks should reject delta_t with ValueError")
     except ValueError:
         pass
     state0 = plain_stack.init_state()
@@ -879,7 +882,10 @@ if __name__ == "__main__":
     # --- rotation-mixer decayed stack: parallel vs streaming ---
     torch.manual_seed(404)
     rot_decayed_stack = MinGRUStack(
-        D_in, D_h, 3, mixer="rotation",
+        D_in,
+        D_h,
+        3,
+        mixer="rotation",
         mixer_kwargs={"decay": "learnable", "decay_rate": 1.0},
     ).eval()
     dt_rot_stack = torch.rand(B, T) * 2.0 + 1e-2
@@ -913,7 +919,10 @@ if __name__ == "__main__":
     # (coupled signed + a custom snap grid on rotation) ---
     torch.manual_seed(502)
     hetero3 = MinGRUStack(
-        D_in, D_h, 3, mixer=["signed", "signed", "rotation"],
+        D_in,
+        D_h,
+        3,
+        mixer=["signed", "signed", "rotation"],
         mixer_kwargs={"signed": {"coupled": True}, "rotation": {"snap": (2, 3, 6)}},
     ).eval()
     assert all(block.mingru.coupled for block in hetero3.blocks[:2])
@@ -942,9 +951,7 @@ if __name__ == "__main__":
     # valid mixer name, exactly the same structural check as "unknown/absent
     # type key" below applied to a fully flat dict) ---
     try:
-        MinGRUStack(
-            D_in, D_h, 2, mixer=["signed", "rotation"], mixer_kwargs={"coupled": True}
-        )
+        MinGRUStack(D_in, D_h, 2, mixer=["signed", "rotation"], mixer_kwargs={"coupled": True})
         raise AssertionError("flat dict with list mixer should have raised ValueError")
     except ValueError:
         pass
@@ -952,9 +959,7 @@ if __name__ == "__main__":
 
     # --- type-keyed dict with str mixer raises ValueError ---
     try:
-        MinGRUStack(
-            D_in, D_h, 2, mixer="signed", mixer_kwargs={"signed": {"coupled": True}}
-        )
+        MinGRUStack(D_in, D_h, 2, mixer="signed", mixer_kwargs={"signed": {"coupled": True}})
         raise AssertionError("type-keyed dict with str mixer should have raised ValueError")
     except ValueError:
         pass
@@ -965,12 +970,14 @@ if __name__ == "__main__":
     # particular mixer list) ---
     try:
         MinGRUStack(
-            D_in, D_h, 2, mixer=["signed", "signed"],
+            D_in,
+            D_h,
+            2,
+            mixer=["signed", "signed"],
             mixer_kwargs={"rotation": {"snap": (3,)}},
         )
         raise AssertionError(
-            "mixer_kwargs key naming a type absent from the list should have "
-            "raised ValueError"
+            "mixer_kwargs key naming a type absent from the list should have raised ValueError"
         )
     except ValueError:
         pass
@@ -1036,7 +1043,10 @@ if __name__ == "__main__":
     # block(s) ---
     torch.manual_seed(504)
     mixed_decay_stack = MinGRUStack(
-        D_in, D_h, 3, mixer=["signed", "rotation", "signed"],
+        D_in,
+        D_h,
+        3,
+        mixer=["signed", "rotation", "signed"],
         mixer_kwargs={"signed": {"decay": "learnable", "decay_rate": 1.0}},
     ).eval()
     assert mixed_decay_stack.blocks[0].mingru.decay == "learnable"
@@ -1054,19 +1064,14 @@ if __name__ == "__main__":
             ys.append(y_t)
         y_seq_md = torch.stack(ys, dim=1)
     err = (y_par_md - y_seq_md).abs().max().item()
-    print(
-        "mixed stack, decay on 'signed' only: parallel vs streaming max abs "
-        f"diff: {err:.3e}"
-    )
+    print(f"mixed stack, decay on 'signed' only: parallel vs streaming max abs diff: {err:.3e}")
     assert err < 1e-4
 
     Th_m = T // 2
     assert dt_mixed[:, Th_m].min().item() > 0, "test setup: boundary gap must be nonzero"
     with torch.no_grad():
         y_a_md, carry_md = mixed_decay_stack(x[:, :Th_m], delta_t=dt_mixed[:, :Th_m])
-        y_b_md, _ = mixed_decay_stack(
-            x[:, Th_m:], state=carry_md, delta_t=dt_mixed[:, Th_m:]
-        )
+        y_b_md, _ = mixed_decay_stack(x[:, Th_m:], state=carry_md, delta_t=dt_mixed[:, Th_m:])
         y_chunked_md = torch.cat([y_a_md, y_b_md], dim=1)
     err = (y_par_md - y_chunked_md).abs().max().item()
     print(
@@ -1184,10 +1189,7 @@ if __name__ == "__main__":
         raise AssertionError("rounds=0 should have raised ValueError")
     except ValueError:
         pass
-    print(
-        "givens construction ValueError (indivisible hidden_size, odd "
-        "block_size, rounds=0): ok"
-    )
+    print("givens construction ValueError (indivisible hidden_size, odd block_size, rounds=0): ok")
 
     try:
         MinGRUBlock(D_h, mixer="not_a_mixer")
@@ -1204,9 +1206,7 @@ if __name__ == "__main__":
         MinGRUStack(D_in, D_h, 3, mixer=["givens", "signed", "givens"])
         MinGRUStack(D_in, D_h, 3, mixer="givens")
         giv_warnings = [w for w in rec if issubclass(w.category, UserWarning)]
-    assert len(giv_warnings) == 0, (
-        f"multi-'givens' stacks must not warn, got {len(giv_warnings)}"
-    )
+    assert len(giv_warnings) == 0, f"multi-'givens' stacks must not warn, got {len(giv_warnings)}"
     print("multi-'givens' + homogeneous 'givens' stacks: zero UserWarning: ok")
 
     with _warnings.catch_warnings(record=True) as rec:
@@ -1385,8 +1385,7 @@ if __name__ == "__main__":
         _auto_A, _auto_Bc = linear_scan(_a, _b)
         _eager_A, _eager_Bc = _eager_out
         assert torch.equal(_auto_A, _eager_A) and torch.equal(_auto_Bc, _eager_Bc), (
-            "MINGRU_SCAN=auto (default) must match MINGRU_SCAN=eager exactly "
-            "on CPU tensors"
+            "MINGRU_SCAN=auto (default) must match MINGRU_SCAN=eager exactly on CPU tensors"
         )
         assert "mingru.triton_scans" not in sys.modules, (
             "MINGRU_SCAN=auto with CPU tensors must never import mingru.triton_scans"
@@ -1468,12 +1467,8 @@ if __name__ == "__main__":
             _set_scan_env(_saved_scan_env)
 
     _angle_x = torch.randn(2, 5, 4)
-    _check_angle_dispatch_seam(
-        "GivensMinGRU", GivensMinGRU(4, 8, block_size=4, rounds=2), _angle_x
-    )
-    _check_angle_dispatch_seam(
-        "RotationMinGRU", RotationMinGRU(4, 8, snap=None), _angle_x
-    )
+    _check_angle_dispatch_seam("GivensMinGRU", GivensMinGRU(4, 8, block_size=4, rounds=2), _angle_x)
+    _check_angle_dispatch_seam("RotationMinGRU", RotationMinGRU(4, 8, snap=None), _angle_x)
 
     # =========================================================================
     # CPU lockstep guard: `_angle_heads` (the angle-fused kernel's head
@@ -1537,9 +1532,7 @@ if __name__ == "__main__":
             theta, scale, gamma, b_heads = mixer._angle_heads(x, dt)
             perm, sgn, p2p = mixer._angle_plane_meta(x.device)
             k = M_ref.shape[-1]
-            M_recon = _reconstruct_angle_matrix(
-                theta, scale, gamma, perm, sgn, p2p, k, has_scale
-            )
+            M_recon = _reconstruct_angle_matrix(theta, scale, gamma, perm, sgn, p2p, k, has_scale)
         m_err = (M_recon - M_ref).abs().max().item()
         b_err = (b_heads.reshape(b_ref.shape) - b_ref).abs().max().item()
         assert m_err < 1e-5, (
@@ -1563,7 +1556,10 @@ if __name__ == "__main__":
     _dt_lockstep_g = torch.rand(2, 5) * 2.0 + 1e-2
     _check_angle_heads_lockstep(
         "GivensMinGRU (rounds=3, decay=learnable)",
-        _givens_lockstep, _x_lockstep_g, _dt_lockstep_g, has_scale=False,
+        _givens_lockstep,
+        _x_lockstep_g,
+        _dt_lockstep_g,
+        has_scale=False,
     )
 
     torch.manual_seed(12)
@@ -1571,5 +1567,8 @@ if __name__ == "__main__":
     _x_lockstep_r = torch.randn(2, 5, 4)
     _check_angle_heads_lockstep(
         "RotationMinGRU (snap=(2,3,4,6))",
-        _rotation_lockstep, _x_lockstep_r, None, has_scale=True,
+        _rotation_lockstep,
+        _x_lockstep_r,
+        None,
+        has_scale=True,
     )

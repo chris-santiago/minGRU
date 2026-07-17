@@ -625,6 +625,8 @@ triton = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "lightning-sdk", version = "2026.4.23", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "lightning-sdk", version = "2026.7.9.post0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "nox" },
     { name = "pytest" },
     { name = "ruff" },
@@ -633,10 +635,6 @@ docs = [
     { name = "mkdocstrings" },
     { name = "mkdocstrings-python" },
     { name = "zensical" },
-]
-gpu = [
-    { name = "lightning-sdk", version = "2026.4.23", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "lightning-sdk", version = "2026.7.9.post0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
 ]
 
 [package.metadata]
@@ -648,6 +646,7 @@ provides-extras = ["triton"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "lightning-sdk" },
     { name = "nox" },
     { name = "pytest", specifier = ">=8" },
     { name = "ruff", specifier = ">=0.6" },
@@ -657,7 +656,6 @@ docs = [
     { name = "mkdocstrings-python", specifier = "==2.0.5" },
     { name = "zensical", specifier = "==0.0.43" },
 ]
-gpu = [{ name = "lightning-sdk" }]
 
 [[package]]
 name = "mkdocs"

@@ -20,18 +20,25 @@ nox.options.default_venv_backend = "uv"
 
 @nox.session(python=False)
 def lint(session: nox.Session) -> None:
-    """Ruff: check everything; fix/format only the non-frozen surfaces."""
-    session.run("uvx", "ruff", "check", ".", external=True)
-    session.run("uvx", "ruff", "check", "tests", "scripts", "--fix", external=True)
-    session.run("uvx", "ruff", "format", "tests", "scripts", external=True)
+    """Ruff check --fix and format, repo-wide.
+
+    Frozen files included by user decision: formatting is AST-invariant and
+    the freeze session verifies identity afterward -- review the diffs.
+    """
+    session.run("uv", "run", "--group", "dev", "ruff", "check", ".", "--fix", external=True)
+    session.run("uv", "run", "--group", "dev", "ruff", "format", ".", external=True)
 
 
 @nox.session(python=False)
 def freeze(session: nox.Session) -> None:
     """Frozen-AST gate: library + relocated selftests vs the pinned baseline."""
     session.run(
-        "uv", "run", "--python", "3.12",
-        "python", "scripts/check_frozen_ast.py",
+        "uv",
+        "run",
+        "--python",
+        "3.12",
+        "python",
+        "scripts/check_frozen_ast.py",
         external=True,
     )
 
@@ -67,8 +74,14 @@ def doctests(session: nox.Session) -> None:
 def evidence(session: nox.Session) -> None:
     """Evidence-pin selftest: the relocated suites under torch==2.5.1, no install."""
     session.run(
-        "uv", "run", "--python", "3.12", "--with", "torch==2.5.1",
-        "python", "min_gru.py",
+        "uv",
+        "run",
+        "--python",
+        "3.12",
+        "--with",
+        "torch==2.5.1",
+        "python",
+        "min_gru.py",
         external=True,
     )
 
@@ -88,8 +101,13 @@ def gpu(session: nox.Session) -> None:
     pass --dry-run to inspect the job spec without submitting.
     """
     session.run(
-        "uv", "run", "--group", "gpu",
-        "python", "scripts/gpu_check.py", *session.posargs,
+        "uv",
+        "run",
+        "--group",
+        "dev",
+        "python",
+        "scripts/gpu_check.py",
+        *session.posargs,
         external=True,
     )
 
@@ -104,7 +122,13 @@ def build(session: nox.Session) -> None:
 def docs(session: nox.Session) -> None:
     """Build the docs site with the pinned docs toolchain; strict (fails on warnings)."""
     session.run(
-        "uv", "run", "--only-group", "docs",
-        "zensical", "build", "--clean", "--strict",
+        "uv",
+        "run",
+        "--only-group",
+        "docs",
+        "zensical",
+        "build",
+        "--clean",
+        "--strict",
         external=True,
     )

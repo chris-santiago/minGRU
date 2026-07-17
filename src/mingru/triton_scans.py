@@ -167,9 +167,7 @@ def _scan_env(mode: str | None = None):
             os.environ["MINGRU_SCAN"] = saved
 
 
-def parallel_scan_log_recompute(
-    log_coeffs: torch.Tensor, log_values: torch.Tensor
-) -> torch.Tensor:
+def parallel_scan_log_recompute(log_coeffs: torch.Tensor, log_values: torch.Tensor) -> torch.Tensor:
     """Pure-torch re-derivation of ``min_gru.parallel_scan_log``'s eager math.
 
     Defined at module level, OUTSIDE the ``if _HAS_TRITON:`` block below (no
@@ -827,9 +825,7 @@ if _HAS_TRITON:
             if it == 0:
                 hprev = tl.load(h0_ptr + h0_base + ar_k).to(tl.float32)
             else:
-                hprev = tl.load(
-                    out_ptr + bk_base + (it - 1) * (n * k) + ar_k
-                ).to(tl.float32)
+                hprev = tl.load(out_ptr + bk_base + (it - 1) * (n * k) + ar_k).to(tl.float32)
 
             # --- recompute forward per-round states vv[0..R] from h_{t-1} ---
             if HAS_SCALE:
@@ -851,7 +847,9 @@ if _HAS_TRITON:
             # `+`. (The forward kernel's R-loop carries a single state and
             # needs no list, so it can stay a plain `range`.)
             for r in tl.static_range(R):
-                th = tl.load(theta_ptr + th_base + it * (n * R * half) + r * half + ar_h).to(tl.float32)
+                th = tl.load(theta_ptr + th_base + it * (n * R * half) + r * half + ar_h).to(
+                    tl.float32
+                )
                 ch = tl.cos(th)
                 sh = tl.sin(th)
                 p2p = tl.load(p2p_ptr + r * k + ar_k)
@@ -886,7 +884,9 @@ if _HAS_TRITON:
             # compiles fine outside a runtime loop. Down-counting the range
             # sidesteps that entirely and doubles as the pointer/load index.
             for rr in tl.static_range(R - 1, -1, -1):
-                th = tl.load(theta_ptr + th_base + it * (n * R * half) + rr * half + ar_h).to(tl.float32)
+                th = tl.load(theta_ptr + th_base + it * (n * R * half) + rr * half + ar_h).to(
+                    tl.float32
+                )
                 ch = tl.cos(th)
                 sh = tl.sin(th)
                 p2p = tl.load(p2p_ptr + rr * k + ar_k)
@@ -920,9 +920,7 @@ if _HAS_TRITON:
         tl.store(gh0_ptr + h0_base + ar_k, ghat)  # dL/dh_0
 
     @triton_op("mingru_scans::affine_scan_fwd", mutates_args={})
-    def affine_scan_fwd(
-        A: torch.Tensor, Bm: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def affine_scan_fwd(A: torch.Tensor, Bm: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Generic k x k affine prefix scan (Kernel 1).
 
         ``A`` is ``(B, T, n, k, k)``, ``Bm`` is ``(B, T, n, k, v)``. Returns
@@ -947,9 +945,7 @@ if _HAS_TRITON:
         return Abar, Bbar
 
     @triton_op("mingru_scans::linear_scan_fwd", mutates_args={})
-    def linear_scan_fwd(
-        a: torch.Tensor, b: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def linear_scan_fwd(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Channel-tiled k=1 affine prefix scan (Kernel 1).
 
         ``a`` and ``b`` are ``(B, T, D)``. Returns ``(A, Bc)`` of the same
@@ -967,9 +963,7 @@ if _HAS_TRITON:
         return A, Bc
 
     @triton_op("mingru_scans::parallel_scan_log_fwd", mutates_args={})
-    def parallel_scan_log_fwd(
-        log_coeffs: torch.Tensor, log_values: torch.Tensor
-    ) -> torch.Tensor:
+    def parallel_scan_log_fwd(log_coeffs: torch.Tensor, log_values: torch.Tensor) -> torch.Tensor:
         """Fused log-space forward scan (Kernel 2).
 
         ``log_coeffs`` is ``(B, T, D)`` and ``log_values`` is ``(B, T+1,
@@ -1021,9 +1015,7 @@ if _HAS_TRITON:
         dA = torch.empty_like(A)
         dB = torch.empty_like(Bbar)
         grid = (b * n,)
-        wrap_triton(_affine_scan_bwd_kernel)[grid](
-            A, Abar, Bbar, gAbar, gBbar, dA, dB, t, n, k, v
-        )
+        wrap_triton(_affine_scan_bwd_kernel)[grid](A, Abar, Bbar, gAbar, gBbar, dA, dB, t, n, k, v)
         return dA, dB
 
     @triton_op("mingru_scans::linear_scan_bwd", mutates_args={})
@@ -1050,9 +1042,7 @@ if _HAS_TRITON:
         da = torch.empty_like(a)
         db = torch.empty_like(Bc)
         grid = (bsz, triton.cdiv(d, _LINEAR_BLOCK_D))
-        wrap_triton(_linear_scan_bwd_kernel)[grid](
-            a, A, Bc, gA, gBc, da, db, t, d, _LINEAR_BLOCK_D
-        )
+        wrap_triton(_linear_scan_bwd_kernel)[grid](a, A, Bc, gA, gBc, da, db, t, d, _LINEAR_BLOCK_D)
         return da, db
 
     # --- Autograd registration (Kernel 3; torch 2.8 route) ----------
@@ -1247,8 +1237,22 @@ if _HAS_TRITON:
         out = torch.empty_like(b)
         grid = (B * n,)
         wrap_triton(_angle_scan_fwd_kernel)[grid](
-            theta, scale, gamma, b, h0, perm, sgn, p2p, out, T, n,
-            k, R, half, int(has_scale), int(has_decay),
+            theta,
+            scale,
+            gamma,
+            b,
+            h0,
+            perm,
+            sgn,
+            p2p,
+            out,
+            T,
+            n,
+            k,
+            R,
+            half,
+            int(has_scale),
+            int(has_decay),
         )
         return out
 
@@ -1266,9 +1270,7 @@ if _HAS_TRITON:
         p2p: torch.Tensor,
         has_scale: int,
         has_decay: int,
-    ) -> tuple[
-        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-    ]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Angle-fused exact stored-state reversible backward.
 
         Reads the forward inputs, the forward output ``out`` (the source of
@@ -1305,16 +1307,34 @@ if _HAS_TRITON:
         dh0 = torch.empty_like(h0)
         grid = (B * n,)
         wrap_triton(_angle_scan_bwd_kernel)[grid](
-            theta, scale, gamma, b, h0, out, grad_out, perm, sgn, p2p,
-            dtheta, dscale, dgamma, db, dh0, T, n,
-            k, R, half, int(has_scale), int(has_decay),
+            theta,
+            scale,
+            gamma,
+            b,
+            h0,
+            out,
+            grad_out,
+            perm,
+            sgn,
+            p2p,
+            dtheta,
+            dscale,
+            dgamma,
+            db,
+            dh0,
+            T,
+            n,
+            k,
+            R,
+            half,
+            int(has_scale),
+            int(has_decay),
         )
         return dtheta, dscale, dgamma, db, dh0
 
     def _angle_setup_context(ctx, inputs, output):
         """``register_autograd`` setup hook: save what ``_angle_backward`` needs."""
-        (theta, scale, gamma, b, h0, perm, sgn, p2p,
-         has_scale, has_decay) = inputs
+        (theta, scale, gamma, b, h0, perm, sgn, p2p, has_scale, has_decay) = inputs
         # The forward output (all states) is what the backward reads every
         # h_{t-1} from; it is the module's return value, so saving it adds no
         # allocation.
@@ -1326,8 +1346,18 @@ if _HAS_TRITON:
         """``register_autograd`` backward for ``angle_scan_fwd``: dispatches to ``angle_scan_bwd``."""
         theta, scale, gamma, b, h0, out, perm, sgn, p2p = ctx.saved_tensors
         dtheta, dscale, dgamma, db, dh0 = angle_scan_bwd(
-            theta, scale, gamma, b, h0, out, grad_out, perm, sgn, p2p,
-            ctx.has_scale, ctx.has_decay,
+            theta,
+            scale,
+            gamma,
+            b,
+            h0,
+            out,
+            grad_out,
+            perm,
+            sgn,
+            p2p,
+            ctx.has_scale,
+            ctx.has_decay,
         )
         # One grad per forward input, in order; None for the non-tensor args and
         # for perm/sgn/p2p (constant plane metadata, never differentiated).
@@ -1406,15 +1436,11 @@ if _HAS_TRITON:
                 "agreeing with theta's (B, T, n, R, half) on (B, T, n, R, k)"
             )
         try:
-            return angle_scan_fwd(
-                theta, scale, gamma, b, h0, perm, sgn, p2p, has_scale, has_decay
-            )
+            return angle_scan_fwd(theta, scale, gamma, b, h0, perm, sgn, p2p, has_scale, has_decay)
         except Exception as exc:  # kernel launch/compile failure -> loud fallback
             raise ScanFallback(f"angle-fused Triton kernel failed: {exc}") from exc
 
-    def _linear_scan_impl(
-        a: torch.Tensor, b: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _linear_scan_impl(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """SCAN_IMPLS entry for ``linear_scan`` (k = v = 1, always in envelope).
 
         Guards the ``(B, T, D)`` rank and the ``a``/``b`` shape agreement
@@ -1432,9 +1458,7 @@ if _HAS_TRITON:
         except Exception as exc:  # kernel launch/compile failure -> loud fallback
             raise ScanFallback(f"linear_scan Triton kernel failed: {exc}") from exc
 
-    def _parallel_scan_log_impl(
-        log_coeffs: torch.Tensor, log_values: torch.Tensor
-    ) -> torch.Tensor:
+    def _parallel_scan_log_impl(log_coeffs: torch.Tensor, log_values: torch.Tensor) -> torch.Tensor:
         """SCAN_IMPLS entry for ``parallel_scan_log`` (elementwise in D, always in envelope).
 
         Guards the ``log_coeffs`` ``(B, T, D)`` rank and the ``log_values``
@@ -1446,7 +1470,8 @@ if _HAS_TRITON:
         if (
             log_coeffs.ndim != 3
             or log_values.ndim != 3
-            or log_values.shape != (log_coeffs.shape[0], log_coeffs.shape[1] + 1, log_coeffs.shape[2])
+            or log_values.shape
+            != (log_coeffs.shape[0], log_coeffs.shape[1] + 1, log_coeffs.shape[2])
         ):
             raise ScanFallback(
                 f"parallel_scan_log (log_coeffs={tuple(log_coeffs.shape)}, "
@@ -1456,13 +1481,9 @@ if _HAS_TRITON:
         try:
             return parallel_scan_log_fwd(log_coeffs, log_values)
         except Exception as exc:  # kernel launch/compile failure -> loud fallback
-            raise ScanFallback(
-                f"parallel_scan_log Triton kernel failed: {exc}"
-            ) from exc
+            raise ScanFallback(f"parallel_scan_log Triton kernel failed: {exc}") from exc
 
-    def _matrix_scan_impl(
-        M: torch.Tensor, b: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def _matrix_scan_impl(M: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """SCAN_IMPLS entry for ``matrix_scan`` (k = 2, v = 1, fixed in envelope).
 
         Maps onto the generic kernel by viewing the ``(B, T, n, 2)``
@@ -1533,9 +1554,7 @@ if _HAS_TRITON:
         try:
             return affine_scan_fwd(A, Bm)
         except Exception as exc:  # kernel launch/compile failure -> loud fallback
-            raise ScanFallback(
-                f"matrix_affine_scan Triton kernel failed: {exc}"
-            ) from exc
+            raise ScanFallback(f"matrix_affine_scan Triton kernel failed: {exc}") from exc
 
     SCAN_IMPLS = {
         "parallel_scan_log": _parallel_scan_log_impl,
@@ -1777,9 +1796,11 @@ def _run_forward_parity_body(collect: list[dict] | None = None) -> int:
             failures.append(f"{label}: Triton path raised {type(exc).__name__}: {exc}")
             print(f"  [FAIL] {label}: {type(exc).__name__}: {exc}")
             if collect is not None and not informational:
-                collect.append(_parity_row(
-                    name, tag, inputs[0], "fwd", case_atol, case_rtol, None, None, False
-                ))
+                collect.append(
+                    _parity_row(
+                        name, tag, inputs[0], "fwd", case_atol, case_rtol, None, None, False
+                    )
+                )
             return
         ref = getattr(min_gru, name)(*inputs)
         # Ops return either a pair (the affine scans) or a single tensor
@@ -1794,9 +1815,7 @@ def _run_forward_parity_body(collect: list[dict] | None = None) -> int:
             abs_i, rel_i = _max_abs_rel(out_i, ref_i)
             abs_err = max(abs_err, abs_i)
             rels.append(rel_i)
-            ok = ok and torch.allclose(
-                out_i.float(), ref_i.float(), atol=case_atol, rtol=case_rtol
-            )
+            ok = ok and torch.allclose(out_i.float(), ref_i.float(), atol=case_atol, rtol=case_rtol)
         if informational:
             print(f"  [info] {label}: max_abs={abs_err:.2e} (not gated)")
             return
@@ -1807,10 +1826,19 @@ def _run_forward_parity_body(collect: list[dict] | None = None) -> int:
             failures.append(f"{label}: max_abs={abs_err:.2e} (rel={rel_str})")
             print(f"  [FAIL] {label}: max_abs={abs_err:.2e}")
         if collect is not None:
-            collect.append(_parity_row(
-                name, tag, inputs[0], "fwd", case_atol, case_rtol,
-                abs_err, max(rels) if rels else None, ok,
-            ))
+            collect.append(
+                _parity_row(
+                    name,
+                    tag,
+                    inputs[0],
+                    "fwd",
+                    case_atol,
+                    case_rtol,
+                    abs_err,
+                    max(rels) if rels else None,
+                    ok,
+                )
+            )
 
     # parallel_scan_log tolerance is the log-space exception to the flat
     # atol=1e-5 fp32 gate, and it is NOT a loosening of that gate (which
@@ -1885,9 +1913,7 @@ def _run_forward_parity_body(collect: list[dict] | None = None) -> int:
     a, b = _linear_scan_inputs(B, T, 64, device)
     check("linear_scan", "bf16 B=2 T=64 D=64", a.bfloat16(), b.bfloat16(), informational=True)
     M, b2 = _matrix_scan_inputs(B, T, 2, device)
-    check(
-        "matrix_scan", "bf16 B=2 T=64 n=2", M.bfloat16(), b2.bfloat16(), informational=True
-    )
+    check("matrix_scan", "bf16 B=2 T=64 n=2", M.bfloat16(), b2.bfloat16(), informational=True)
     A, Bm = _matrix_affine_scan_inputs(B, T, 1, 8, 4, device)
     check(
         "matrix_affine_scan",
@@ -1967,9 +1993,9 @@ def _run_grad_parity_body(collect: list[dict] | None = None) -> int:
             failures.append(f"{label}: Triton path raised {type(exc).__name__}: {exc}")
             print(f"  [FAIL] {label}: {type(exc).__name__}: {exc}")
             if collect is not None:
-                collect.append(_parity_row(
-                    name, tag, inputs[0], "grad", atol, rtol, None, None, False
-                ))
+                collect.append(
+                    _parity_row(name, tag, inputs[0], "grad", atol, rtol, None, None, False)
+                )
             return
         out_e = getattr(min_gru, name)(*eager_inputs)
         outs_t = out_t if isinstance(out_t, tuple) else (out_t,)
@@ -2005,9 +2031,9 @@ def _run_grad_parity_body(collect: list[dict] | None = None) -> int:
             failures.append(f"{label}: max_grad_abs={max_err:.2e}")
             print(f"  [FAIL] {label}: max_grad_abs={max_err:.2e}")
         if collect is not None:
-            collect.append(_parity_row(
-                name, tag, inputs[0], "grad", atol, rtol, max_err, max_rel, ok
-            ))
+            collect.append(
+                _parity_row(name, tag, inputs[0], "grad", atol, rtol, max_err, max_rel, ok)
+            )
 
     print("grad parallel_scan_log (recompute backward):")
     for B in Bs:
@@ -2153,12 +2179,10 @@ def _run_angle_fused_parity_body(collect: list[dict] | None = None) -> int:
             print(f"  [FAIL] {name}: {type(exc).__name__}: {exc}")
             os.environ["MINGRU_SCAN"] = "eager"
             if collect is not None:
-                collect.append(_parity_row(
-                    name, shape, x, "fwd", out_atol, 0.0, None, None, False
-                ))
-                collect.append(_parity_row(
-                    name, shape, x, "grad", grad_atol, grad_rtol, None, None, False
-                ))
+                collect.append(_parity_row(name, shape, x, "fwd", out_atol, 0.0, None, None, False))
+                collect.append(
+                    _parity_row(name, shape, x, "grad", grad_atol, grad_rtol, None, None, False)
+                )
             return
         (cot * out_t).sum().backward()
         grads_t = {nm: p.grad.detach().clone() for nm, p in mixer.named_parameters()}
@@ -2178,7 +2202,9 @@ def _run_angle_fused_parity_body(collect: list[dict] | None = None) -> int:
             err, rel = _max_abs_rel(gt, ge)
             grad_err = max(grad_err, err)
             grad_rel = max(grad_rel, rel)
-            grad_ok = grad_ok and torch.allclose(gt.float(), ge.float(), atol=grad_atol, rtol=grad_rtol)
+            grad_ok = grad_ok and torch.allclose(
+                gt.float(), ge.float(), atol=grad_atol, rtol=grad_rtol
+            )
         ok = out_ok and grad_ok
         if ok:
             n_pass += 1
@@ -2187,12 +2213,14 @@ def _run_angle_fused_parity_body(collect: list[dict] | None = None) -> int:
             failures.append(f"{name}: out={out_err:.2e} grad={grad_err:.2e}")
             print(f"  [FAIL] {name}: out={out_err:.2e} grad={grad_err:.2e}")
         if collect is not None:
-            collect.append(_parity_row(
-                name, shape, x, "fwd", out_atol, 0.0, out_err, out_rel, out_ok
-            ))
-            collect.append(_parity_row(
-                name, shape, x, "grad", grad_atol, grad_rtol, grad_err, grad_rel, grad_ok
-            ))
+            collect.append(
+                _parity_row(name, shape, x, "fwd", out_atol, 0.0, out_err, out_rel, out_ok)
+            )
+            collect.append(
+                _parity_row(
+                    name, shape, x, "grad", grad_atol, grad_rtol, grad_err, grad_rel, grad_ok
+                )
+            )
 
     print("angle-fused GivensMinGRU (k=8, rounds=3, exact stored-state backward):")
     check_mixer(
@@ -2218,7 +2246,9 @@ def _run_angle_fused_parity_body(collect: list[dict] | None = None) -> int:
     )
     check_mixer(
         "rotation snap=(2,3,4,6) decay=learnable",
-        lambda: min_gru.RotationMinGRU(32, 64, snap=(2, 3, 4, 6), decay="learnable", decay_rate=1.0),
+        lambda: min_gru.RotationMinGRU(
+            32, 64, snap=(2, 3, 4, 6), decay="learnable", decay_rate=1.0
+        ),
         1.0,
     )
 

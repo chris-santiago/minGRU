@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0]
+## [0.1.0] - 2026-07-17
 
 Initial release of `mingru-scans`.
 
@@ -27,8 +27,18 @@ Initial release of `mingru-scans`.
 - **Tests.** CPU-only pytest suite covering scan ops, mixers, dispatch
   semantics, the packaging surface, and docstring coverage, alongside the
   preserved `__main__` selftests in the root evidence drivers.
-- **Release tooling.** CPU test CI (`tests.yaml`), docs deploy (`docs.yml`),
-  and PyPI trusted-publishing on release (`publish.yaml`); a `check_wheel.sh`
-  wheel-and-install proof against a fresh venv.
+- **Release tooling.** Docs deploy on push to main (`docs.yml`) and PyPI
+  trusted-publishing on GitHub Release (`publish.yaml`); a `check_wheel.sh`
+  wheel-and-install proof against a fresh venv; nox sessions (`lint`,
+  `freeze`, `test`, `doctests`, `evidence`, `wheel`, `build`, `docs`) as the
+  local gate suite run before every release.
+- **Optional `[triton]` extra.** Unpinned convenience extra for CUDA-capable
+  torch builds from channels that omit triton; torch's own Linux CUDA wheels
+  already bundle the matching triton.
+- **Evidence artifacts.** Committed division-reversal error emulation
+  (`experiments/reversal_emulation.py` + `experiments/bench/` artifacts)
+  backing the exact stored-state backward decision, alongside the GPU
+  conformance (590/590), benchmark, and memory artifacts.
+- **Slides.** The parallel-GRUs deck and appendix published on the docs site.
 
 [0.1.0]: https://github.com/chris-santiago/minGRU/releases/tag/v0.1.0

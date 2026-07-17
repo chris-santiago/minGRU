@@ -51,7 +51,7 @@ def build_command(repo: str, ref: str, bench: bool) -> str:
         "set -euxo pipefail",
         (
             "python -c 'import torch; assert torch.cuda.is_available(), "
-            "\"no CUDA device\"; print(torch.__version__)'"
+            '"no CUDA device"; print(torch.__version__)\''
         ),
         "python -c 'import triton' || pip install --no-cache-dir triton",
         f"git clone --filter=blob:none {repo} /tmp/minGRU",

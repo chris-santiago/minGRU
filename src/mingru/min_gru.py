@@ -142,9 +142,7 @@ def _resolve_scan_mode(is_cuda: bool) -> str | None:
     """
     mode = os.environ.get("MINGRU_SCAN", "auto")
     if mode not in _VALID_SCAN_MODES:
-        raise ValueError(
-            f"MINGRU_SCAN must be one of {_VALID_SCAN_MODES} (got {mode!r})"
-        )
+        raise ValueError(f"MINGRU_SCAN must be one of {_VALID_SCAN_MODES} (got {mode!r})")
     if mode == "eager":
         return None
     if mode == "auto" and not is_cuda:
@@ -153,9 +151,7 @@ def _resolve_scan_mode(is_cuda: bool) -> str | None:
     return mode
 
 
-def _resolve_triton_dispatch(
-    mode: str, op_label: str, call
-) -> tuple[object | None, str | None]:
+def _resolve_triton_dispatch(mode: str, op_label: str, call) -> tuple[object | None, str | None]:
     """Shared ``triton_scans`` resolution: lazy import, per-op availability
     check + invocation via ``call``, and ``ScanFallback`` handling.
 
@@ -215,8 +211,7 @@ def _resolve_triton_dispatch(
 
     if mode == "triton":
         raise RuntimeError(
-            f"MINGRU_SCAN=triton requested for {op_label} but Triton is "
-            f"unavailable: {reason}"
+            f"MINGRU_SCAN=triton requested for {op_label} but Triton is unavailable: {reason}"
         )
     return None, reason
 
@@ -381,13 +376,19 @@ def _dispatch_angle_scan(
         if not hasattr(triton_scans, "angle_scan_impl"):
             raise triton_scans.ScanFallback("no angle-fused Triton kernel registered")
         return triton_scans.angle_scan_impl(
-            theta, scale, gamma, b, h0, perm, sgn, p2p,
-            has_scale=has_scale, has_decay=has_decay,
+            theta,
+            scale,
+            gamma,
+            b,
+            h0,
+            perm,
+            sgn,
+            p2p,
+            has_scale=has_scale,
+            has_decay=has_decay,
         )
 
-    result, reason = _resolve_triton_dispatch(
-        mode, "the angle-fused mixer path", _call
-    )
+    result, reason = _resolve_triton_dispatch(mode, "the angle-fused mixer path", _call)
     if reason is None:
         return result
 
@@ -801,9 +802,7 @@ class DecayMixin:
             error``.
         """
         if decay not in (None, "fixed", "learnable"):
-            raise ValueError(
-                f"decay must be None, 'fixed', or 'learnable' (got {decay!r})"
-            )
+            raise ValueError(f"decay must be None, 'fixed', or 'learnable' (got {decay!r})")
         if decay is not None and decay_rate <= 0:
             raise ValueError(
                 f"decay_rate must be > 0 when decay={decay!r} is enabled (got "
@@ -1009,9 +1008,7 @@ class MinGRU(DecayMixin, nn.Module):
     def _default_log_h0(self, B: int, x: torch.Tensor) -> torch.Tensor:
         if self.h0_pre is not None:
             return log_g(self.h0_pre).expand(B, 1, self.hidden_size)
-        return torch.full(
-            (B, 1, self.hidden_size), 0.5, dtype=x.dtype, device=x.device
-        ).log()
+        return torch.full((B, 1, self.hidden_size), 0.5, dtype=x.dtype, device=x.device).log()
 
     def forward(
         self,
@@ -1075,9 +1072,9 @@ class MinGRU(DecayMixin, nn.Module):
             # so log() stays finite.
             log_h_0 = h_0.clamp_min(torch.finfo(h_0.dtype).tiny).log()
 
-        k = self.linear_z(x)                    # pre-activation of z
-        log_z = -F.softplus(-k)                 # log(sigmoid(k)) = log(z)
-        log_coeffs = -F.softplus(k)             # log(1 - sigmoid(k)) = log(1 - z)
+        k = self.linear_z(x)  # pre-activation of z
+        log_z = -F.softplus(-k)  # log(sigmoid(k)) = log(z)
+        log_coeffs = -F.softplus(k)  # log(1 - sigmoid(k)) = log(1 - z)
         dt = self._prepare_decay(delta_t, canonical_ndim=2)
         if dt is not None:
             # log(gamma * (1 - z)) = log(1 - z) - lambda * f(dt); additive
@@ -1276,9 +1273,7 @@ def matrix_scan(M: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.T
     return A, Bc
 
 
-def matrix_affine_scan(
-    A: torch.Tensor, Bm: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+def matrix_affine_scan(A: torch.Tensor, Bm: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Associative scan for ``H_t = A_t @ H_{t-1} + B_t``, k x k transitions.
 
     The k x k generalization of ``matrix_scan``: transitions are square
@@ -1345,10 +1340,7 @@ def matrix_affine_scan(
     offset, T = 1, A.size(1)
     while offset < T:
         newA = torch.einsum("btnij,btnjk->btnik", Ab[:, offset:], Ab[:, :-offset])
-        newB = (
-            torch.einsum("btnij,btnjv->btniv", Ab[:, offset:], Bb[:, :-offset])
-            + Bb[:, offset:]
-        )
+        newB = torch.einsum("btnij,btnjv->btniv", Ab[:, offset:], Bb[:, :-offset]) + Bb[:, offset:]
         Ab = torch.cat([Ab[:, :offset], newA], dim=1)
         Bb = torch.cat([Bb[:, :offset], newB], dim=1)
         offset *= 2
@@ -1602,8 +1594,7 @@ class SignedMinGRU(DecayMixin, nn.Module):
 
     def extra_repr(self) -> str:
         return (
-            f"input_size={self.input_size}, hidden_size={self.hidden_size}, "
-            f"coupled={self.coupled}"
+            f"input_size={self.input_size}, hidden_size={self.hidden_size}, coupled={self.coupled}"
         )
 
 
@@ -1783,9 +1774,7 @@ class RotationMinGRU(DecayMixin, nn.Module):
                 f"RotationMinGRU requires an even hidden_size (got {hidden_size}); "
                 "state is n = hidden_size / 2 planar 2D blocks."
             )
-        if snap is not None and (
-            len(snap) == 0 or any(k < 1 for k in snap)
-        ):
+        if snap is not None and (len(snap) == 0 or any(k < 1 for k in snap)):
             raise ValueError(
                 f"snap must be None or a non-empty tuple of positive ints (got {snap!r})"
             )
@@ -1801,9 +1790,7 @@ class RotationMinGRU(DecayMixin, nn.Module):
         if snap is not None:
             self.register_buffer(
                 "snap_step",
-                torch.tensor(
-                    [2 * math.pi / snap[j % len(snap)] for j in range(self.n_blocks)]
-                ),
+                torch.tensor([2 * math.pi / snap[j % len(snap)] for j in range(self.n_blocks)]),
             )
         self._init_decay(decay, decay_rate, log1p_delta, self.n_blocks)
 
@@ -2003,8 +1990,16 @@ class RotationMinGRU(DecayMixin, nn.Module):
         has_decay = 1 if dt is not None else 0
         perm, sgn, p2p = self._angle_plane_meta(x.device)
         h = _dispatch_angle_scan(
-            theta, scale, gamma, b, h0_blocks, perm, sgn, p2p,
-            has_scale=1, has_decay=has_decay,
+            theta,
+            scale,
+            gamma,
+            b,
+            h0_blocks,
+            perm,
+            sgn,
+            p2p,
+            has_scale=1,
+            has_decay=has_decay,
         )
         if h is None:
             return None
@@ -2056,10 +2051,7 @@ class RotationMinGRU(DecayMixin, nn.Module):
         return h.reshape(B, self.hidden_size)
 
     def extra_repr(self) -> str:
-        return (
-            f"input_size={self.input_size}, hidden_size={self.hidden_size}, "
-            f"snap={self.snap}"
-        )
+        return f"input_size={self.input_size}, hidden_size={self.hidden_size}, snap={self.snap}"
 
 
 class GivensMinGRU(DecayMixin, nn.Module):
@@ -2458,8 +2450,16 @@ class GivensMinGRU(DecayMixin, nn.Module):
         has_decay = 1 if dt is not None else 0
         perm, sgn, p2p = self._angle_plane_meta(x.device)
         h = _dispatch_angle_scan(
-            theta, scale, gamma, b, h0_blocks, perm, sgn, p2p,
-            has_scale=0, has_decay=has_decay,
+            theta,
+            scale,
+            gamma,
+            b,
+            h0_blocks,
+            perm,
+            sgn,
+            p2p,
+            has_scale=0,
+            has_decay=has_decay,
         )
         if h is None:
             return None
@@ -2597,8 +2597,7 @@ class MinGRUBlock(nn.Module):
         super().__init__()
         if mixer not in self._MIXER_CLASSES:
             raise ValueError(
-                f"unknown mixer {mixer!r}; expected one of "
-                f"{sorted(self._MIXER_CLASSES)}"
+                f"unknown mixer {mixer!r}; expected one of {sorted(self._MIXER_CLASSES)}"
             )
         mixer_kwargs = dict(mixer_kwargs) if mixer_kwargs else {}
         self.norm1 = nn.LayerNorm(d_model)
@@ -2769,10 +2768,7 @@ def _resolve_stack_mixer_spec(
 
     if isinstance(mixer, list):
         if len(mixer) != n_layers:
-            raise ValueError(
-                f"mixer list length ({len(mixer)}) must equal n_layers "
-                f"({n_layers})"
-            )
+            raise ValueError(f"mixer list length ({len(mixer)}) must equal n_layers ({n_layers})")
         unknown = sorted({name for name in mixer if name not in valid_names})
         if unknown:
             raise ValueError(
@@ -2781,14 +2777,10 @@ def _resolve_stack_mixer_spec(
             )
         types_in_stack = set(mixer)
         if mixer_kwargs is None:
-            kwargs_by_type: dict[str, dict | None] = {
-                name: None for name in types_in_stack
-            }
+            kwargs_by_type: dict[str, dict | None] = {name: None for name in types_in_stack}
         else:
             bad_keys = sorted(
-                k
-                for k in mixer_kwargs
-                if k not in valid_names or k not in types_in_stack
+                k for k in mixer_kwargs if k not in valid_names or k not in types_in_stack
             )
             if bad_keys:
                 raise ValueError(
@@ -2930,22 +2922,16 @@ class MinGRUStack(nn.Module):
     ):
         super().__init__()
         if decay_layers not in ("all", "last"):
-            raise ValueError(
-                f"decay_layers must be 'all' or 'last' (got {decay_layers!r})"
-            )
+            raise ValueError(f"decay_layers must be 'all' or 'last' (got {decay_layers!r})")
         self.decay_layers = decay_layers
-        self.in_proj = (
-            nn.Linear(input_size, d_model) if input_size != d_model else nn.Identity()
-        )
+        self.in_proj = nn.Linear(input_size, d_model) if input_size != d_model else nn.Identity()
         # Normalize mixer/mixer_kwargs to a per-block mixer list and a
         # kwargs dict keyed by mixer type name (a str mixer collapses to
         # a single-entry list/dict, so the rest of __init__ is generic
         # over both forms). See _resolve_stack_mixer_spec for the
         # ValueError cases (length mismatch, unknown name, schema
         # mismatch between mixer's type and mixer_kwargs's shape).
-        mixer_list, kwargs_by_type = _resolve_stack_mixer_spec(
-            mixer, mixer_kwargs, n_layers
-        )
+        mixer_list, kwargs_by_type = _resolve_stack_mixer_spec(mixer, mixer_kwargs, n_layers)
         # "last": non-final blocks get their resolved kwargs with decay
         # keys stripped, by position, whatever that block's mixer type;
         # the final block keeps its resolved kwargs unchanged. "all"
@@ -2977,13 +2963,9 @@ class MinGRUStack(nn.Module):
         for i in range(n_layers):
             is_last_block = i == n_layers - 1
             name = mixer_list[i]
-            block_kwargs = (
-                kwargs_by_type[name] if is_last_block else stripped_by_type[name]
-            )
+            block_kwargs = kwargs_by_type[name] if is_last_block else stripped_by_type[name]
             blocks.append(
-                MinGRUBlock(
-                    d_model, mlp_expansion, dropout, learnable_h0, name, block_kwargs
-                )
+                MinGRUBlock(d_model, mlp_expansion, dropout, learnable_h0, name, block_kwargs)
             )
         self.blocks = nn.ModuleList(blocks)
         self.norm_out = nn.LayerNorm(d_model)
