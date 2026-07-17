@@ -1082,6 +1082,7 @@ if _HAS_TRITON:
     # branch.
 
     def _affine_setup_context(ctx, inputs, output):
+        """``register_autograd`` setup hook: save what ``_affine_backward`` needs."""
         A, _Bm = inputs
         Abar, Bbar = output
         # Saves the forward input A and forward outputs Abar/Bbar only --
@@ -1090,6 +1091,7 @@ if _HAS_TRITON:
         ctx.save_for_backward(A, Abar, Bbar)
 
     def _affine_backward(ctx, grad_Abar, grad_Bbar):
+        """``register_autograd`` backward for ``affine_scan_fwd``: dispatches to ``affine_scan_bwd``."""
         A, Abar, Bbar = ctx.saved_tensors
         dA, dB = affine_scan_bwd(A, Abar, Bbar, grad_Abar, grad_Bbar)
         return dA, dB
@@ -1101,11 +1103,13 @@ if _HAS_TRITON:
     )
 
     def _linear_setup_context(ctx, inputs, output):
+        """``register_autograd`` setup hook: save what ``_linear_backward`` needs."""
         a, _b = inputs
         A, Bc = output
         ctx.save_for_backward(a, A, Bc)
 
     def _linear_backward(ctx, grad_A, grad_Bc):
+        """``register_autograd`` backward for ``linear_scan_fwd``: dispatches to ``linear_scan_bwd``."""
         a, A, Bc = ctx.saved_tensors
         da, db = linear_scan_bwd(a, A, Bc, grad_A, grad_Bc)
         return da, db
@@ -1117,6 +1121,7 @@ if _HAS_TRITON:
     )
 
     def _parallel_scan_log_setup_context(ctx, inputs, output):
+        """``register_autograd`` setup hook: save what ``_parallel_scan_log_backward`` needs."""
         log_coeffs, log_values = inputs
         # Autograd-through-recomputation: the log op has no hand-derived
         # adjoint kernel (nothing to get wrong blind). Saving the two forward
@@ -1126,6 +1131,7 @@ if _HAS_TRITON:
         ctx.save_for_backward(log_coeffs, log_values)
 
     def _parallel_scan_log_backward(ctx, grad_h):
+        """``register_autograd`` backward for ``parallel_scan_log_fwd`` via autograd-through-recomputation."""
         # No `grad_h is None` guard: per the "None-grad handling" note
         # above (this op has a single output, so the same
         # always-materialized-tensor guarantee applies), `grad_h` is never
@@ -1301,6 +1307,7 @@ if _HAS_TRITON:
         return dtheta, dscale, dgamma, db, dh0
 
     def _angle_setup_context(ctx, inputs, output):
+        """``register_autograd`` setup hook: save what ``_angle_backward`` needs."""
         (theta, scale, gamma, b, h0, perm, sgn, p2p,
          has_scale, has_decay) = inputs
         # The forward output (all states) is what the backward reads every
@@ -1311,6 +1318,7 @@ if _HAS_TRITON:
         ctx.has_decay = has_decay
 
     def _angle_backward(ctx, grad_out):
+        """``register_autograd`` backward for ``angle_scan_fwd``: dispatches to ``angle_scan_bwd``."""
         theta, scale, gamma, b, h0, out, perm, sgn, p2p = ctx.saved_tensors
         dtheta, dscale, dgamma, db, dh0 = angle_scan_bwd(
             theta, scale, gamma, b, h0, out, grad_out, perm, sgn, p2p,
