@@ -8,7 +8,8 @@ dynamic = ["version"]
 description = "Parallel-scan minGRU variants (log-space, signed, rotation, Givens) with an optional Triton scan backend."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Chris Santiago", email = "cjsantiago@gatech.edu" }]
 keywords = ["minGRU", "rnn", "parallel-scan", "triton", "pytorch", "sequence-model"]
 classifiers = [

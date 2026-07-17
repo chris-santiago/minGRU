@@ -1636,7 +1636,10 @@ class RotationMinGRU(DecayMixin, nn.Module):
     gradient passes through the pre-snap "soft" angle unchanged. ``K``
     is cycled across blocks from the ``snap`` tuple (block ``j`` uses
     ``snap[j % len(snap)]``). This manufactures attractors at exact
-    group elements, the same way ``tanh``'s asymptote manufactures an
+    group elements -- exactly for the snapped angle; the scale channel
+    ``tanh(u_t)`` reaches a group element (+-1) only as the ``u``-head
+    saturates, so full-map exactness is empirical -- the same way
+    ``tanh``'s asymptote manufactures an
     attractor at eigenvalue -1 for ``SignedMinGRU``: without snapping,
     plain rotation angles have no attractor and drift with sequence
     length (error compounds with T). The snap grid must contain the

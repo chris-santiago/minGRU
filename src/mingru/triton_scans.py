@@ -185,6 +185,13 @@ def parallel_scan_log_recompute(
     ordinary CI (and the GPU-less Phase-4 wheel CI), not only the GPU-only
     grad-parity selftest.
 
+    Cost note: because the backward differentiates through this full eager
+    recompute (under ``enable_grad``), the Triton route's forward+backward
+    for ``parallel_scan_log`` is measured SLOWER than eager -- 0.70-0.80x at
+    benchmarked shapes (``experiments/bench/scan_bench.md`` in the
+    repository); ``MINGRU_SCAN=eager`` is the faster training choice for
+    this op today.
+
     MAINTENANCE: this formula must be kept byte-identical to
     ``min_gru.parallel_scan_log``'s eager body (``a_star = pad(cumsum(log_coeffs));
     log_h = a_star + logcumsumexp(log_values - a_star); h = exp(log_h)[:, 1:]``).

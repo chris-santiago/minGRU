@@ -8,7 +8,9 @@ is exposed *lazily* via :pep:`562` module ``__getattr__``: ``import mingru``
 never imports the Triton module, and only touching a Triton-backed name
 (e.g. ``mingru.ScanFallback``, ``mingru.angle_scan_impl``) triggers its
 import. This keeps ``import mingru`` working wherever the eager library works
-(including the torch==2.5.1 evidence pin). Once torch>=2.8 is installed,
+(including torch releases older than 2.8 -- the repository's recorded
+evidence environment runs the eager library under torch 2.5.1). Once
+torch>=2.8 is installed,
 :mod:`mingru.triton_scans` imports successfully and its three unconditional
 names (``available``, ``ScanFallback``, ``SCAN_IMPLS``) resolve regardless of
 platform; the other eight names (the raw kernel wrappers -- e.g.
@@ -24,8 +26,8 @@ the eager API: every Triton-module name -- including ``available``,
 ``ScanFallback``, and ``SCAN_IMPLS``, which exist on every Triton-importable
 build -- resolves through this module's ``__getattr__`` by importing
 :mod:`mingru.triton_scans`, and that import raises ``ImportError`` outright
-below the module's torch>=2.8 floor (e.g. under the torch==2.5.1 evidence
-pin). Since ``__all__``/``__dir__``/``import *`` must resolve on *every*
+below the module's torch>=2.8 floor (i.e. on any pre-2.8 torch).
+Since ``__all__``/``__dir__``/``import *`` must resolve on *every*
 build the eager API supports, no Triton name -- gated or not -- belongs in
 them; all are still reachable individually via ``mingru.<name>`` attribute
 access, which imports :mod:`mingru.triton_scans` lazily on first touch (the
