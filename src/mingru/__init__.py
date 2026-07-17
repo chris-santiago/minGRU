@@ -8,8 +8,16 @@ is exposed *lazily* via :pep:`562` module ``__getattr__``: ``import mingru``
 never imports the Triton module, and only touching a Triton-backed name
 (e.g. ``mingru.ScanFallback``, ``mingru.angle_scan_impl``) triggers its
 import. This keeps ``import mingru`` working wherever the eager library works
-(including the torch==2.5.1 evidence pin) while still advertising the full
-dispatch surface to installed users on torch>=2.8.
+(including the torch==2.5.1 evidence pin). Once torch>=2.8 is installed,
+:mod:`mingru.triton_scans` imports successfully and its three unconditional
+names (``available``, ``ScanFallback``, ``SCAN_IMPLS``) resolve regardless of
+platform; the other eight names (the raw kernel wrappers -- e.g.
+``angle_scan_impl`` and each scan op's ``*_fwd``/``*_bwd`` pair) additionally
+require a working Triton install, and so only resolve where Triton itself is
+installable (currently: torch's Linux CUDA wheels). On macOS, Windows, or a
+Linux CPU-only install, touching one of those eight raises
+``AttributeError`` -- the import of :mod:`mingru.triton_scans` itself still
+succeeds; only the attribute lookup inside it fails.
 
 ``__all__`` (and thus ``__dir__`` and ``from mingru import *``) lists only
 the eager API: every Triton-module name -- including ``available``,
@@ -20,7 +28,9 @@ below the module's torch>=2.8 floor (e.g. under the torch==2.5.1 evidence
 pin). Since ``__all__``/``__dir__``/``import *`` must resolve on *every*
 build the eager API supports, no Triton name -- gated or not -- belongs in
 them; all are still reachable individually via ``mingru.<name>`` attribute
-access, which imports :mod:`mingru.triton_scans` lazily on first touch.
+access, which imports :mod:`mingru.triton_scans` lazily on first touch (the
+three unconditional names resolve there on any torch>=2.8 install; the
+other eight additionally need Triton, per above).
 """
 
 from .min_gru import *  # noqa: F401,F403 -- eager public API re-export
@@ -31,13 +41,19 @@ __version__ = "0.1.0"
 # Names of :mod:`mingru.triton_scans` reachable lazily via `__getattr__`.
 # Listed statically (rather than read off the module's ``__all__``) so that
 # ``import mingru`` need not import the Triton module to resolve this tuple --
-# the whole point of the PEP 562 lazy path. ALL eleven, including the three
-# defined unconditionally (``available``/``ScanFallback``/``SCAN_IMPLS``), are
-# deliberately excluded from ``__all__`` below: resolving any of them imports
+# the whole point of the PEP 562 lazy path. All eleven are deliberately
+# excluded from ``__all__`` below: resolving any of them imports
 # :mod:`mingru.triton_scans`, and that import raises ``ImportError`` below the
 # module's torch>=2.8 floor (the torch==2.5.1 evidence pin) -- a failure mode
-# ``__all__``/``__dir__``/``from mingru import *`` must never trigger. Each
-# name still resolves individually via `mingru.<name>` attribute access.
+# ``__all__``/``__dir__``/``from mingru import *`` must never trigger. Only
+# the first three (``available``/``ScanFallback``/``SCAN_IMPLS``) are defined
+# unconditionally in ``triton_scans`` and so resolve on every torch>=2.8
+# install; the remaining eight (the raw kernel wrappers) are defined only
+# under that module's ``if _HAS_TRITON:`` block and raise ``AttributeError``
+# -- not ``ImportError`` -- via `getattr` below on a torch>=2.8 install
+# without a working Triton (e.g. macOS, Windows, or Linux CPU-only). Each
+# name still resolves individually via `mingru.<name>` attribute access where
+# its platform requirements are met.
 _TRITON_EXPORTS = (
     "available",
     "ScanFallback",

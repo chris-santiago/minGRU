@@ -95,6 +95,16 @@ Decay = Literal["fixed", "learnable"] | None
 # (.claude/output/specs/2026-07-16-triton-scan-kernels-design.md) §4 for
 # the full contract. triton_scans is imported lazily, only from within
 # this function, so importing/running min_gru.py never attempts it.
+#
+# Disclosure: for `parallel_scan_log` specifically (the `MinGRU`/
+# `SignedMinGRU` path), "auto" routing the fwd+bwd of a training step to
+# the Triton kernel on CUDA is measured SLOWER than eager at benchmarked
+# shapes (0.70-0.80x eager; see experiments/bench/scan_bench.md) -- the
+# forward-only kernel is roughly on par with eager, but the backward's
+# autograd-through-recomputation reruns the eager forward under
+# `enable_grad`, doubling the forward cost. `MINGRU_SCAN=eager` is the
+# right choice for training the base mixer today; this is disclosure
+# only, the routing itself is unchanged.
 _VALID_SCAN_MODES = ("auto", "eager", "triton")
 _warned_scan_fallback = False
 _warned_angle_fallback = False
@@ -501,6 +511,15 @@ def parallel_scan_log(log_coeffs: torch.Tensor, log_values: torch.Tensor) -> tor
     Heinsen (2023), "Efficient Parallelization of a Ubiquitous Sequential
     Computation" -- the log-space cumulative-sum / logcumsumexp scan.
 
+    Notes
+    -----
+    Under ``MINGRU_SCAN=auto`` (the default) on CUDA, this op dispatches to
+    a Triton kernel that is measured SLOWER than eager for a full forward+
+    backward training step at benchmarked shapes (0.70-0.80x eager; see
+    ``experiments/bench/scan_bench.md``), even though its forward-only
+    latency is roughly on par with eager. ``MINGRU_SCAN=eager`` is the
+    right choice for training ``MinGRU``/``SignedMinGRU`` today.
+
     Examples
     --------
     >>> import torch
@@ -537,7 +556,9 @@ def parallel_scan_log(log_coeffs: torch.Tensor, log_values: torch.Tensor) -> tor
 
 # Cap applied to +inf entries during delta_t sanitization (see
 # _normalize_delta_t). Empirically, an unclamped +inf overflows MinGRU's
-# log-space scan to NaN; 1e10 was verified (by the __main__ NaN/inf test)
+# log-space scan to NaN; 1e10 was verified (by the NaN/inf test in the
+# repo-root `min_gru.py` evidence driver's `__main__` selftest -- run via
+# `python min_gru.py` from a checkout, not shipped in the wheel)
 # to stay finite end-to-end for all three mixers, at every decay_rate the
 # self-test suite exercises.
 _DELTA_T_POSINF_CAP = 1e10
@@ -724,8 +745,9 @@ class DecayMixin:
     This is the single place the attribute contract is declared; do
     not reorder attribute assignment or buffer/parameter registration
     inside ``_init_decay`` — every state_dict-order and bit-identity
-    self-test in this module's ``__main__`` depends on these names and
-    their construction order.
+    self-test in the repo-root ``min_gru.py`` evidence driver's
+    ``__main__`` (run via ``python min_gru.py`` from a checkout) depends
+    on these names and their construction order.
     """
 
     decay: Decay
@@ -1905,10 +1927,10 @@ class RotationMinGRU(DecayMixin, nn.Module):
 
         Pure extraction of ``_angle_fused_forward``'s head-assembly math
         (no CUDA gate, no kernel dispatch) -- lets a CPU-runnable selftest
-        (``__main__``'s "CPU lockstep guard" section) call this directly and
-        cross-check its reconstructed transition against ``_coeffs``'s
-        ``(M, b)``, the MAINTENANCE lockstep this method's caller-side
-        comment warns about.
+        (the repo-root ``min_gru.py`` evidence driver's ``__main__``, "CPU
+        lockstep guard" section) call this directly and cross-check its
+        reconstructed transition against ``_coeffs``'s ``(M, b)``, the
+        MAINTENANCE lockstep this method's caller-side comment warns about.
 
         MAINTENANCE: this head derivation (``linear_theta``, snap STE,
         ``linear_u`` -> ``tanh``, ``linear_z``/``linear_h`` -> ``b``) must be
@@ -1919,9 +1941,10 @@ class RotationMinGRU(DecayMixin, nn.Module):
         change to ``_coeffs``'s head math must be mirrored in this method by
         hand. Two checks catch divergence: the GPU-only module-level
         angle-fused parity selftest (``triton_scans._run_angle_fused_parity``)
-        and the CPU-runnable ``__main__`` lockstep assertion below (which
-        needs no GPU/Triton, so ordinary CI and the GPU-less Phase-4 wheel CI
-        both catch drift too).
+        and the CPU-runnable lockstep assertion in the repo-root
+        ``min_gru.py`` evidence driver's ``__main__`` (run via ``python
+        min_gru.py`` from a checkout, needs no GPU/Triton, so ordinary CI
+        and the GPU-less Phase-4 wheel CI both catch drift too).
 
         Returns
         -------
@@ -2358,10 +2381,10 @@ class GivensMinGRU(DecayMixin, nn.Module):
 
         Pure extraction of ``_angle_fused_forward``'s head-assembly math (no
         CUDA gate, no kernel dispatch) -- lets a CPU-runnable selftest
-        (``__main__``'s "CPU lockstep guard" section) call this directly and
-        cross-check its reconstructed transition against ``_coeffs``'s
-        ``(M, b)``, the MAINTENANCE lockstep this method's caller-side
-        comment warns about.
+        (the repo-root ``min_gru.py`` evidence driver's ``__main__``, "CPU
+        lockstep guard" section) call this directly and cross-check its
+        reconstructed transition against ``_coeffs``'s ``(M, b)``, the
+        MAINTENANCE lockstep this method's caller-side comment warns about.
 
         MAINTENANCE: this head derivation (``linear_theta`` view,
         ``linear_z``/``linear_h`` -> ``b``) must be kept byte-for-byte in
@@ -2372,8 +2395,10 @@ class GivensMinGRU(DecayMixin, nn.Module):
         must be mirrored in this method by hand. Two checks catch
         divergence: the GPU-only module-level angle-fused parity selftest
         (``triton_scans._run_angle_fused_parity``) and the CPU-runnable
-        ``__main__`` lockstep assertion below (which needs no GPU/Triton, so
-        ordinary CI and the GPU-less Phase-4 wheel CI both catch drift too).
+        lockstep assertion in the repo-root ``min_gru.py`` evidence driver's
+        ``__main__`` (run via ``python min_gru.py`` from a checkout, needs no
+        GPU/Triton, so ordinary CI and the GPU-less Phase-4 wheel CI both
+        catch drift too).
 
         Returns
         -------

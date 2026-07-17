@@ -143,8 +143,9 @@ def _scan_env(mode: str | None = None):
     the duration of the block, then restore whatever value (or absence)
     preceded it.
 
-    Matches ``min_gru.py``'s own ``__main__`` selftest discipline (its
-    ``_set_scan_env``/``finally: _set_scan_env(_saved_scan_env)`` pattern).
+    Matches the repo-root ``min_gru.py`` evidence driver's own ``__main__``
+    selftest discipline (its ``_set_scan_env``/``finally:
+    _set_scan_env(_saved_scan_env)`` pattern).
     Without this, each parity runner (``_run_forward_parity``,
     ``_run_grad_parity``, ``_run_angle_fused_parity``) set
     ``os.environ["MINGRU_SCAN"] = "eager"`` (or ``"triton"``) to force one
@@ -180,8 +181,9 @@ def parallel_scan_log_recompute(
     it is always importable, even on a CPU-only/no-Triton install. Two
     callers: ``_parallel_scan_log_backward``'s autograd-through-recomputation
     (inside ``_HAS_TRITON`` -- differentiates through this via
-    ``torch.autograd.grad``), and this module's own ``__main__`` CPU
-    lockstep selftest below, which asserts this function matches
+    ``torch.autograd.grad``), and the repo-root ``triton_scans.py`` evidence
+    driver's own ``__main__`` CPU lockstep selftest (run via ``python
+    triton_scans.py`` from a checkout), which asserts this function matches
     ``min_gru.parallel_scan_log`` on random CPU tensors WITHOUT needing a
     GPU/Triton -- catching drift between this and the eager reference on
     ordinary CI (and the GPU-less Phase-4 wheel CI), not only the GPU-only
@@ -1171,10 +1173,10 @@ if _HAS_TRITON:
             # Calls the module-level `parallel_scan_log_recompute` (defined
             # above, outside this `if _HAS_TRITON:` block) rather than
             # inlining the formula here -- the CPU-runnable lockstep
-            # selftest in `__main__` below cross-checks THAT function
-            # against `min_gru.parallel_scan_log`, so this call site
-            # inherits that guarantee instead of maintaining its own
-            # unchecked copy.
+            # selftest in the repo-root `triton_scans.py` evidence driver's
+            # `__main__` cross-checks THAT function against
+            # `min_gru.parallel_scan_log`, so this call site inherits that
+            # guarantee instead of maintaining its own unchecked copy.
             h = parallel_scan_log_recompute(lc, lv)
         dlc, dlv = torch.autograd.grad(h, (lc, lv), grad_outputs=grad_h)
         return dlc, dlv
