@@ -72,6 +72,12 @@ def main() -> int:
     ap.add_argument("--ref", default=None)
     ap.add_argument("--repo", default=None)
     ap.add_argument("--teamspace", default=os.environ.get("MINGRU_LIGHTNING_TEAMSPACE"))
+    ap.add_argument(
+        "--studio",
+        default=os.environ.get("MINGRU_LIGHTNING_STUDIO"),
+        help="run via Studio.run_job (the studio's warm machine pool + env snapshot) "
+        "instead of a container-image batch job -- attaches much faster",
+    )
     ap.add_argument("--bench", action="store_true")
     ap.add_argument("--interruptible", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
@@ -85,7 +91,7 @@ def main() -> int:
         "name": f"{JOB_NAME}-{ref[:7]}",
         "teamspace": args.teamspace,
         "machine": args.machine,
-        "image": args.image,
+        "mode": f"studio:{args.studio}" if args.studio else f"image:{args.image}",
         "interruptible": args.interruptible,
         "command": command,
     }
@@ -107,7 +113,7 @@ def main() -> int:
             print(f"error: {var} not set (lightning.ai Settings -> Keys)", file=sys.stderr)
             return 2
 
-    from lightning_sdk import Job, Machine
+    from lightning_sdk import Job, Machine, Studio
 
     try:
         machine = getattr(Machine, args.machine)
@@ -135,7 +141,19 @@ def main() -> int:
             **owner_kw,
         )
 
-    if owner is None:
+    if args.studio:
+        studio = Studio(
+            args.studio,
+            teamspace=ts_name,
+            **({"org": owner} if owner else {}),
+        )
+        job = studio.run_job(
+            name=spec["name"],
+            machine=machine,
+            command=command,
+            interruptible=args.interruptible,
+        )
+    elif owner is None:
         job = _run()
     else:
         try:
