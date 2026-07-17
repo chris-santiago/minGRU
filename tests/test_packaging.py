@@ -100,9 +100,9 @@ class TestTypingMarker:
 class TestLazyImport:
     def _run(self, snippet: str) -> subprocess.CompletedProcess:
         env = dict(os.environ)
-        env["PYTHONPATH"] = os.pathsep.join(
-            [str(_SRC_DIR), env.get("PYTHONPATH", "")]
-        ).rstrip(os.pathsep)
+        env["PYTHONPATH"] = os.pathsep.join([str(_SRC_DIR), env.get("PYTHONPATH", "")]).rstrip(
+            os.pathsep
+        )
         return subprocess.run(
             [sys.executable, "-c", snippet],
             capture_output=True,

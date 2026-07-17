@@ -44,11 +44,7 @@ _NUMPY_SECTIONS = frozenset(
 
 def _public_symbols():
     """Public API objects that should be documented (excludes __version__)."""
-    return [
-        (name, getattr(mingru, name))
-        for name in mingru.__all__
-        if name != "__version__"
-    ]
+    return [(name, getattr(mingru, name)) for name in mingru.__all__ if name != "__version__"]
 
 
 # ===========================================================================
@@ -91,8 +87,7 @@ class TestNumpyStructure:
                     underline = lines[i + 1].strip()
                     if underline and set(underline) == {"-"}:
                         assert len(underline) == len(header), (
-                            f"{name}: '{header}' underline length "
-                            f"{len(underline)} != {len(header)}"
+                            f"{name}: '{header}' underline length {len(underline)} != {len(header)}"
                         )
 
     def test_classes_document_parameters(self):

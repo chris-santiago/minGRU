@@ -76,9 +76,7 @@ def _git_show(ref_path: str) -> str:
 def _strip_docstrings(node: ast.AST) -> ast.AST:
     """Remove module/class/function leading-string-literal docstrings, in place."""
     for child in ast.walk(node):
-        if isinstance(
-            child, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-        ):
+        if isinstance(child, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             body = getattr(child, "body", [])
             if (
                 body
@@ -99,7 +97,7 @@ def _find_main_block(tree: ast.Module) -> ast.If:
             and node.test.left.id == "__name__"
         ):
             return node
-    raise SystemExit("FAIL: no `if __name__ == \"__main__\"` block found")
+    raise SystemExit('FAIL: no `if __name__ == "__main__"` block found')
 
 
 def _without_main_block(tree: ast.Module) -> ast.Module:
@@ -246,8 +244,7 @@ def check_selftest_relocation(
         errors.append(
             f"selftest relocation: root {driver_name} __main__ block diverges "
             f"from `git show {main_ref}` __main__ beyond the permitted import "
-            "header + module-name-string adaptations.\n"
-            + _first_divergence(main_dump, driver_dump)
+            "header + module-name-string adaptations.\n" + _first_divergence(main_dump, driver_dump)
         )
     return errors
 

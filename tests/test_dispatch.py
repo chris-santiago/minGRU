@@ -158,12 +158,28 @@ class TestAutoWarnOnceFallback:
         with warnings.catch_warnings(record=True) as records:
             warnings.simplefilter("always")
             first = mg._dispatch_angle_scan(
-                theta, None, None, None, None, None, None, None,
-                has_scale=1, has_decay=0,
+                theta,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                has_scale=1,
+                has_decay=0,
             )
             second = mg._dispatch_angle_scan(
-                theta, None, None, None, None, None, None, None,
-                has_scale=1, has_decay=0,
+                theta,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                has_scale=1,
+                has_decay=0,
             )
         assert first is None
         assert second is None

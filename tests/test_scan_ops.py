@@ -63,9 +63,7 @@ def _ref_matrix_scan(M: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, to
     return torch.stack(A_out, dim=1), torch.stack(Bc_out, dim=1)
 
 
-def _ref_matrix_affine_scan(
-    A: torch.Tensor, Bm: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _ref_matrix_affine_scan(A: torch.Tensor, Bm: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     k = A.size(-1)
     A_run = torch.eye(k, dtype=A.dtype).expand_as(A[:, 0]).clone()
     Bb_run = torch.zeros_like(Bm[:, 0])
