@@ -41,6 +41,7 @@ O(1)-memory streaming via step().
 """
 
 import math
+import os
 import warnings
 from typing import Literal
 
@@ -48,7 +49,376 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Public surface (additive metadata, Phase-4 packaging prep): the four
+# mixers, the block/stack wrappers, and the four scan functions -- exactly
+# what the README documents as importable (e.g. `from min_gru import
+# MinGRUStack`). Everything else (dispatch internals, decay machinery,
+# `g`/`log_g`, `DecayMixin`) is implementation detail, not part of the
+# documented public API.
+__all__ = [
+    "MinGRU",
+    "SignedMinGRU",
+    "RotationMinGRU",
+    "GivensMinGRU",
+    "MinGRUBlock",
+    "MinGRUStack",
+    "parallel_scan_log",
+    "linear_scan",
+    "matrix_scan",
+    "matrix_affine_scan",
+]
+
 Decay = Literal["fixed", "learnable"] | None
+
+# --- Triton scan dispatch seam ----------------------------------------------
+#
+# MINGRU_SCAN selects which implementation backs the four scan functions
+# below (mirrors probes.py's MAX_STEPS/CKPT env-var idiom: read via
+# os.environ.get at call time, not cached at import time):
+#   "auto" (default) -- CUDA-resident inputs with an importable, available
+#       Triton kernel registered for the op run that kernel; everything
+#       else (CPU tensors, missing/unavailable triton_scans, no kernel
+#       registered yet for the op) falls back to the eager implementation
+#       below, unchanged. A CUDA-input fallback warns exactly once per
+#       process, naming the reason.
+#   "eager" -- always the eager implementation; triton_scans is never
+#       imported.
+#   "triton" -- always a Triton kernel; raises rather than silently
+#       falling back to eager if one isn't available.
+# See triton_scans.py and the design spec
+# (.claude/output/specs/2026-07-16-triton-scan-kernels-design.md) §4 for
+# the full contract. triton_scans is imported lazily, only from within
+# this function, so importing/running min_gru.py never attempts it.
+_VALID_SCAN_MODES = ("auto", "eager", "triton")
+_warned_scan_fallback = False
+_warned_angle_fallback = False
+
+
+def _resolve_scan_mode(is_cuda: bool) -> str | None:
+    """Validate ``MINGRU_SCAN`` and apply the eager/CPU-``auto`` short-circuit.
+
+    Shared by ``_dispatch_scan``, ``_angle_scan_should_try``, and
+    ``_dispatch_angle_scan`` -- the identical "read ``MINGRU_SCAN``,
+    validate it, then skip Triton for ``eager`` or CPU-resident ``auto``"
+    check used to be duplicated across the first two; hoisting it here lets
+    ``_dispatch_angle_scan`` call it directly too, so it no longer has to
+    (silently) trust that ``_angle_scan_should_try`` already ran first --
+    see ``_dispatch_angle_scan``'s docstring.
+
+    Parameters
+    ----------
+    is_cuda : bool
+        Whether this call's tensor input is CUDA-resident.
+
+    Returns
+    -------
+    str or None
+        The validated mode (``"auto"`` or ``"triton"``) if a Triton path
+        should be attempted; ``None`` if the caller should just run its
+        existing eager implementation (``MINGRU_SCAN=eager``, or ``auto``
+        with a CPU-resident input -- CPU behavior is unchanged: no import
+        attempted, no warning).
+
+    Raises
+    ------
+    ValueError
+        If ``MINGRU_SCAN`` is not one of ``"auto"``, ``"eager"``, ``"triton"``.
+    """
+    mode = os.environ.get("MINGRU_SCAN", "auto")
+    if mode not in _VALID_SCAN_MODES:
+        raise ValueError(
+            f"MINGRU_SCAN must be one of {_VALID_SCAN_MODES} (got {mode!r})"
+        )
+    if mode == "eager":
+        return None
+    if mode == "auto" and not is_cuda:
+        # CPU behavior is unchanged: no import attempted, no warning.
+        return None
+    return mode
+
+
+def _resolve_triton_dispatch(
+    mode: str, op_label: str, call
+) -> tuple[object | None, str | None]:
+    """Shared ``triton_scans`` resolution: lazy import, per-op availability
+    check + invocation via ``call``, and ``ScanFallback`` handling.
+
+    Both ``_dispatch_scan`` and ``_dispatch_angle_scan`` need the identical
+    "lazily import ``triton_scans``, confirm there's a usable Triton path
+    for this op, invoke it, treat a declined/failed kernel exactly like any
+    other unavailability reason" flow, differing only in which op-specific
+    availability check and kernel call to make -- this is the one hoisted
+    copy of that machinery, parameterized by ``call``.
+
+    Parameters
+    ----------
+    mode : str
+        The value a caller's own ``_resolve_scan_mode`` call already
+        validated and returned. Always ``"auto"`` or ``"triton"`` here --
+        this function is only ever reached after ruling out ``"eager"``
+        and CPU-resident ``"auto"`` (never called with any other value).
+    op_label : str
+        Human-readable name of the op/path for the ``MINGRU_SCAN=triton``
+        error message (e.g. ``repr(scan_name)``, or a fixed phrase for the
+        angle-fused path).
+    call : Callable[[module], object]
+        Given the imported ``triton_scans`` module, perform this op's own
+        availability check(s) and the actual kernel invocation, raising
+        ``triton_scans.ScanFallback`` (never a bare exception) if no usable
+        Triton path exists for this call -- out-of-envelope shape, no
+        kernel registered yet, or a launch/compile failure are all the
+        same "declined" signal to this function.
+
+    Returns
+    -------
+    tuple of (result, reason)
+        ``(kernel_result, None)`` if a Triton path ran; ``(None, reason)``
+        if it didn't (only possible when ``mode == "auto"`` -- ``"triton"``
+        raises directly below instead of returning a reason). The caller
+        owns the ``mode == "auto"`` warn-once call itself (rather than this
+        helper doing it), so each ``warnings.warn``'s ``stacklevel`` keeps
+        pointing at that caller's own original call site, unaffected by
+        this helper's stack depth.
+
+    Raises
+    ------
+    RuntimeError
+        If ``mode == "triton"`` but no Triton path is usable for this call
+        (never a silent downgrade to eager).
+    """
+    reason = None
+    try:
+        import triton_scans
+    except ImportError as exc:
+        reason = f"triton_scans not importable: {exc}"
+    else:
+        try:
+            return call(triton_scans), None
+        except triton_scans.ScanFallback as exc:
+            reason = str(exc)
+
+    if mode == "triton":
+        raise RuntimeError(
+            f"MINGRU_SCAN=triton requested for {op_label} but Triton is "
+            f"unavailable: {reason}"
+        )
+    return None, reason
+
+
+def _dispatch_scan(name: str, *args: torch.Tensor):
+    """Resolve ``MINGRU_SCAN`` and run a Triton scan kernel if selected.
+
+    Called as a guard at the top of each of the four scan functions
+    (``parallel_scan_log``, ``linear_scan``, ``matrix_scan``,
+    ``matrix_affine_scan``), before any of their existing eager
+    computation. A non-``None`` return is the scan's final result (the
+    caller returns it immediately, skipping the eager code below); a
+    ``None`` return means "fall through to the unchanged eager
+    implementation".
+
+    Parameters
+    ----------
+    name : str
+        The scan function's own name, used to look up its Triton
+        implementation in ``triton_scans.SCAN_IMPLS`` and to name the op
+        in fallback warnings and errors.
+    *args : torch.Tensor
+        The scan function's positional tensor arguments, forwarded as-is
+        to the Triton implementation when one runs. ``args[0]`` is
+        inspected for ``.is_cuda`` to decide device residency.
+
+    Returns
+    -------
+    tuple, torch.Tensor, or None
+        The Triton kernel's result if one ran; ``None`` to signal the
+        eager fallback.
+
+    Raises
+    ------
+    ValueError
+        If ``MINGRU_SCAN`` is set to something other than ``"auto"``,
+        ``"eager"``, or ``"triton"``.
+    RuntimeError
+        If ``MINGRU_SCAN=triton`` but no Triton implementation is
+        available or registered for ``name`` (never a silent downgrade
+        to eager).
+    """
+    mode = _resolve_scan_mode(args[0].is_cuda)
+    if mode is None:
+        return None
+
+    def _call(triton_scans):
+        status = triton_scans.available()
+        if status is not True:
+            raise triton_scans.ScanFallback(str(status))
+        if name not in triton_scans.SCAN_IMPLS:
+            raise triton_scans.ScanFallback(f"no Triton kernel registered for {name!r} yet")
+        return triton_scans.SCAN_IMPLS[name](*args)
+
+    result, reason = _resolve_triton_dispatch(mode, repr(name), _call)
+    if reason is None:
+        return result
+
+    # mode == "auto" with CUDA-resident inputs and no usable Triton path:
+    # warn once per process, naming the reason, then fall back to eager.
+    global _warned_scan_fallback
+    if not _warned_scan_fallback:
+        warnings.warn(
+            f"MINGRU_SCAN=auto fell back to the eager scan implementation "
+            f"for {name!r} despite CUDA inputs: {reason}",
+            stacklevel=3,
+        )
+        _warned_scan_fallback = True
+    return None
+
+
+def _angle_scan_should_try(is_cuda: bool) -> bool:
+    """Cheap pre-check: should the angle-fused module path be attempted?
+
+    Thin wrapper over ``_resolve_scan_mode`` -- returns ``False`` (run the
+    unchanged eager mixer forward) for ``eager``, or for ``auto`` with CPU
+    inputs, WITHOUT importing ``triton_scans``. Keeping this gate ahead of
+    any head assembly means the recorded CPU evidence path stays
+    byte-identical and import-free. ``True`` means assemble the angle heads
+    and call ``_dispatch_angle_scan`` (which independently re-validates via
+    the same ``_resolve_scan_mode`` call -- see its docstring -- so this
+    pre-check is a throughput optimization for the CPU/eager path, not a
+    correctness dependency ``_dispatch_angle_scan`` relies on).
+
+    Parameters
+    ----------
+    is_cuda : bool
+        Whether the mixer's input is CUDA-resident.
+
+    Returns
+    -------
+    bool
+        ``True`` to attempt the angle-fused kernel, ``False`` to stay eager.
+
+    Raises
+    ------
+    ValueError
+        If ``MINGRU_SCAN`` is not one of ``auto``/``eager``/``triton``.
+    """
+    return _resolve_scan_mode(is_cuda) is not None
+
+
+def _dispatch_angle_scan(
+    theta: torch.Tensor,
+    scale: torch.Tensor,
+    gamma: torch.Tensor,
+    b: torch.Tensor,
+    h0: torch.Tensor,
+    perm: torch.Tensor,
+    sgn: torch.Tensor,
+    p2p: torch.Tensor,
+    *,
+    has_scale: int,
+    has_decay: int,
+):
+    """Run the angle-fused kernel, or return ``None`` to fall back to eager.
+
+    ``has_scale``/``has_decay`` are keyword-only: both are 0/1 flags with no
+    positional meaning a reader could infer from a bare ``1, 0`` at a call
+    site (unlike ``theta``/``scale``/etc., whose names the tensor shapes
+    already suggest) -- keyword-only makes every call site self-documenting
+    and immune to an accidental argument-order swap between the two flags.
+
+    The module-forward analogue of ``_dispatch_scan``, sharing both of its
+    hoisted helpers. Both current call sites (``GivensMinGRU``,
+    ``RotationMinGRU``) invoke this only after ``_angle_scan_should_try``
+    already returned ``True`` (mode is ``auto`` with CUDA inputs, or
+    ``triton``) so the eager path never pays for assembling the angle
+    heads -- but this function does NOT depend on that ordering for
+    correctness: it re-validates ``MINGRU_SCAN`` itself via
+    ``_resolve_scan_mode(theta.is_cuda)``, exactly like ``_dispatch_scan``
+    does with its own tensor argument, so a direct/out-of-order call is
+    just as safe (redundant, not incorrect) as the current call sites.
+    Shape/envelope validation and the launch-failure funnel live in
+    ``triton_scans.angle_scan_impl`` (mirroring how ``_dispatch_scan``
+    leaves those checks to each ``SCAN_IMPLS`` entry) -- this function
+    catches only ``triton_scans.ScanFallback``, never a bare exception,
+    exactly like ``_dispatch_scan``.
+
+    Returns
+    -------
+    torch.Tensor or None
+        The states ``h`` ``(B, T, n, k)`` if the kernel ran; ``None`` to fall
+        through to the unchanged eager mixer forward.
+
+    Raises
+    ------
+    ValueError
+        If ``MINGRU_SCAN`` is not one of ``"auto"``, ``"eager"``, ``"triton"``.
+    RuntimeError
+        If ``MINGRU_SCAN=triton`` but the angle-fused kernel is unavailable
+        (never a silent downgrade).
+    """
+    mode = _resolve_scan_mode(theta.is_cuda)
+    if mode is None:
+        return None
+
+    def _call(triton_scans):
+        status = triton_scans.available()
+        if status is not True:
+            raise triton_scans.ScanFallback(str(status))
+        if not hasattr(triton_scans, "angle_scan_impl"):
+            raise triton_scans.ScanFallback("no angle-fused Triton kernel registered")
+        return triton_scans.angle_scan_impl(
+            theta, scale, gamma, b, h0, perm, sgn, p2p,
+            has_scale=has_scale, has_decay=has_decay,
+        )
+
+    result, reason = _resolve_triton_dispatch(
+        mode, "the angle-fused mixer path", _call
+    )
+    if reason is None:
+        return result
+
+    global _warned_angle_fallback
+    if not _warned_angle_fallback:
+        warnings.warn(
+            "MINGRU_SCAN=auto fell back to the eager mixer forward "
+            f"(angle-fused path) despite CUDA inputs: {reason}",
+            stacklevel=3,
+        )
+        _warned_angle_fallback = True
+    return None
+
+
+def _cached_plane_meta_per_device(obj, attr: str, device: torch.device, build):
+    """Return ``build()``'s ``(perm, sgn, p2p)`` tensors on ``device``, cached.
+
+    Shared by ``GivensMinGRU._angle_plane_meta`` and
+    ``RotationMinGRU._angle_plane_meta`` -- both mixers cache small constant
+    plane-metadata tensors for the angle-fused kernel on an instance attribute
+    keyed by device, rebuilding only on a cache miss (e.g. the module's first
+    call on a given device, or after a ``.to(device)`` move). ``build`` returns
+    the CPU tensors fresh on each cache miss; this data is constant (no RNG),
+    so caching it never perturbs the eager path or the parameter RNG stream.
+
+    Parameters
+    ----------
+    obj : object
+        The mixer instance (``self``); the cache lives on ``getattr(obj, attr)``.
+    attr : str
+        Instance attribute name to cache the ``(perm, sgn, p2p)`` tuple under.
+    device : torch.device
+        Target device for the cached tensors.
+    build : Callable[[], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+        Zero-arg callable returning fresh CPU ``(perm, sgn, p2p)`` tensors.
+
+    Returns
+    -------
+    tuple of torch.Tensor
+        ``(perm, sgn, p2p)`` on ``device``.
+    """
+    cache = getattr(obj, attr, None)
+    if cache is not None and cache[0].device == device:
+        return cache
+    meta = tuple(t.to(device) for t in build())
+    setattr(obj, attr, meta)
+    return meta
 
 
 def g(x: torch.Tensor) -> torch.Tensor:
@@ -120,6 +490,9 @@ def parallel_scan_log(log_coeffs: torch.Tensor, log_values: torch.Tensor) -> tor
     torch.Tensor
         Shape ``(B, T, D)``. The states ``h_1..h_T``.
     """
+    result = _dispatch_scan("parallel_scan_log", log_coeffs, log_values)
+    if result is not None:
+        return result
     # a*_t = sum_{i<=t} log(a_i), padded with a*_0 = 0
     a_star = F.pad(torch.cumsum(log_coeffs, dim=1), (0, 0, 1, 0))
     log_h0_plus_b_star = torch.logcumsumexp(log_values - a_star, dim=1)
@@ -745,6 +1118,9 @@ def linear_scan(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.T
     ``torch.associative_scan`` primitive exists to lean on. Revisit for
     long-sequence training.
     """
+    result = _dispatch_scan("linear_scan", a, b)
+    if result is not None:
+        return result
     T = a.size(1)
     A, Bc = a, b
     offset = 1
@@ -800,6 +1176,9 @@ def matrix_scan(M: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.T
     the short training lengths this repo targets (probes train at
     T=64); revisit for long-sequence training.
     """
+    result = _dispatch_scan("matrix_scan", M, b)
+    if result is not None:
+        return result
     B_, T, n = M.shape[:3]
     eye = torch.eye(2, dtype=M.dtype, device=M.device)
     A, Bc = M, b
@@ -865,6 +1244,9 @@ def matrix_affine_scan(
     generalization of it) so the recorded 2x2 rotation evidence's
     floating-point path is preserved byte-for-byte.
     """
+    result = _dispatch_scan("matrix_affine_scan", A, Bm)
+    if result is not None:
+        return result
     Ab, Bb = A, Bm
     offset, T = 1, A.size(1)
     while offset < T:
@@ -1386,9 +1768,117 @@ class RotationMinGRU(DecayMixin, nn.Module):
             h_0 = self.h0.expand(B, 1, self.hidden_size)
         h0_blocks = h_0.reshape(B, self.n_blocks, 2)
         dt = self._prepare_decay(delta_t, canonical_ndim=2)
+        fused = self._angle_fused_forward(x, h0_blocks, dt)
+        if fused is not None:
+            return fused
         M, b = self._coeffs(x, dt)
         A, Bc = matrix_scan(M, b)
         h = torch.einsum("btnij,bnj->btni", A, h0_blocks) + Bc
+        return h.reshape(B, T, self.hidden_size)
+
+    def _angle_plane_meta(self, device: torch.device):
+        """The single-plane ``(perm, sgn, p2p)`` metadata for the angle kernel.
+
+        ``RotationMinGRU`` is always ``k=2``, ``rounds=1``, one plane -- the
+        metadata is a fixed constant, but still cached per device (mirrors
+        ``GivensMinGRU._angle_plane_meta``'s caching, via the shared
+        ``_cached_plane_meta_per_device`` helper) rather than rebuilt on every
+        ``forward`` call.
+        """
+
+        def build():
+            return (
+                torch.tensor([[1, 0]], dtype=torch.int32),
+                torch.tensor([[-1.0, 1.0]], dtype=torch.float32),
+                torch.tensor([[0, 0]], dtype=torch.int32),
+            )
+
+        return _cached_plane_meta_per_device(self, "_angle_meta_cache", device, build)
+
+    def _angle_heads(
+        self, x: torch.Tensor, dt: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Assemble the angle-fused kernel's per-step heads.
+
+        Pure extraction of ``_angle_fused_forward``'s head-assembly math
+        (no CUDA gate, no kernel dispatch) -- lets a CPU-runnable selftest
+        (``__main__``'s "CPU lockstep guard" section) call this directly and
+        cross-check its reconstructed transition against ``_coeffs``'s
+        ``(M, b)``, the MAINTENANCE lockstep this method's caller-side
+        comment warns about.
+
+        MAINTENANCE: this head derivation (``linear_theta``, snap STE,
+        ``linear_u`` -> ``tanh``, ``linear_z``/``linear_h`` -> ``b``) must be
+        kept byte-for-byte in lockstep with ``RotationMinGRU._coeffs``.
+        ``_coeffs`` is frozen for evidence invariance (its eager op sequence
+        must not be reordered or refactored -- see the class/module
+        docstrings), so it is re-derived here rather than shared; any future
+        change to ``_coeffs``'s head math must be mirrored in this method by
+        hand. Two checks catch divergence: the GPU-only module-level
+        angle-fused parity selftest (``triton_scans._run_angle_fused_parity``)
+        and the CPU-runnable ``__main__`` lockstep assertion below (which
+        needs no GPU/Triton, so ordinary CI and the GPU-less Phase-4 wheel CI
+        both catch drift too).
+
+        Returns
+        -------
+        tuple of torch.Tensor
+            ``theta`` ``(B, T, n_blocks, 1, 1)`` post-snap; ``scale`` =
+            ``tanh(u_t)`` ``(B, T, n_blocks)``; ``gamma`` ``(B, T, n_blocks)``
+            (all ones if ``dt`` is None); ``b`` ``(B, T, n_blocks, 2)``.
+        """
+        B, T, _ = x.shape
+        n = self.n_blocks
+        theta = self.linear_theta(x)
+        if self.snap is not None:
+            snapped = torch.round(theta / self.snap_step) * self.snap_step
+            theta = theta + (snapped - theta).detach()
+        theta = theta.view(B, T, n, 1, 1)
+        scale = torch.tanh(self.linear_u(x))  # d_t, (B, T, n)
+        b = (torch.sigmoid(self.linear_z(x)) * self.linear_h(x)).reshape(B, T, n, 2)
+        if dt is not None:
+            gamma = self._decay_gamma(dt).expand(B, T, n)
+        else:
+            gamma = torch.ones(B, T, n, dtype=x.dtype, device=x.device)
+        return theta, scale, gamma, b
+
+    def _angle_fused_forward(
+        self, x: torch.Tensor, h0_blocks: torch.Tensor, dt: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        """CUDA angle-fused fast path for ``forward`` (returns None off-path).
+
+        On CUDA under ``MINGRU_SCAN=auto``/``triton`` this assembles the raw
+        rotation angle, the ``tanh(u)`` scale channel, injection, decay, and
+        ``h_0`` (via ``_angle_heads``) and routes them through the
+        angle-fused Triton kernel, never materializing the 2x2 transition
+        matrices ``matrix_scan`` is defined over. On CPU or under ``eager``
+        it returns ``None`` without importing ``triton_scans``, so
+        ``forward`` runs its unchanged eager path (the recorded evidence path
+        stays byte-identical). The snap STE stays inside ``_angle_heads``
+        upstream -- the kernel consumes POST-snap angles.
+
+        The reversible backward reads every ``h_{t-1}`` exactly from the
+        stored forward output -- never by dividing out ``gamma``/``tanh(u)``.
+        An earlier design reversed across a multi-step checkpoint by dividing,
+        which is unsound here: the per-block scale ``diag(1, tanh(u))`` is
+        near-singular whenever ``tanh(u_t) ~ 0`` (typical at init), so that
+        division would amplify roundoff past the grad tolerance. The user's
+        ruling (Task-5 report, "Fix round 2") rejected division-based reversal
+        for both mixers, so ``GivensMinGRU`` now uses the same exact-recompute
+        backward.
+        """
+        if not _angle_scan_should_try(x.is_cuda):
+            return None
+        B, T, _ = x.shape
+        theta, scale, gamma, b = self._angle_heads(x, dt)
+        has_decay = 1 if dt is not None else 0
+        perm, sgn, p2p = self._angle_plane_meta(x.device)
+        h = _dispatch_angle_scan(
+            theta, scale, gamma, b, h0_blocks, perm, sgn, p2p,
+            has_scale=1, has_decay=has_decay,
+        )
+        if h is None:
+            return None
         return h.reshape(B, T, self.hidden_size)
 
     @torch.no_grad()
@@ -1703,9 +2193,129 @@ class GivensMinGRU(DecayMixin, nn.Module):
             h_0 = self.h0.expand(B, 1, self.hidden_size)
         h0_blocks = h_0.reshape(B, self.n_blocks, self.k)
         dt = self._prepare_decay(delta_t, canonical_ndim=2)
+        fused = self._angle_fused_forward(x, h0_blocks, dt)
+        if fused is not None:
+            return fused
         M, b = self._coeffs(x, dt)
         Abar, Bbar = matrix_affine_scan(M, b.unsqueeze(-1))
         h = torch.einsum("btnij,bnj->btni", Abar, h0_blocks) + Bbar.squeeze(-1)
+        return h.reshape(B, T, self.hidden_size)
+
+    def _angle_plane_meta(self, device: torch.device):
+        """Per-round ``(perm, sgn, p2p)`` plane metadata for the angle kernel.
+
+        Derived (via the shared ``_cached_plane_meta_per_device`` helper, and
+        cached per device) from the registered brick-wall plane buffers
+        ``_pi{r}``/``_pj{r}``: ``perm[r, p]`` is position ``p``'s partner
+        within round ``r``'s planes, ``sgn[r, p]`` is ``-1`` for the first
+        (``i``) member and ``+1`` for the second (``j``), and ``p2p[r, p]``
+        is the index of ``p``'s plane among the round's ``k/2`` angles.
+        Constant data (no RNG), so building it here never perturbs the eager
+        path or the parameter RNG stream.
+        """
+
+        def build():
+            R, k = self.rounds, self.k
+            perm = torch.empty(R, k, dtype=torch.int32)
+            sgn = torch.empty(R, k, dtype=torch.float32)
+            p2p = torch.empty(R, k, dtype=torch.int32)
+            for r in range(R):
+                i_idx = getattr(self, f"_pi{r}").cpu()
+                j_idx = getattr(self, f"_pj{r}").cpu()
+                for m in range(len(i_idx)):
+                    i, j = int(i_idx[m]), int(j_idx[m])
+                    perm[r, i], perm[r, j] = j, i
+                    sgn[r, i], sgn[r, j] = -1.0, 1.0
+                    p2p[r, i] = m
+                    p2p[r, j] = m
+            return perm, sgn, p2p
+
+        return _cached_plane_meta_per_device(self, "_angle_meta_cache", device, build)
+
+    def _angle_heads(
+        self, x: torch.Tensor, dt: torch.Tensor | None
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Assemble the angle-fused kernel's per-step heads.
+
+        Pure extraction of ``_angle_fused_forward``'s head-assembly math (no
+        CUDA gate, no kernel dispatch) -- lets a CPU-runnable selftest
+        (``__main__``'s "CPU lockstep guard" section) call this directly and
+        cross-check its reconstructed transition against ``_coeffs``'s
+        ``(M, b)``, the MAINTENANCE lockstep this method's caller-side
+        comment warns about.
+
+        MAINTENANCE: this head derivation (``linear_theta`` view,
+        ``linear_z``/``linear_h`` -> ``b``) must be kept byte-for-byte in
+        lockstep with ``GivensMinGRU._coeffs``. ``_coeffs`` is frozen for
+        evidence invariance (its eager op sequence must not be reordered or
+        refactored -- see the class/module docstrings), so it is re-derived
+        here rather than shared; any future change to ``_coeffs``'s head math
+        must be mirrored in this method by hand. Two checks catch
+        divergence: the GPU-only module-level angle-fused parity selftest
+        (``triton_scans._run_angle_fused_parity``) and the CPU-runnable
+        ``__main__`` lockstep assertion below (which needs no GPU/Triton, so
+        ordinary CI and the GPU-less Phase-4 wheel CI both catch drift too).
+
+        Returns
+        -------
+        tuple of torch.Tensor
+            ``theta`` ``(B, T, n_blocks, rounds, k // 2)``; ``scale`` = all
+            ones ``(B, T, n_blocks)`` (the Givens transition has no per-block
+            scale; kept only for the angle-fused kernel's shared calling
+            convention with ``RotationMinGRU``); ``gamma`` ``(B, T,
+            n_blocks)`` (all ones if ``dt`` is None); ``b`` ``(B, T,
+            n_blocks, k)``.
+        """
+        B, T, _ = x.shape
+        n, k, R = self.n_blocks, self.k, self.rounds
+        theta = self.linear_theta(x).view(B, T, n, R, k // 2)
+        b = (torch.sigmoid(self.linear_z(x)) * self.linear_h(x)).reshape(B, T, n, k)
+        if dt is not None:
+            gamma = self._decay_gamma(dt).expand(B, T, n)
+        else:
+            gamma = torch.ones(B, T, n, dtype=x.dtype, device=x.device)
+        scale = torch.ones(B, T, n, dtype=x.dtype, device=x.device)
+        return theta, scale, gamma, b
+
+    def _angle_fused_forward(
+        self, x: torch.Tensor, h0_blocks: torch.Tensor, dt: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        """CUDA angle-fused fast path for ``forward`` (returns None off-path).
+
+        On CUDA under ``MINGRU_SCAN=auto``/``triton`` this assembles the raw
+        per-round Givens angles, injection, decay, and ``h_0`` (via
+        ``_angle_heads``) and routes them through the angle-fused Triton
+        kernel, never materializing or scanning the ``k x k`` transition
+        matrices ``matrix_affine_scan`` is defined over. On CPU or under
+        ``eager`` it returns ``None`` without importing ``triton_scans`` (the
+        recorded evidence path stays byte-identical). The Givens transition
+        has no per-block scale, so ``has_scale`` is 0.
+
+        The reversible backward reads every ``h_{t-1}`` exactly from the
+        stored forward output -- never by inverting the forward step. An
+        earlier design reversed across a multi-step checkpoint (``C=64``,
+        exploiting the Givens transition's exact orthogonality) by applying
+        the inverse rotation and dividing by ``gamma``; a blind CPU probe
+        showed that division still amplifies roundoff by roughly
+        ``gamma^{-chunklen}``, which blew past the grad tolerance even at this
+        class's own default ``decay_rate=1.0`` (see the Task-5 report,
+        "Fix round 2"). The user's ruling rejected division-based reversal
+        entirely, so this mixer now uses the same exact stored-state backward
+        as ``RotationMinGRU``, with no checkpoint-interval knob left to
+        re-enable reversal.
+        """
+        if not _angle_scan_should_try(x.is_cuda):
+            return None
+        B, T, _ = x.shape
+        theta, scale, gamma, b = self._angle_heads(x, dt)
+        has_decay = 1 if dt is not None else 0
+        perm, sgn, p2p = self._angle_plane_meta(x.device)
+        h = _dispatch_angle_scan(
+            theta, scale, gamma, b, h0_blocks, perm, sgn, p2p,
+            has_scale=0, has_decay=has_decay,
+        )
+        if h is None:
+            return None
         return h.reshape(B, T, self.hidden_size)
 
     @torch.no_grad()
@@ -3605,4 +4215,257 @@ if __name__ == "__main__":
     print(
         "generic decay-constructed-last check (all _MIXER_CLASSES entries, "
         "fixed buffer / learnable parameter): ok"
+    )
+
+    # =====================================================================
+    # MINGRU_SCAN dispatch seam: CPU-testable branches of _dispatch_scan.
+    # triton_scans.py itself requires torch>=2.8 and CUDA to do anything
+    # useful, so its real Triton-path behavior isn't testable here; these
+    # assertions instead pin the seam's env-var resolution, mode
+    # validation, and CPU/eager guarantees against regression. Each block
+    # sets/restores os.environ["MINGRU_SCAN"] around one assertion (read at
+    # call time -- see _dispatch_scan -- so in-process mutation is safe and
+    # observable immediately).
+    # =====================================================================
+    import sys
+
+    _a = torch.randn(2, 8, 4)
+    _b = torch.randn(2, 8, 4)
+    _scan_env_key = "MINGRU_SCAN"
+    _saved_scan_env = os.environ.get(_scan_env_key)
+
+    def _set_scan_env(value: str | None) -> None:
+        if value is None:
+            os.environ.pop(_scan_env_key, None)
+        else:
+            os.environ[_scan_env_key] = value
+
+    try:
+        # 1. Invalid MINGRU_SCAN value raises ValueError.
+        _set_scan_env("not-a-real-mode")
+        try:
+            linear_scan(_a, _b)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid MINGRU_SCAN value must raise ValueError")
+        print("MINGRU_SCAN=<invalid> raises ValueError: ok")
+
+        # 2. MINGRU_SCAN=eager never imports triton_scans.
+        sys.modules.pop("triton_scans", None)
+        _set_scan_env("eager")
+        _eager_out = linear_scan(_a, _b)
+        assert "triton_scans" not in sys.modules, (
+            "MINGRU_SCAN=eager must never import triton_scans"
+        )
+        print("MINGRU_SCAN=eager: no triton_scans import, ok")
+
+        # 3. MINGRU_SCAN=triton on CPU (no CUDA/Triton kernel available)
+        # raises RuntimeError naming the reason -- never a silent fallback.
+        _set_scan_env("triton")
+        try:
+            linear_scan(_a, _b)
+        except RuntimeError as _exc:
+            assert str(_exc), "RuntimeError must name a reason"
+        else:
+            raise AssertionError(
+                "MINGRU_SCAN=triton with no Triton available must raise "
+                "RuntimeError, never silently fall back to eager"
+            )
+        print("MINGRU_SCAN=triton on CPU raises RuntimeError naming the reason: ok")
+
+        # 4. Default (unset -> "auto") + CPU tensors: output identical to
+        # eager, and triton_scans still never imported.
+        sys.modules.pop("triton_scans", None)
+        _set_scan_env(None)
+        _auto_A, _auto_Bc = linear_scan(_a, _b)
+        _eager_A, _eager_Bc = _eager_out
+        assert torch.equal(_auto_A, _eager_A) and torch.equal(_auto_Bc, _eager_Bc), (
+            "MINGRU_SCAN=auto (default) must match MINGRU_SCAN=eager exactly "
+            "on CPU tensors"
+        )
+        assert "triton_scans" not in sys.modules, (
+            "MINGRU_SCAN=auto with CPU tensors must never import triton_scans"
+        )
+        print(
+            "MINGRU_SCAN=auto (default) on CPU: output matches eager exactly, "
+            "no triton_scans import: ok"
+        )
+    finally:
+        _set_scan_env(_saved_scan_env)
+
+    # =====================================================================
+    # Angle-fused dispatch seam: CPU-testable branches of
+    # _angle_scan_should_try / _dispatch_angle_scan (the module-level fast
+    # path GivensMinGRU/RotationMinGRU route through on CUDA -- Task 5). Same
+    # four assertions as the four-scan-function seam above, driven through
+    # each mixer's forward instead of a bare scan function, so the NEW seam
+    # gets the same regression coverage the four scan functions already have.
+    # =====================================================================
+    def _check_angle_dispatch_seam(mixer_name: str, mixer: nn.Module, x: torch.Tensor) -> None:
+        try:
+            # 1. Invalid MINGRU_SCAN value raises ValueError.
+            _set_scan_env("not-a-real-mode")
+            try:
+                mixer(x)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(
+                    f"{mixer_name}: invalid MINGRU_SCAN value must raise ValueError"
+                )
+            print(f"{mixer_name}: MINGRU_SCAN=<invalid> raises ValueError: ok")
+
+            # 2. MINGRU_SCAN=eager never imports triton_scans.
+            sys.modules.pop("triton_scans", None)
+            _set_scan_env("eager")
+            _eager_out = mixer(x)
+            assert "triton_scans" not in sys.modules, (
+                f"{mixer_name}: MINGRU_SCAN=eager must never import triton_scans"
+            )
+            print(f"{mixer_name}: MINGRU_SCAN=eager: no triton_scans import, ok")
+
+            # 3. MINGRU_SCAN=triton on CPU (no CUDA/Triton kernel available)
+            # raises RuntimeError naming the angle-fused reason -- never a
+            # silent fallback.
+            _set_scan_env("triton")
+            try:
+                mixer(x)
+            except RuntimeError as _exc:
+                assert str(_exc), f"{mixer_name}: RuntimeError must name a reason"
+            else:
+                raise AssertionError(
+                    f"{mixer_name}: MINGRU_SCAN=triton with no Triton available "
+                    "must raise RuntimeError, never silently fall back to eager"
+                )
+            print(
+                f"{mixer_name}: MINGRU_SCAN=triton on CPU raises RuntimeError "
+                "naming the angle-fused reason: ok"
+            )
+
+            # 4. Default (unset -> "auto") + CPU tensors: output identical to
+            # eager, and triton_scans still never imported.
+            sys.modules.pop("triton_scans", None)
+            _set_scan_env(None)
+            _auto_out = mixer(x)
+            assert torch.equal(_auto_out, _eager_out), (
+                f"{mixer_name}: MINGRU_SCAN=auto (default) must match "
+                "MINGRU_SCAN=eager exactly on CPU tensors"
+            )
+            assert "triton_scans" not in sys.modules, (
+                f"{mixer_name}: MINGRU_SCAN=auto with CPU tensors must never "
+                "import triton_scans"
+            )
+            print(
+                f"{mixer_name}: MINGRU_SCAN=auto (default) on CPU: output "
+                "matches eager exactly, no triton_scans import: ok"
+            )
+        finally:
+            _set_scan_env(_saved_scan_env)
+
+    _angle_x = torch.randn(2, 5, 4)
+    _check_angle_dispatch_seam(
+        "GivensMinGRU", GivensMinGRU(4, 8, block_size=4, rounds=2), _angle_x
+    )
+    _check_angle_dispatch_seam(
+        "RotationMinGRU", RotationMinGRU(4, 8, snap=None), _angle_x
+    )
+
+    # =========================================================================
+    # CPU lockstep guard: `_angle_heads` (the angle-fused kernel's head
+    # derivation, GPU-only at runtime) vs `_coeffs` (the frozen eager
+    # reference), for both mixers. Reconstructs the per-step transition
+    # matrix `_angle_heads`'s (theta, scale, gamma) heads implicitly
+    # represent -- by applying the SAME per-round factored-plane-rotation
+    # formula the angle-fused Triton kernel implements (scale -> rounds ->
+    # decay; see `triton_scans._angle_scan_fwd_kernel`) to each of the k
+    # standard basis columns -- and asserts it matches `_coeffs`'s own `M`
+    # (plus `b` directly). This is CPU-runnable (no GPU/Triton needed), so
+    # head-math drift between `_angle_heads` and `_coeffs` now fails ordinary
+    # CI (and the GPU-less Phase-4 wheel CI), not only the GPU-only
+    # module-level angle-fused parity selftest
+    # (`triton_scans._run_angle_fused_parity`).
+    # =========================================================================
+    def _reconstruct_angle_matrix(
+        theta: torch.Tensor,
+        scale: torch.Tensor,
+        gamma: torch.Tensor,
+        perm: torch.Tensor,
+        sgn: torch.Tensor,
+        p2p: torch.Tensor,
+        k: int,
+        has_scale: bool,
+    ) -> torch.Tensor:
+        """Reference (selftest-only) reconstruction of the per-step transition
+        matrix from `_angle_heads`'s heads and the plane metadata, by applying
+        the kernel's per-round formula to each of the k standard basis
+        columns: column c of the result is that action applied to e_c. Never
+        used by any runtime path -- may freely differ in implementation
+        strategy from the Triton kernel while checking the same mathematical
+        object `_coeffs` computes.
+        """
+        *lead, n, R, half = theta.shape
+        eye = torch.eye(k, dtype=theta.dtype, device=theta.device)
+        v = eye.expand(*lead, n, k, k).clone()
+        if has_scale:
+            v[..., 1, :] = scale.unsqueeze(-1) * v[..., 1, :]
+        for r in range(R):
+            cos = torch.cos(theta[..., r, :])
+            sin = torch.sin(theta[..., r, :])
+            perm_r, sgn_r, p2p_r = perm[r].long(), sgn[r], p2p[r].long()
+            cos_pos = cos[..., p2p_r]  # (*lead, n, k)
+            sin_pos = sin[..., p2p_r]
+            vp = v[..., perm_r, :]  # gather along the row axis (dim -2)
+            v = cos_pos.unsqueeze(-1) * v + (sgn_r * sin_pos).unsqueeze(-1) * vp
+        return gamma.unsqueeze(-1).unsqueeze(-1) * v
+
+    def _check_angle_heads_lockstep(
+        mixer_name: str,
+        mixer: nn.Module,
+        x: torch.Tensor,
+        delta_t: torch.Tensor | None,
+        has_scale: bool,
+    ) -> None:
+        """Cross-check one mixer's `_angle_heads` against its `_coeffs`."""
+        with torch.no_grad():
+            dt = mixer._prepare_decay(delta_t, canonical_ndim=2)
+            M_ref, b_ref = mixer._coeffs(x, dt)
+            theta, scale, gamma, b_heads = mixer._angle_heads(x, dt)
+            perm, sgn, p2p = mixer._angle_plane_meta(x.device)
+            k = M_ref.shape[-1]
+            M_recon = _reconstruct_angle_matrix(
+                theta, scale, gamma, perm, sgn, p2p, k, has_scale
+            )
+        m_err = (M_recon - M_ref).abs().max().item()
+        b_err = (b_heads.reshape(b_ref.shape) - b_ref).abs().max().item()
+        assert m_err < 1e-5, (
+            f"{mixer_name}: _angle_heads-reconstructed M diverges from "
+            f"_coeffs's M (max_abs={m_err:.3e}) -- MAINTENANCE lockstep broken"
+        )
+        assert b_err < 1e-6, (
+            f"{mixer_name}: _angle_heads's b diverges from _coeffs's b "
+            f"(max_abs={b_err:.3e}) -- MAINTENANCE lockstep broken"
+        )
+        print(
+            f"{mixer_name}: _angle_heads vs _coeffs lockstep "
+            f"(M max_abs={m_err:.3e}, b max_abs={b_err:.3e}): ok"
+        )
+
+    torch.manual_seed(11)
+    _givens_lockstep = GivensMinGRU(
+        4, 12, block_size=4, rounds=3, decay="learnable", decay_rate=1.0
+    )
+    _x_lockstep_g = torch.randn(2, 5, 4)
+    _dt_lockstep_g = torch.rand(2, 5) * 2.0 + 1e-2
+    _check_angle_heads_lockstep(
+        "GivensMinGRU (rounds=3, decay=learnable)",
+        _givens_lockstep, _x_lockstep_g, _dt_lockstep_g, has_scale=False,
+    )
+
+    torch.manual_seed(12)
+    _rotation_lockstep = RotationMinGRU(4, 8, snap=(2, 3, 4, 6))
+    _x_lockstep_r = torch.randn(2, 5, 4)
+    _check_angle_heads_lockstep(
+        "RotationMinGRU (snap=(2,3,4,6))",
+        _rotation_lockstep, _x_lockstep_r, None, has_scale=True,
     )

@@ -1,0 +1,648 @@
+{
+  "meta": {
+    "torch_version": "2.8.0+cu128",
+    "device_name": "NVIDIA L4",
+    "warmup_reps": {
+      "lab": {
+        "warmup": 10,
+        "reps": 30
+      },
+      "long-T": {
+        "warmup": 5,
+        "reps": 10
+      }
+    },
+    "counts": {
+      "attempted": 48,
+      "succeeded": 48,
+      "failed": 0,
+      "excluded_unavailable": 0
+    }
+  },
+  "rows": [
+    {
+      "op": "linear_scan",
+      "impl": "triton",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 114.38079675038655
+    },
+    {
+      "op": "linear_scan",
+      "impl": "eager",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 599.8933156331381
+    },
+    {
+      "op": "linear_scan",
+      "impl": "torch_compile",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 128.68266900380453
+    },
+    {
+      "op": "linear_scan",
+      "impl": "triton",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 1188.1151835123699
+    },
+    {
+      "op": "linear_scan",
+      "impl": "eager",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 3571.4388529459634
+    },
+    {
+      "op": "linear_scan",
+      "impl": "torch_compile",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 1301.742935180664
+    },
+    {
+      "op": "matrix_scan",
+      "impl": "triton",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "n": 32,
+        "k": 2,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 331.332270304362
+    },
+    {
+      "op": "matrix_scan",
+      "impl": "eager",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "n": 32,
+        "k": 2,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 5337.019856770833
+    },
+    {
+      "op": "matrix_scan",
+      "impl": "torch_compile",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "n": 32,
+        "k": 2,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 5275.750223795573
+    },
+    {
+      "op": "matrix_scan",
+      "impl": "triton",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "n": 32,
+        "k": 2,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 1000.2431869506836
+    },
+    {
+      "op": "matrix_scan",
+      "impl": "eager",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "n": 32,
+        "k": 2,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 94222.607421875
+    },
+    {
+      "op": "matrix_scan",
+      "impl": "torch_compile",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "n": 32,
+        "k": 2,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 97409.43196614583
+    },
+    {
+      "op": "matrix_affine_scan",
+      "impl": "triton",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "n": 8,
+        "k": 8,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 286.1397425333659
+    },
+    {
+      "op": "matrix_affine_scan",
+      "impl": "eager",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "n": 8,
+        "k": 8,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 5462.937418619792
+    },
+    {
+      "op": "matrix_affine_scan",
+      "impl": "torch_compile",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "n": 8,
+        "k": 8,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 4954.487609863281
+    },
+    {
+      "op": "matrix_affine_scan",
+      "impl": "triton",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "n": 8,
+        "k": 8,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 905.250104268392
+    },
+    {
+      "op": "matrix_affine_scan",
+      "impl": "eager",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "n": 8,
+        "k": 8,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 35200.81787109375
+    },
+    {
+      "op": "matrix_affine_scan",
+      "impl": "torch_compile",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "n": 8,
+        "k": 8,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 28935.817464192707
+    },
+    {
+      "op": "parallel_scan_log",
+      "impl": "triton",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 96.93866570790608
+    },
+    {
+      "op": "parallel_scan_log",
+      "impl": "eager",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 99.15733337402344
+    },
+    {
+      "op": "parallel_scan_log",
+      "impl": "torch_compile",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 111.54773235321045
+    },
+    {
+      "op": "parallel_scan_log",
+      "impl": "triton",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 1399.5349884033203
+    },
+    {
+      "op": "parallel_scan_log",
+      "impl": "eager",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 979.865582784017
+    },
+    {
+      "op": "parallel_scan_log",
+      "impl": "torch_compile",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 1013.5552088419596
+    },
+    {
+      "op": "linear_scan",
+      "impl": "triton",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 184.83200073242188
+    },
+    {
+      "op": "linear_scan",
+      "impl": "eager",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 1074.5856285095215
+    },
+    {
+      "op": "linear_scan",
+      "impl": "torch_compile",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 197.11999893188477
+    },
+    {
+      "op": "linear_scan",
+      "impl": "triton",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 894.3615913391113
+    },
+    {
+      "op": "linear_scan",
+      "impl": "eager",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 4151.500701904297
+    },
+    {
+      "op": "linear_scan",
+      "impl": "torch_compile",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 1631.9488525390625
+    },
+    {
+      "op": "matrix_scan",
+      "impl": "triton",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "n": 32,
+        "k": 2,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 747.6223945617676
+    },
+    {
+      "op": "matrix_scan",
+      "impl": "eager",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "n": 32,
+        "k": 2,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 18737.66326904297
+    },
+    {
+      "op": "matrix_scan",
+      "impl": "torch_compile",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "n": 32,
+        "k": 2,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 18530.201721191406
+    },
+    {
+      "op": "matrix_scan",
+      "impl": "triton",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "n": 32,
+        "k": 2,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 1932.3904037475586
+    },
+    {
+      "op": "matrix_scan",
+      "impl": "eager",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "n": 32,
+        "k": 2,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 325657.6904296875
+    },
+    {
+      "op": "matrix_scan",
+      "impl": "torch_compile",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "n": 32,
+        "k": 2,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 338814.35546875
+    },
+    {
+      "op": "matrix_affine_scan",
+      "impl": "triton",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "n": 8,
+        "k": 8,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 1055.948829650879
+    },
+    {
+      "op": "matrix_affine_scan",
+      "impl": "eager",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "n": 8,
+        "k": 8,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 24373.861694335938
+    },
+    {
+      "op": "matrix_affine_scan",
+      "impl": "torch_compile",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "n": 8,
+        "k": 8,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 27216.793823242188
+    },
+    {
+      "op": "matrix_affine_scan",
+      "impl": "triton",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "n": 8,
+        "k": 8,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 2668.23673248291
+    },
+    {
+      "op": "matrix_affine_scan",
+      "impl": "eager",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "n": 8,
+        "k": 8,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 142901.2451171875
+    },
+    {
+      "op": "matrix_affine_scan",
+      "impl": "torch_compile",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "n": 8,
+        "k": 8,
+        "v": 1
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 119721.37451171875
+    },
+    {
+      "op": "parallel_scan_log",
+      "impl": "triton",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 350.41279792785645
+    },
+    {
+      "op": "parallel_scan_log",
+      "impl": "eager",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 551.526403427124
+    },
+    {
+      "op": "parallel_scan_log",
+      "impl": "torch_compile",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwd",
+      "us_per_iter": 200.49920082092285
+    },
+    {
+      "op": "parallel_scan_log",
+      "impl": "triton",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 1722.5727081298828
+    },
+    {
+      "op": "parallel_scan_log",
+      "impl": "eager",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 1375.539207458496
+    },
+    {
+      "op": "parallel_scan_log",
+      "impl": "torch_compile",
+      "shape": {
+        "B": 16,
+        "T": 1024,
+        "D": 64
+      },
+      "dtype": "float32",
+      "direction": "fwdbwd",
+      "us_per_iter": 1038.7455940246582
+    }
+  ]
+}

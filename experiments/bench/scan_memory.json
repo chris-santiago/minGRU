@@ -1,0 +1,28 @@
+{
+  "rows": [
+    {
+      "impl": "eager_phase1_generic",
+      "op": "GivensMinGRU.forward+backward",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "d": 64,
+        "k": 8
+      },
+      "peak_bytes": 414284288,
+      "peak_mb": 395.09228515625
+    },
+    {
+      "impl": "angle_fused_triton",
+      "op": "GivensMinGRU.forward+backward",
+      "shape": {
+        "B": 128,
+        "T": 64,
+        "d": 64,
+        "k": 8
+      },
+      "peak_bytes": 40107520,
+      "peak_mb": 38.24951171875
+    }
+  ]
+}
