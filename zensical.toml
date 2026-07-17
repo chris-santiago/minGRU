@@ -49,6 +49,8 @@ nav = [
         { "GivensMinGRU deep dive" = "explanation/givens-mingru.md" },
         { "Triton scan kernels"    = "explanation/triton-scans.md" },
     ] },
+
+    { "Slides" = "slides/index.md" },
 ]
 
 
