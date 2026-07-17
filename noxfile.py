@@ -79,6 +79,21 @@ def wheel(session: nox.Session) -> None:
     session.run("bash", "scripts/check_wheel.sh", external=True)
 
 
+@nox.session(python=False)
+def gpu(session: nox.Session) -> None:
+    """Run the GPU conformance suite on an ephemeral Lightning AI job.
+
+    Requires LIGHTNING_USER_ID / LIGHTNING_API_KEY and a teamspace
+    (MINGRU_LIGHTNING_TEAMSPACE or --teamspace). Consumes GPU credits;
+    pass --dry-run to inspect the job spec without submitting.
+    """
+    session.run(
+        "uv", "run", "--group", "gpu",
+        "python", "scripts/gpu_check.py", *session.posargs,
+        external=True,
+    )
+
+
 @nox.session()
 def build(session: nox.Session) -> None:
     """Build the wheel and sdist."""
