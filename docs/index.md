@@ -6,6 +6,8 @@ minGRU is the minimal GRU of [Feng et al., "Were RNNs All We Needed?", arXiv:241
 
 Use it when you want GRU-style sequence mixing that trains with parallel-scan speed, when you need state-tracking capacity beyond what diagonal-transition RNNs offer, or when you want to study the rotation-family parameterizations behind those capabilities.
 
+Each mixer has its own lineage. The log-space `MinGRU` training path uses Heinsen's (2023) parallel scan. `SignedMinGRU`'s negative-eigenvalue gates follow the state-tracking analyses of Merrill, Petty & Sabharwal (2024) and Grazzi et al. (2025). The `GivensMinGRU` brick-wall rotation mesh comes from the orthogonal/unitary-RNN literature — EUNN ([Jing et al. 2017, arXiv:1612.05231](https://arxiv.org/abs/1612.05231)) and the Clements et al. (2016) rectangular mesh — built from the Givens plane rotations of Golub & Van Loan's *Matrix Computations*. Full citations live in each class's [API reference](reference/mixers.md) entry and the [GivensMinGRU deep dive](explanation/givens-mingru.md).
+
 ## Install
 
 ```bash
