@@ -2,11 +2,20 @@
 
 minGRU is the minimal GRU of [Feng et al., "Were RNNs All We Needed?", arXiv:2410.01201](https://arxiv.org/abs/2410.01201) — a GRU stripped to a scannable linear recurrence. A parallel (associative) scan solves that recurrence by combining elements pairwise instead of one at a time, so the whole sequence resolves in logarithmic depth rather than a sequential loop.
 
-`mingru-scans` is a research library of parallel-scan minGRU variants: the log-space baseline `MinGRU`, the signed-gate `SignedMinGRU`, and the rotation-family mixers `RotationMinGRU` and `GivensMinGRU`, whose recurrences run as associative scans instead of sequential loops. An optional Triton backend accelerates the scan primitives on CUDA GPUs behind a zero-config dispatch seam; on CPU, or wherever Triton is absent, the pure-PyTorch eager path runs unchanged.
+`mingru-scans` is a research library of parallel-scan minGRU variants: the log-space baseline `MinGRU`, the signed-gate `SignedMinGRU`, and the rotation-family mixers `RotationMinGRU` and `GivensMinGRU`, whose recurrences run as associative scans instead of sequential loops. An **optional Triton backend** supplies fused forward+backward GPU kernels for the scan primitives behind a zero-config dispatch seam; on CPU, or wherever Triton is absent, the pure-PyTorch eager path runs unchanged. Measured forward+backward against plain PyTorch (eager) on an NVIDIA L4:
+
+| scan op | lab shape ($B{=}128$, $T{=}64$) | long-$T$ ($B{=}16$, $T{=}1024$) |
+|---|---|---|
+| `matrix_scan` | **94.20x** | **168.53x** |
+| `matrix_affine_scan` | **38.89x** | **53.56x** |
+| `linear_scan` | 3.01x | 4.64x |
+| `parallel_scan_log` | 0.70x (slower) | 0.80x (slower) |
+
+The log-space op's backward recomputes its forward, so eager remains the right default for the baseline `MinGRU`/`SignedMinGRU` mixers; the win concentrates in the matrix/block ops the rotation-family mixers use. Full tables, memory results (395 → 38 MB), and the kernel design are in the [Triton scan kernels explanation](explanation/triton-scans.md) and `experiments/bench/`.
 
 Use it when you want GRU-style sequence mixing that trains with parallel-scan speed, when you need state-tracking capacity beyond what diagonal-transition RNNs offer, or when you want to study the rotation-family parameterizations behind those capabilities.
 
-Each mixer has its own lineage. The log-space `MinGRU` training path uses Heinsen's (2023) parallel scan. `SignedMinGRU`'s negative-eigenvalue gates follow the state-tracking analyses of Merrill, Petty & Sabharwal (2024) and Grazzi et al. (2025). The `GivensMinGRU` brick-wall rotation mesh comes from the orthogonal/unitary-RNN literature — EUNN ([Jing et al. 2017, arXiv:1612.05231](https://arxiv.org/abs/1612.05231)) and the Clements et al. (2016) rectangular mesh — built from the Givens plane rotations of Golub & Van Loan's *Matrix Computations*. Full citations live in each class's [API reference](reference/mixers.md) entry and the [GivensMinGRU deep dive](explanation/givens-mingru.md).
+Each mixer has its own lineage. The log-space `MinGRU` training path uses [Heinsen's (2023, arXiv:2311.06281)](https://arxiv.org/abs/2311.06281) parallel scan. `SignedMinGRU`'s negative-eigenvalue gates follow the state-tracking analyses of [Merrill, Petty & Sabharwal (2024, arXiv:2404.08819)](https://arxiv.org/abs/2404.08819) and [Grazzi et al. (2025, arXiv:2411.12537)](https://arxiv.org/abs/2411.12537). The `GivensMinGRU` brick-wall rotation mesh comes from the orthogonal/unitary-RNN literature — EUNN ([Jing et al. 2017, arXiv:1612.05231](https://arxiv.org/abs/1612.05231)) and the [Clements et al. (2016, arXiv:1603.08788)](https://arxiv.org/abs/1603.08788) rectangular mesh — built from the Givens plane rotations of Golub & Van Loan's *Matrix Computations*. Full citations live in each class's [API reference](reference/mixers.md) entry and the [GivensMinGRU deep dive](explanation/givens-mingru.md).
 
 ## Install
 
