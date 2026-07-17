@@ -116,14 +116,37 @@ def main() -> int:
         print(f"error: unknown machine {args.machine!r}; available: {names}", file=sys.stderr)
         return 2
 
-    job = Job.run(
-        name=spec["name"],
-        teamspace=args.teamspace,
-        machine=machine,
-        image=args.image,
-        command=command,
-        interruptible=args.interruptible,
-    )
+    # The SDK takes the teamspace NAME plus a separate org=/user= owner kwarg;
+    # our config uses the UI's "owner/teamspace" form. Split it and try the
+    # owner as an org first, then as a user.
+    if "/" in args.teamspace:
+        owner, ts_name = args.teamspace.split("/", 1)
+    else:
+        owner, ts_name = None, args.teamspace
+
+    def _run(**owner_kw):
+        return Job.run(
+            name=spec["name"],
+            teamspace=ts_name,
+            machine=machine,
+            image=args.image,
+            command=command,
+            interruptible=args.interruptible,
+            **owner_kw,
+        )
+
+    if owner is None:
+        job = _run()
+    else:
+        try:
+            job = _run(org=owner)
+        except Exception as org_exc:
+            try:
+                job = _run(user=owner)
+            except Exception as user_exc:
+                print(f"error: teamspace resolution failed as org ({org_exc}) "
+                      f"and as user ({user_exc})", file=sys.stderr)
+                return 2
     print(f"submitted: {job.name}; waiting...")
     try:
         job.wait()
