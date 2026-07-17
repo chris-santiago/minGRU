@@ -77,7 +77,7 @@ show_signature_annotations = true
 # Theme: modern variant of Material's look and feel.
 # ----------------------------------------------------------------------------
 [project.theme]
-variant  = "modern"
+variant  = "classic"
 language = "en"
 
 features = [
