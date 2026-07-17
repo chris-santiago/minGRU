@@ -297,6 +297,11 @@ dependencies = [
     { name = "torch" },
 ]
 
+[package.optional-dependencies]
+triton = [
+    { name = "triton" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
@@ -309,7 +314,11 @@ docs = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "torch", specifier = ">=2.8" }]
+requires-dist = [
+    { name = "torch", specifier = ">=2.8" },
+    { name = "triton", marker = "extra == 'triton'" },
+]
+provides-extras = ["triton"]
 
 [package.metadata.requires-dev]
 dev = [
