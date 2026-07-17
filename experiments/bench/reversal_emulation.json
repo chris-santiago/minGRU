@@ -1,0 +1,42 @@
+{
+  "protocol": {
+    "T": 4096,
+    "D": 256,
+    "chunk": 64,
+    "seed": 0,
+    "decay_sampling": "uniform [gamma_min, 1)",
+    "dtype": "float32 (fp64 inputs cast)",
+    "loss": "sum of all states"
+  },
+  "env": {
+    "torch": "2.8.0",
+    "python": "3.12.5",
+    "machine": "arm64"
+  },
+  "rows": [
+    {
+      "gamma_min": 0.86,
+      "state_err_global": 2.241698712168727e-05,
+      "grad_err_global": 1.778729165380355e-05,
+      "state_max_rel_err": 9.209254264831543,
+      "grad_max_rel_err": 9.209254264831543,
+      "worst_case_bound_eps_gamma_pow": 0.0015955399081758015
+    },
+    {
+      "gamma_min": 0.48,
+      "state_err_global": 2562.37255859375,
+      "grad_err_global": 1498.7813720703125,
+      "state_max_rel_err": 3584840.0,
+      "grad_max_rel_err": 3584840.0,
+      "worst_case_bound_eps_gamma_pow": 14391701579175.523
+    },
+    {
+      "gamma_min": 0.23,
+      "state_err_global": 10468886315008.0,
+      "grad_err_global": 6099170230272.0,
+      "state_max_rel_err": 413306179289088.0,
+      "grad_max_rel_err": 413306179289088.0,
+      "worst_case_bound_eps_gamma_pow": 1.938458155801094e+33
+    }
+  ]
+}
