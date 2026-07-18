@@ -204,24 +204,30 @@ class _ProbeConfig:
     training_arm: bool = False
 
 
-def _delta_configs() -> tuple[_ProbeConfig, ...]:
-    sweep = tuple(
-        _ProbeConfig(
-            label=f"delta_nh4_dk{d}",
-            mechanism="delta",
-            build_kwargs={
-                "input_size": 64,
-                "hidden_size": 64,
-                "n_heads": 4,
-                "nh": 2,
-                "d_k": d,
-                "d_v": d,
-                "chunk_size": _DELTA_CHUNK_SIZE,
-            },
-            state_elements=4 * d * d,
-        )
-        for d in (4, 8, 16, 32)
+def _delta_sweep_config(d: int) -> _ProbeConfig:
+    build_kwargs = {
+        "input_size": 64,
+        "hidden_size": 64,
+        "n_heads": 4,
+        "nh": 2,
+        "d_k": d,
+        "d_v": d,
+        "chunk_size": _DELTA_CHUNK_SIZE,
+    }
+    return _ProbeConfig(
+        label=f"delta_nh4_dk{d}",
+        mechanism="delta",
+        build_kwargs=build_kwargs,
+        # Derived from the same build_kwargs the config is constructed
+        # from (n_heads * d_k * d_v), not a separately-maintained literal
+        # -- a hardcoded `4 * d * d` here could silently drift from
+        # `n_heads` above if either changed independently.
+        state_elements=build_kwargs["n_heads"] * d * d,
     )
+
+
+def _delta_configs() -> tuple[_ProbeConfig, ...]:
+    sweep = tuple(_delta_sweep_config(d) for d in (4, 8, 16, 32))
     training_arms = (
         _ProbeConfig(
             label="delta_train_pd64",

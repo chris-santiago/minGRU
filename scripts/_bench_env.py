@@ -2,6 +2,22 @@
 
 Used by ``scripts/bench_delta.py`` and ``scripts/scaling_probe.py`` to
 record run metadata in their artifacts. Stdlib-only, no torch dependency.
+
+Evidence-pin idiom, by script (one place to look -- each script enforces
+``torch==2.5.1`` differently, since each has a different call shape):
+
+- ``experiments/hetero_lab.py``: opt-in ``--require-torch <version>`` CLI
+  flag on ``run_arm`` -- exact-string match against ``torch.__version__``,
+  ``SystemExit`` before any training step on mismatch, no row written.
+  Opt-in (not a permanent hardcoded assert) so existing/future invocations
+  without the flag are unaffected.
+- ``scripts/scaling_probe.py``: hard assert inside each child subprocess
+  (``_run_child``), before constructing any model -- the parent never
+  imports torch at all, so the pin can only be enforced where torch is
+  actually loaded.
+- ``scripts/bench_delta.py``: hard assert in-process, at the top of
+  ``run()``, before any timing -- this script is single-process (no
+  child subprocess boundary to enforce the pin across).
 """
 
 from __future__ import annotations

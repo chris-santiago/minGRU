@@ -40,26 +40,30 @@ Two subcommands:
     section 6 / TECHNICAL_REPORT section 4.4 verdict table as markdown:
     fit counts, mean acc@{64,256,512,1024}, fit-only acc@{512,1024},
     threshold-robustness at {0.98, 0.99, 0.995}, two-sided Fisher exact
-    (exact hypergeometric enumeration, stdlib ``math.comb`` -- no scipy)
     for each new arm against the recorded givens arm, and composer
-    parameter counts computed arithmetically from the ``nn.Linear``
-    in/out/bias formulas (see ``_givens_composer_params``/
-    ``_delta_composer_params``) rather than hardcoded. A round with zero
+    parameter counts computed arithmetically rather than hardcoded. The
+    pure computation (Fisher exact, composer parameter-count formulas,
+    per-arm ledger-row aggregation) lives in ``scripts/_evidence_stats
+    .py`` (hoisted out of this file, mirroring the
+    ``scripts/_bench_env.py`` precedent); this module only reads the
+    ledger, calls that engine, and formats markdown. A round with zero
     ledger rows (e.g. before ``run`` has produced any) renders as an
     explicit "0 rows" line, not a crash.
 
 This script is stdlib-only (no torch import): it only ever shells out to
-``experiments/hetero_lab.py`` for anything that needs torch, so no
-``src/``-onto-``sys.path`` bootstrap or ruff E402 exemption is needed
-here (unlike ``scripts/bench_delta.py``/``scripts/scaling_probe.py``,
-which import the packaged ``mingru`` distribution directly).
+``experiments/hetero_lab.py`` for anything that needs torch, so it needs
+no ``src/``-onto-``sys.path`` bootstrap for a torch-touching package
+import (unlike ``scripts/bench_delta.py``/``scripts/scaling_probe.py``,
+which import the packaged ``mingru`` distribution directly); it does
+insert ``scripts/`` onto ``sys.path`` to import the sibling
+``_evidence_stats`` module, the same idiom ``scripts/scaling_probe.py``
+uses for ``_bench_env``.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import platform
 import re
@@ -71,6 +75,27 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+# Insert scripts/ onto sys.path to import _evidence_stats before any other
+# local imports (same rationale as scripts/scaling_probe.py's _bench_env
+# bootstrap: this makes the import work identically whether the module is
+# run directly (`python scripts/run_matched_state.py`, where scripts/ is
+# already sys.path[0]) or loaded by file path via importlib, as
+# tests/test_run_matched_state.py does (which does NOT get that implicit
+# sys.path[0] entry)).
+_scripts_dir = Path(__file__).resolve().parent
+if str(_scripts_dir) not in sys.path:
+    sys.path.insert(0, str(_scripts_dir))
+
+from _evidence_stats import (  # noqa: E402
+    FIT_ONLY_LENGTHS,
+    ROBUSTNESS_THRESHOLDS,
+    ArmStats,
+    arm_stats,
+    delta_composer_params,
+    fisher_exact_two_sided,
+    givens_composer_params,
+)
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _HETERO_LAB = _REPO_ROOT / "experiments" / "hetero_lab.py"
 _RESULTS = _REPO_ROOT / "experiments" / "lab_results.jsonl"
@@ -80,10 +105,6 @@ _EVIDENCE_PIN_TORCH_VERSION = "2.5.1"
 _DEFAULT_STEPS = 1600
 _DEFAULT_WORKERS = 6
 _ALL_SEEDS = tuple(range(12))
-_FIT_THRESHOLD = 0.99
-_ROBUSTNESS_THRESHOLDS = (0.98, 0.99, 0.995)
-_ACC_LENGTHS = (64, 256, 512, 1024)
-_FIT_ONLY_LENGTHS = (512, 1024)
 
 _RECORDED_GIVENS_ROUND = "hetero-loop-17-sg8"
 
@@ -384,61 +405,20 @@ def _run_cmd(args: argparse.Namespace) -> int:
     return 1 if n_failed else 0
 
 
-# --- report: composer parameter counts ----------------------------------
-
-
-def _linear_params(in_features: int, out_features: int, bias: bool = True) -> int:
-    """``nn.Linear`` parameter count: ``in*out`` weights + ``out`` bias."""
-    return in_features * out_features + (out_features if bias else 0)
-
-
-def _givens_composer_params(
-    hidden_size: int = 64, block_size: int = 8, rounds: int = 3, input_size: int = 64
-) -> int:
-    """``GivensMinGRU`` parameter count, from ``experiments/hetero_lab.py``'s
-    ``GivensMinGRU.__init__`` (mirrored by the packaged ``mingru.GivensMinGRU``,
-    bit-identical per the lab's bridge selftest): ``linear_theta`` (bias,
-    out = n_blocks*rounds*(block_size//2)) + ``linear_z`` + ``linear_h``
-    (both ``hidden_size -> hidden_size``, bias) + ``h0`` (``hidden_size``
-    free parameters, no weight/bias structure). At the recorded arm's
-    config (block_size=8, rounds=3, hidden_size=64) this must reproduce
-    the recorded 14,624 (TECHNICAL_REPORT section 4.4); callers should
-    treat any drift from that value as a discrepancy to report, not to
-    silently accept.
-    """
-    n_blocks = hidden_size // block_size
-    half = block_size // 2
-    theta_out = n_blocks * rounds * half
-    return (
-        _linear_params(input_size, theta_out)  # linear_theta
-        + 2 * _linear_params(input_size, hidden_size)  # linear_z, linear_h
-        + hidden_size  # h0
-    )
-
-
-def _delta_composer_params(
-    n_heads: int, nh: int, d_k: int, d_v: int, input_size: int = 64, hidden_size: int = 64
-) -> int:
-    """``DeltaMinGRU`` parameter count, from ``mingru.min_gru.DeltaMinGRU
-    .__init__``: ``linear_q`` + ``nh``-length ``linear_k``/``linear_v``/
-    ``linear_beta`` ModuleLists (each linear per micro-step, bias) +
-    ``out_proj``. At the recorded delta@64 config (n_heads=1, nh=2,
-    d_k=d_v=8) this must reproduce the recorded 3,306 (TECHNICAL_REPORT
-    section 4.4 / next-round design doc); callers should treat any drift
-    from that value as a discrepancy to report, not to silently accept.
-    """
-    return (
-        _linear_params(input_size, n_heads * d_k)  # linear_q
-        + nh * _linear_params(input_size, n_heads * d_k)  # linear_k[j]
-        + nh * _linear_params(input_size, n_heads * d_v)  # linear_v[j]
-        + nh * _linear_params(input_size, n_heads)  # linear_beta[j]
-        + _linear_params(n_heads * d_v, hidden_size)  # out_proj
-    )
-
+# --- report: composer parameter counts, Fisher exact, ledger stats -------
+#
+# The pure computation (Fisher exact, composer parameter-count formulas,
+# per-arm ledger-row aggregation) lives in scripts/_evidence_stats.py
+# (design review S3: hoisted out of this file, mirroring the
+# scripts/_bench_env.py precedent) -- imported above as ``fisher_exact_
+# two_sided``, ``givens_composer_params``, ``delta_composer_params``,
+# ``arm_stats``/``ArmStats``. This module keeps only report-specific
+# glue: ledger I/O, discrepancy checks against the recorded literature
+# figures, and markdown formatting.
 
 # Recorded values this round's arms must reproduce (TECHNICAL_REPORT
-# section 4.4); computed here, never hardcoded into the table -- see
-# ``_param_discrepancy_notes``.
+# section 4.4); computed via the imported formulas, never hardcoded into
+# the table -- see ``_param_discrepancy_notes``.
 _RECORDED_GIVENS_PARAMS = 14_624
 _RECORDED_DELTA64_PARAMS = 3_306
 
@@ -447,8 +427,8 @@ def _param_discrepancy_notes() -> list[str]:
     """Flag (not fudge) any drift between the computed formulas above and
     the recorded literature values they are supposed to reproduce."""
     notes = []
-    givens = _givens_composer_params()
-    delta64 = _delta_composer_params(n_heads=1, nh=2, d_k=8, d_v=8)
+    givens = givens_composer_params()
+    delta64 = delta_composer_params(n_heads=1, nh=2, d_k=8, d_v=8)
     if givens != _RECORDED_GIVENS_PARAMS:
         notes.append(
             f"DISCREPANCY: computed givens@64 composer params = {givens:,}, "
@@ -460,36 +440,6 @@ def _param_discrepancy_notes() -> list[str]:
             f"recorded value = {_RECORDED_DELTA64_PARAMS:,}"
         )
     return notes
-
-
-# --- report: Fisher exact (stdlib, exact hypergeometric enumeration) ----
-
-
-def _fisher_exact_two_sided(a: int, b: int, c: int, d: int) -> float:
-    """Two-sided Fisher exact p-value for the 2x2 table [[a, b], [c, d]].
-
-    Exact hypergeometric enumeration (stdlib ``math.comb``, no scipy),
-    per the round's Global Constraint. Sums the hypergeometric
-    probability of every table sharing the observed table's marginals
-    whose probability is <= the observed table's probability (the
-    standard two-sided definition; a small relative tolerance absorbs
-    floating-point rounding at the boundary).
-    """
-    row1, row2 = a + b, c + d
-    col1 = a + c
-    n = row1 + row2
-    denom = math.comb(n, col1)
-
-    def _prob(x: int) -> float:
-        return math.comb(row1, x) * math.comb(row2, col1 - x) / denom
-
-    lo, hi = max(0, col1 - row2), min(row1, col1)
-    p_observed = _prob(a)
-    tolerance = p_observed * 1e-7 + 1e-12
-    return sum(_prob(x) for x in range(lo, hi + 1) if _prob(x) <= p_observed + tolerance)
-
-
-# --- report: ledger stats -------------------------------------------------
 
 
 def _load_rows_by_round(results_path: Path) -> dict[str, list[dict[str, Any]]]:
@@ -506,48 +456,14 @@ def _load_rows_by_round(results_path: Path) -> dict[str, list[dict[str, Any]]]:
     return by_round
 
 
-@dataclass
-class _ArmStats:
-    seeds: int
-    fits: int
-    mean_acc: dict[int, float | None]
-    fit_only_acc: dict[int, float | None]
-    robustness: dict[float, int]
-
-
-def _arm_stats(rows: list[dict[str, Any]]) -> _ArmStats:
-    """Fit counts, mean acc, fit-only acc, threshold-robustness -- all
-    computed from ``rows`` (never hand-transcribed), matching
-    TECHNICAL_REPORT section 4.4's definitions: a fit is the selected
-    checkpoint's val@128 >= threshold; acc@T is the mean over ALL rows;
-    fit-only acc@T is the mean over fitting rows only.
-    """
-    n = len(rows)
-    val128s = [row["ckpt"]["val128"] for row in rows]
-    fit_rows = [row for row in rows if row["ckpt"]["val128"] >= _FIT_THRESHOLD]
-
-    def _mean_acc(subset: list[dict[str, Any]], t: int) -> float | None:
-        if not subset:
-            return None
-        return sum(row["acc"][str(t)] for row in subset) / len(subset)
-
-    return _ArmStats(
-        seeds=n,
-        fits=len(fit_rows),
-        mean_acc={t: _mean_acc(rows, t) for t in _ACC_LENGTHS},
-        fit_only_acc={t: _mean_acc(fit_rows, t) for t in _FIT_ONLY_LENGTHS},
-        robustness={th: sum(1 for v in val128s if v >= th) for th in _ROBUSTNESS_THRESHOLDS},
-    )
-
-
 def _fmt_acc(value: float | None) -> str:
     return f"{value:.3f}" if value is not None else "n/a"
 
 
-def _fmt_fit_only(stats: _ArmStats) -> str:
+def _fmt_fit_only(stats: ArmStats) -> str:
     if stats.seeds == 0:
         return "n/a"
-    parts = [_fmt_acc(stats.fit_only_acc[t]) for t in _FIT_ONLY_LENGTHS]
+    parts = [_fmt_acc(stats.fit_only_acc[t]) for t in FIT_ONLY_LENGTHS]
     return " / ".join(parts)
 
 
@@ -566,10 +482,10 @@ def _report_cmd(args: argparse.Namespace) -> int:
         "| config | seeds | fits | acc@64 | acc@256 | acc@512 | acc@1024 | fit-only @512/@1024 |",
         "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
-    all_stats: dict[str, _ArmStats] = {}
+    all_stats: dict[str, ArmStats] = {}
     for label, round_name, key in row_specs:
         rows = by_round.get(round_name, [])
-        stats = _arm_stats(rows)
+        stats = arm_stats(rows)
         if key is not None:
             all_stats[key] = stats
         fits_str = f"{stats.fits}/{stats.seeds}" if stats.seeds else "0/0"
@@ -582,16 +498,16 @@ def _report_cmd(args: argparse.Namespace) -> int:
         if not rows:
             lines.append(f"  (0 rows found for round `{round_name}`)")
 
-    givens_stats = _arm_stats(by_round.get(_RECORDED_GIVENS_ROUND, []))
+    givens_stats = arm_stats(by_round.get(_RECORDED_GIVENS_ROUND, []))
 
     lines += ["", "## Threshold-robustness (fits at {0.98, 0.99, 0.995})", ""]
     lines += ["| config | 0.98 | 0.99 | 0.995 |", "| --- | --- | --- |"]
     for label, round_name, _key in row_specs:
         rows = by_round.get(round_name, [])
-        stats = _arm_stats(rows)
+        stats = arm_stats(rows)
         n = stats.seeds
         cells = " | ".join(
-            f"{stats.robustness[th]}/{n}" if n else "n/a" for th in _ROBUSTNESS_THRESHOLDS
+            f"{stats.robustness[th]}/{n}" if n else "n/a" for th in ROBUSTNESS_THRESHOLDS
         )
         lines.append(f"| {label} | {cells} |")
 
@@ -603,7 +519,7 @@ def _report_cmd(args: argparse.Namespace) -> int:
         if stats.seeds == 0 or givens_stats.seeds == 0:
             lines.append(f"- {label} vs givens@64: n/a (one arm has 0 rows)")
             continue
-        p = _fisher_exact_two_sided(
+        p = fisher_exact_two_sided(
             stats.fits,
             stats.seeds - stats.fits,
             givens_stats.fits,
@@ -614,9 +530,9 @@ def _report_cmd(args: argparse.Namespace) -> int:
             f"({givens_stats.fits}/{givens_stats.seeds}): p = {p:.4g}"
         )
 
-    givens_params = _givens_composer_params()
-    delta64_params = _delta_composer_params(n_heads=1, nh=2, d_k=8, d_v=8)
-    delta1024_params = _delta_composer_params(n_heads=4, nh=2, d_k=16, d_v=16)
+    givens_params = givens_composer_params()
+    delta64_params = delta_composer_params(n_heads=1, nh=2, d_k=8, d_v=8)
+    delta1024_params = delta_composer_params(n_heads=4, nh=2, d_k=16, d_v=16)
     lines += [
         "",
         "## Composer parameter counts (computed arithmetically, not hardcoded)",
