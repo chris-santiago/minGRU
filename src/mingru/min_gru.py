@@ -25,13 +25,16 @@ positive — a property of the paper's log-space variant, not of the
 Parameter count: O(2 * d_h * d_x) vs. O(3 * d_h * (d_x + d_h)) for a
 standard GRU.
 
-`MinGRU`, `SignedMinGRU`, `RotationMinGRU`, and `GivensMinGRU` are each
-kept atomic (one scan layer, one sequence-mixing mechanism).
-`MinGRUBlock` wraps any one of them, chosen via
-`mixer="log"|"signed"|"rotation"|"givens"` (plus `mixer_kwargs` for
-per-mixer config such as `coupled=True`, a custom `snap` grid, or
-`block_size`/`rounds`), in the standard pre-norm residual template
-(LN -> mixer ->
+`MinGRU`, `SignedMinGRU`, `RotationMinGRU`, `GivensMinGRU`, and
+`DeltaMinGRU` are each kept atomic (one scan layer, one sequence-mixing
+mechanism); `DeltaMinGRU` departs from the other four in mechanism (a
+DeltaNet/DeltaProduct generalized-Householder delta rule, not a
+diagonal/rotation transition scan) but shares the same
+forward/step/registry contract. `MinGRUBlock` wraps any one of them,
+chosen via `mixer="log"|"signed"|"rotation"|"givens"|"delta"` (plus
+`mixer_kwargs` for per-mixer config such as `coupled=True`, a custom
+`snap` grid, `block_size`/`rounds`, or `n_heads`/`nh`), in the standard
+pre-norm residual template (LN -> mixer ->
 residual, then LN -> MLP -> residual), which supplies the inter-layer
 nonlinear mixing: layer l's gates condition on layer l-1's hidden
 states, and the MLP provides cross-channel interaction that a diagonal
@@ -55,17 +58,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Public surface (additive metadata, Phase-4 packaging prep): the four
+# Public surface (additive metadata, Phase-4 packaging prep): the five
 # mixers, the block/stack wrappers, and the four scan functions -- exactly
 # what the README documents as importable (e.g. `from min_gru import
 # MinGRUStack`). Everything else (dispatch internals, decay machinery,
 # `g`/`log_g`, `DecayMixin`) is implementation detail, not part of the
-# documented public API.
+# documented public API. `DeltaMinGRU` does not use the scan ops (its
+# parallel form is chunked-WY, not a Hillis-Steele scan), so it adds no
+# new scan-op export.
 __all__ = [
     "MinGRU",
     "SignedMinGRU",
     "RotationMinGRU",
     "GivensMinGRU",
+    "DeltaMinGRU",
     "MinGRUBlock",
     "MinGRUStack",
     "parallel_scan_log",
@@ -2516,6 +2522,420 @@ class GivensMinGRU(DecayMixin, nn.Module):
         )
 
 
+class DeltaMinGRU(nn.Module):
+    """DeltaNet/DeltaProduct generalized-Householder delta-rule mixer.
+
+    Departs from the other four mixers' diagonal/rotation-scan
+    mechanism entirely: state is a per-head ``d_k x d_v``
+    associative-memory matrix ``H`` (not a vector), updated by ``nh``
+    generalized-Householder rank-1 corrections per token rather than a
+    linear/affine scan. Reimplements Yang et al.'s DeltaNet (``nh=1``)
+    and Siems et al.'s DeltaProduct generalization (``nh>1``) as a
+    package citizen, mirroring the parameter layout of the lab's
+    ``DeltaNetMixer`` (``experiments/variants.py``, not imported here)
+    so state dicts are relatable across lab and package.
+
+    Per head, per token ``t``, in order for micro-step ``j = 1..nh``:
+
+        k_{t,j} = normalize(Linear_k^(j)(x_t))              # L2, last dim
+        v_{t,j} = Linear_v^(j)(x_t)
+        beta_{t,j} = 2 * sigmoid(Linear_beta^(j)(x_t))        # in (0, 2)
+        H <- (I - beta_{t,j} k_{t,j} k_{t,j}^T) H + beta_{t,j} k_{t,j} v_{t,j}^T
+
+    ``beta = 2`` with a unit ``k`` makes the update an exact Householder
+    reflection (``I - 2 k k^T`` is orthogonal, determinant -1); ``(0,
+    2)`` interpolates between the identity (``beta=0``, no update) and a
+    full reflection. Readout after the token's final micro-step is
+    ``y_t = H_t^T q_t`` per head (``q_t = Linear_q(x_t)``), heads
+    concatenated and projected by ``out_proj`` to ``hidden_size``. ``H``
+    is zero-initialized (empty associative memory) unless ``h_0`` is
+    supplied -- unlike ``RotationMinGRU``/``GivensMinGRU``, there is no
+    intrinsic learned initial state: ``H = 0`` is the delta rule's
+    natural origin, not a degenerate point the way it is for a group
+    action.
+
+    This class implements only the sequential per-token recurrence
+    above (correct, ``O(T * nh)`` per-sequence cost); it never
+    materializes a per-token ``d_k x d_k`` transition matrix (each
+    micro-step is a rank-1 correction applied directly to ``H``, never
+    composed into an explicit matrix). A future chunked-WY parallel
+    forward (the standard efficient algorithm for this recurrence --
+    Yang et al. 2024, arXiv:2406.06484) is planned as a
+    semantics-preserving, performance-only swap of ``forward``'s
+    internals; this sequential form (and ``step``) is that future
+    form's correctness oracle.
+
+    Time decay is not supported: the constructor rejects any ``decay is
+    not None`` (``decay``/``decay_rate``/``log1p_delta`` are accepted
+    only for signature uniformity with the other mixers -- folding a
+    per-token decay into the delta-rule composition is unimplemented),
+    and both ``forward``/``step`` reject any ``delta_t`` unconditionally.
+
+    Parameters
+    ----------
+    input_size : int
+        Dimensionality of the inputs ``x_t``.
+    hidden_size : int
+        Output dimensionality (``out_proj`` maps ``n_heads * d_v ->
+        hidden_size``).
+    bias : bool, default=True
+        Whether every linear head (``q``, each micro-step's ``k``/``v``/
+        ``beta``, and ``out_proj``) carries a bias term.
+    n_heads : int, default=4
+        Number of parallel associative-memory heads.
+    nh : int, default=1
+        Number of generalized-Householder micro-steps per token
+        (``nh=1`` is DeltaNet; ``nh>1`` is DeltaProduct).
+    d_k : int, optional
+        Per-head key/query dimension. Defaults to ``hidden_size //
+        n_heads`` (requires ``hidden_size % n_heads == 0`` in that
+        case); pass explicitly to decouple per-head state size from
+        ``hidden_size``.
+    d_v : int, optional
+        Per-head value dimension. Defaults to ``d_k``.
+    chunk_size : int, default=64
+        Reserved for the future chunked-WY parallel forward; this
+        sequential ``forward`` ignores it (performance-only knob, no
+        semantic effect once the parallel form lands). Validated at
+        construction (must be positive) so the constructor contract is
+        already stable for that swap.
+    decay : {"fixed", "learnable", None}, default=None
+        Must be ``None`` -- time decay is not implemented for the
+        delta-rule transition. Accepted for signature uniformity with
+        the other mixers only.
+    decay_rate : float, default=1.0
+        Unused (``decay`` must be ``None``); accepted for signature
+        uniformity.
+    log1p_delta : bool, default=False
+        Unused (``decay`` must be ``None``); accepted for signature
+        uniformity.
+
+    Raises
+    ------
+    ValueError
+        If ``n_heads``, ``nh``, or ``chunk_size`` is not positive; if
+        ``d_k`` is not given and ``hidden_size`` is not divisible by
+        ``n_heads``; or if ``decay`` is not ``None`` (at construction).
+        If ``delta_t`` is given (``forward``/``step``, decay can never
+        be enabled) or ``h_0``/``h_prev`` has the wrong shape (at call
+        time).
+
+    Notes
+    -----
+    ``carries_matrix_state = True`` (class attribute): the state
+    ``forward(..., return_state=True)`` returns and ``step`` carries is
+    the flattened ``H`` matrix, not a readout vector -- ``y_t != h_t``,
+    unlike the other four mixers, where the scanned state doubles as
+    the output. ``forward`` maps ``x (B, T, input_size)`` with optional
+    ``h_0 (B, 1, n_heads*d_k*d_v)`` (flattened in ``(n_heads, d_k,
+    d_v)`` row-major order) to ``y (B, T, hidden_size)``, or ``(y,
+    h_T)`` when ``return_state=True``. ``step`` maps ``x_t (B,
+    input_size)`` with optional ``h_prev (B, n_heads*d_k*d_v)`` to
+    ``(y_t, h_t)``, each following the same flattening. Chaining
+    ``forward(x2, h_0=s)`` after ``(y1, s) = forward(x1,
+    return_state=True)`` equals ``forward(cat(x1, x2))`` on both outputs
+    and gradients.
+
+    References
+    ----------
+    Yang et al., "Parallelizing Linear Transformers with the Delta
+    Rule over Sequence Length" (DeltaNet), arXiv:2406.06484.
+    Siems et al., "DeltaProduct: Increasing the Expressivity of
+    DeltaNet Through Products of Householders" (DeltaProduct).
+
+    Examples
+    --------
+    >>> import torch
+    >>> from mingru import DeltaMinGRU
+    >>> layer = DeltaMinGRU(input_size=32, hidden_size=64, n_heads=4)
+    >>> x = torch.randn(4, 128, 32)
+    >>> tuple(layer(x).shape)
+    (4, 128, 64)
+    """
+
+    carries_matrix_state: bool = True
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        bias: bool = True,
+        n_heads: int = 4,
+        nh: int = 1,
+        d_k: int | None = None,
+        d_v: int | None = None,
+        chunk_size: int = 64,
+        decay: Decay = None,
+        decay_rate: float = 1.0,
+        log1p_delta: bool = False,
+    ):
+        super().__init__()
+        if n_heads <= 0:
+            raise ValueError(f"n_heads must be positive (got {n_heads})")
+        if nh <= 0:
+            raise ValueError(f"nh must be positive (got {nh})")
+        if chunk_size <= 0:
+            raise ValueError(f"chunk_size must be positive (got {chunk_size})")
+        if decay is not None:
+            raise ValueError(
+                f"DeltaMinGRU does not support time decay (got decay={decay!r}); "
+                "construct with decay=None. Folding per-token decay into the "
+                "delta-rule composition is not implemented; decay/decay_rate/"
+                "log1p_delta are accepted only for signature uniformity with "
+                "the other mixers."
+            )
+        if d_k is None and hidden_size % n_heads != 0:
+            raise ValueError(
+                f"hidden_size ({hidden_size}) must be divisible by n_heads "
+                f"({n_heads}) when d_k is not given explicitly; d_k defaults "
+                "to hidden_size // n_heads. Pass d_k explicitly to decouple "
+                "per-head state size from hidden_size."
+            )
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.n_heads = n_heads
+        self.nh = nh
+        self.d_k = d_k if d_k is not None else hidden_size // n_heads
+        self.d_v = d_v if d_v is not None else self.d_k
+        self.chunk_size = chunk_size
+        # decay is always None here (validated above); decay_rate/
+        # log1p_delta are stored unused, for attribute-shape parity with
+        # the other mixers (e.g. MinGRUStack's `block.mingru.decay`
+        # routing check reads `.decay` on every mixer generically).
+        self.decay = decay
+        self.decay_rate = decay_rate
+        self.log1p_delta = log1p_delta
+        # RNG-draw order mirrors experiments/variants.py's DeltaNetMixer:
+        # linear_q, then linear_k/linear_v/linear_beta (each an
+        # nh-length ModuleList, in micro-step order), then out_proj.
+        self.linear_q = nn.Linear(input_size, n_heads * self.d_k, bias=bias)
+        self.linear_k = nn.ModuleList(
+            nn.Linear(input_size, n_heads * self.d_k, bias=bias) for _ in range(nh)
+        )
+        self.linear_v = nn.ModuleList(
+            nn.Linear(input_size, n_heads * self.d_v, bias=bias) for _ in range(nh)
+        )
+        self.linear_beta = nn.ModuleList(
+            nn.Linear(input_size, n_heads, bias=bias) for _ in range(nh)
+        )
+        self.out_proj = nn.Linear(n_heads * self.d_v, hidden_size, bias=bias)
+
+    def _coeffs(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+        """Per-token query/key/value/beta heads; shared by forward/step.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Shape ``(..., input_size)`` -- ``forward`` passes ``(B, T,
+            input_size)``, ``step`` passes ``(B, input_size)``; both
+            work unchanged since ``nn.Linear`` and the elementwise ops
+            here broadcast uniformly over leading dims, so this single
+            helper serves both call paths and they cannot drift apart.
+
+        Returns
+        -------
+        tuple
+            ``q``, shape ``(..., n_heads, d_k)``. ``ks``/``vs``/
+            ``betas``: length-``nh`` lists, in micro-step order, of
+            tensors shaped ``(..., n_heads, d_k)`` (L2-normalized, last
+            dim), ``(..., n_heads, d_v)``, and ``(..., n_heads)`` (in
+            ``(0, 2)``) respectively.
+        """
+        lead = x.shape[:-1]
+        q = self.linear_q(x).view(*lead, self.n_heads, self.d_k)
+        ks = [
+            F.normalize(lin(x).view(*lead, self.n_heads, self.d_k), dim=-1) for lin in self.linear_k
+        ]
+        vs = [lin(x).view(*lead, self.n_heads, self.d_v) for lin in self.linear_v]
+        betas = [2 * torch.sigmoid(lin(x)) for lin in self.linear_beta]
+        return q, ks, vs, betas
+
+    @staticmethod
+    def _contract_state(vec: torch.Tensor, H: torch.Tensor) -> torch.Tensor:
+        """``vec^T H`` per head: shared by the micro-step update and the readout.
+
+        Parameters
+        ----------
+        vec : torch.Tensor
+            Shape ``(..., n_heads, d_k)`` -- a key (micro-step update)
+            or query (readout).
+        H : torch.Tensor
+            Shape ``(..., n_heads, d_k, d_v)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(..., n_heads, d_v)``.
+        """
+        return torch.einsum("...hk,...hkv->...hv", vec, H)
+
+    def _micro_step(
+        self, H: torch.Tensor, k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor
+    ) -> torch.Tensor:
+        """One generalized-Householder update: ``H <- (I - beta k k^T) H + beta k v^T``.
+
+        Parameters
+        ----------
+        H : torch.Tensor
+            Shape ``(..., n_heads, d_k, d_v)``.
+        k : torch.Tensor
+            Shape ``(..., n_heads, d_k)``, L2-normalized.
+        v : torch.Tensor
+            Shape ``(..., n_heads, d_v)``.
+        beta : torch.Tensor
+            Shape ``(..., n_heads)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Updated ``H``, same shape as the input ``H``. Never
+            materializes a ``(..., n_heads, d_k, d_k)`` transition
+            matrix -- the correction is applied directly to ``H`` as
+            two rank-1 outer-product terms.
+        """
+        kH = self._contract_state(k, H)
+        beta = beta.unsqueeze(-1).unsqueeze(-1)
+        H = H - beta * torch.einsum("...hk,...hv->...hkv", k, kH)
+        H = H + beta * torch.einsum("...hk,...hv->...hkv", k, v)
+        return H
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        h_0: torch.Tensor | None = None,
+        delta_t: torch.Tensor | None = None,
+        return_state: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Sequential forward over a full sequence (correctness oracle).
+
+        Runs the token-by-token recurrence from the class docstring
+        directly (``O(T * nh)`` per-head rank-1 updates); a future
+        chunked-WY parallel form is a performance-only swap of this
+        method's internals, semantically identical within floating-
+        point tolerance.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input sequence, shape ``(B, T, input_size)``.
+        h_0 : torch.Tensor, optional
+            Initial per-head associative-memory state, flattened shape
+            ``(B, 1, n_heads*d_k*d_v)`` in ``(n_heads, d_k, d_v)``
+            row-major order. Defaults to zero (empty memory).
+        delta_t : torch.Tensor, optional
+            Must be ``None`` -- ``DeltaMinGRU`` never enables decay, so
+            any non-``None`` value raises ``ValueError``.
+        return_state : bool, default=False
+            If True, also return the final state ``h_T`` (same
+            flattened shape as ``h_0``).
+
+        Returns
+        -------
+        torch.Tensor or tuple of torch.Tensor
+            ``y``, shape ``(B, T, hidden_size)``; or ``(y, h_T)`` when
+            ``return_state=True``.
+
+        Raises
+        ------
+        ValueError
+            If ``delta_t`` is not None, or ``h_0``'s shape does not
+            match ``(B, 1, n_heads*d_k*d_v)``.
+        """
+        if delta_t is not None:
+            raise ValueError(
+                "delta_t was provided but DeltaMinGRU never supports time "
+                "decay (decay is always None); omit delta_t."
+            )
+        B, T, _ = x.shape
+        expected = (B, 1, self.n_heads * self.d_k * self.d_v)
+        if h_0 is None:
+            H = x.new_zeros(B, self.n_heads, self.d_k, self.d_v)
+        else:
+            if tuple(h_0.shape) != expected:
+                raise ValueError(f"h_0 must have shape {expected} (got {tuple(h_0.shape)})")
+            H = h_0.reshape(B, self.n_heads, self.d_k, self.d_v)
+        q, ks, vs, betas = self._coeffs(x)
+        outs = []
+        for t in range(T):
+            for j in range(self.nh):
+                H = self._micro_step(H, ks[j][:, t], vs[j][:, t], betas[j][:, t])
+            outs.append(self._contract_state(q[:, t], H))
+        y = torch.stack(outs, dim=1).reshape(B, T, self.n_heads * self.d_v)
+        y = self.out_proj(y)
+        if return_state:
+            return y, H.reshape(*expected)
+        return y
+
+    @torch.no_grad()
+    def step(
+        self,
+        x_t: torch.Tensor,
+        h_prev: torch.Tensor | None = None,
+        delta_t: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single recurrent step; same real-state convention as forward().
+
+        Computed from the same ``_coeffs``/``_micro_step`` helpers
+        ``forward()`` uses (applied once instead of over the full
+        sequence), so the two paths cannot drift apart.
+
+        Parameters
+        ----------
+        x_t : torch.Tensor
+            Input at the current timestep, shape ``(B, input_size)``.
+        h_prev : torch.Tensor, optional
+            Previous per-head associative-memory state, flattened shape
+            ``(B, n_heads*d_k*d_v)``. Defaults to zero (empty memory).
+        delta_t : torch.Tensor, optional
+            Must be ``None`` -- ``DeltaMinGRU`` never enables decay, so
+            any non-``None`` value raises ``ValueError``.
+
+        Returns
+        -------
+        tuple of torch.Tensor
+            ``(y_t, h_t)``, shapes ``(B, hidden_size)`` and ``(B,
+            n_heads*d_k*d_v)`` respectively. Unlike the other mixers'
+            single-tensor ``step`` return, readout and state differ
+            here (``y_t = H_t^T q_t``, ``h_t`` is the flattened
+            ``H_t``), so both are returned -- the honest generalization
+            where readout != state.
+
+        Raises
+        ------
+        ValueError
+            If ``delta_t`` is not None, or ``h_prev``'s shape does not
+            match ``(B, n_heads*d_k*d_v)``.
+        """
+        if delta_t is not None:
+            raise ValueError(
+                "delta_t was provided but DeltaMinGRU never supports time "
+                "decay (decay is always None); omit delta_t."
+            )
+        B = x_t.size(0)
+        expected = (B, self.n_heads * self.d_k * self.d_v)
+        if h_prev is None:
+            H = x_t.new_zeros(B, self.n_heads, self.d_k, self.d_v)
+        else:
+            if tuple(h_prev.shape) != expected:
+                raise ValueError(f"h_prev must have shape {expected} (got {tuple(h_prev.shape)})")
+            H = h_prev.reshape(B, self.n_heads, self.d_k, self.d_v)
+        q, ks, vs, betas = self._coeffs(x_t)
+        for j in range(self.nh):
+            H = self._micro_step(H, ks[j], vs[j], betas[j])
+        y = self._contract_state(q, H).reshape(B, self.n_heads * self.d_v)
+        y = self.out_proj(y)
+        return y, H.reshape(*expected)
+
+    def extra_repr(self) -> str:
+        return (
+            f"input_size={self.input_size}, hidden_size={self.hidden_size}, "
+            f"n_heads={self.n_heads}, nh={self.nh}, d_k={self.d_k}, "
+            f"d_v={self.d_v}, chunk_size={self.chunk_size}"
+        )
+
+
 class MinGRUBlock(nn.Module):
     """Pre-norm residual block: LN -> minGRU -> +x, then LN -> MLP -> +x.
 
@@ -2536,24 +2956,30 @@ class MinGRUBlock(nn.Module):
     learnable_h0 : bool, default=False
         Routed to the block's mixer when ``mixer`` is ``"log"`` or
         ``"signed"`` (see ``MinGRU`` / ``SignedMinGRU``). Not accepted
-        by ``"rotation"`` or ``"givens"``: ``RotationMinGRU``'s and
-        ``GivensMinGRU``'s ``h_0`` is an intrinsic learned parameter
-        with no ``learnable_h0`` flag, so this argument is silently
-        unused for those mixers.
-    mixer : {"log", "signed", "rotation", "givens"}, default="log"
+        by ``"rotation"``, ``"givens"``, or ``"delta"``:
+        ``RotationMinGRU``'s and ``GivensMinGRU``'s ``h_0`` is an
+        intrinsic learned parameter, and ``DeltaMinGRU``'s is a fixed
+        zero (empty associative memory) -- none of the three accept a
+        ``learnable_h0`` flag, so this argument is silently unused for
+        them.
+    mixer : {"log", "signed", "rotation", "givens", "delta"}, default="log"
         Selects the sequence mixer: ``MinGRU`` (log-space parallel
         scan), ``SignedMinGRU`` (signed diagonal transitions),
-        ``RotationMinGRU`` (2x2 block rotations), or ``GivensMinGRU``
-        (k-dim block rotations built from brick-wall Givens rounds). Any
-        other value raises ``ValueError``.
+        ``RotationMinGRU`` (2x2 block rotations), ``GivensMinGRU``
+        (k-dim block rotations built from brick-wall Givens rounds), or
+        ``DeltaMinGRU`` (DeltaNet/DeltaProduct generalized-Householder
+        delta rule -- a per-head matrix state, not a diagonal/rotation
+        scan; see its class docstring and the "Notes" section below).
+        Any other value raises ``ValueError``.
     mixer_kwargs : dict, optional
         Extra constructor kwargs forwarded to the selected mixer class
         (e.g. ``{"coupled": True}`` for ``"signed"``,
-        ``{"snap": (2, 3, 5)}`` for ``"rotation"``, or
-        ``{"block_size": 8, "rounds": 3}`` for ``"givens"``); pass
-        ``decay``, ``decay_rate``, ``log1p_delta`` here to enable time
-        decay (see
-        ``MinGRU``/``SignedMinGRU``/``RotationMinGRU``/``GivensMinGRU``).
+        ``{"snap": (2, 3, 5)}`` for ``"rotation"``,
+        ``{"block_size": 8, "rounds": 3}`` for ``"givens"``, or
+        ``{"n_heads": 4, "nh": 2}`` for ``"delta"``); pass ``decay``,
+        ``decay_rate``, ``log1p_delta`` here to enable time decay (see
+        ``MinGRU``/``SignedMinGRU``/``RotationMinGRU``/``GivensMinGRU``;
+        ``DeltaMinGRU`` rejects non-``None`` ``decay``).
 
     Notes
     -----
@@ -2563,6 +2989,15 @@ class MinGRUBlock(nn.Module):
     (``ValueError`` both directions, see ``_validate_delta_t_pairing``)
     is what fires whether the block is used standalone or inside a
     ``MinGRUStack``.
+
+    Matrix-state mixers (``carries_matrix_state = True`` -- currently
+    only ``"delta"``) are called as ``forward(..., return_state=True)``
+    and their returned state is passed through as this block's state,
+    instead of the ``output[:, -1:]`` convention every other mixer
+    uses; this is the only behavior difference such a mixer causes, and
+    it is why the returned ``state``'s last dim can differ from
+    ``d_model`` for ``"delta"`` (it is ``n_heads*d_k*d_v``, not
+    ``d_model``).
 
     Examples
     --------
@@ -2576,13 +3011,15 @@ class MinGRUBlock(nn.Module):
     """
 
     # name -> (class, accepts_learnable_h0). RotationMinGRU's and
-    # GivensMinGRU's h_0 are intrinsic (see their class docstrings), so
-    # the flag is not forwarded to them.
+    # GivensMinGRU's h_0 are intrinsic (see their class docstrings);
+    # DeltaMinGRU's is a fixed zero (see its class docstring) -- none of
+    # the three are forwarded the flag.
     _MIXER_CLASSES: dict[str, tuple[type[nn.Module], bool]] = {
         "log": (MinGRU, True),
         "signed": (SignedMinGRU, True),
         "rotation": (RotationMinGRU, False),
         "givens": (GivensMinGRU, False),
+        "delta": (DeltaMinGRU, False),
     }
 
     def __init__(
@@ -2634,8 +3071,10 @@ class MinGRUBlock(nn.Module):
         x : torch.Tensor
             Residual-stream input, shape ``(B, T, d_model)``.
         h_0 : torch.Tensor, optional
-            This block's real minGRU state carried from a previous
-            chunk, shape ``(B, 1, d_model)``; see ``MinGRU.forward``.
+            This block's mixer state carried from a previous chunk,
+            shape ``(B, 1, d_model)`` for every mixer except ``"delta"``
+            (see ``MinGRU.forward``); for ``"delta"``, shape
+            ``(B, 1, n_heads*d_k*d_v)`` (see ``DeltaMinGRU.forward``).
         delta_t : torch.Tensor, optional
             Time gaps preceding each event, shape ``(B, T)`` or
             ``(B, T, 1)``; forwarded to this block's mixer unchanged.
@@ -2647,8 +3086,10 @@ class MinGRUBlock(nn.Module):
         Returns
         -------
         tuple of torch.Tensor
-            The output ``(B, T, d_model)`` and the block's final minGRU
-            state ``(B, 1, d_model)`` for the next chunk.
+            The output ``(B, T, d_model)`` and the block's final mixer
+            state -- ``(B, 1, d_model)`` for every mixer except
+            ``"delta"``, ``(B, 1, n_heads*d_k*d_v)`` for ``"delta"``
+            (see the class "Notes" section) -- for the next chunk.
 
         Raises
         ------
@@ -2656,11 +3097,15 @@ class MinGRUBlock(nn.Module):
             If the mixer's ``decay`` is enabled without ``delta_t``, or
             ``delta_t`` is given without decay enabled.
         """
-        h_seq = self.mingru(self.norm1(x), h_0, delta_t)
+        if getattr(self.mingru, "carries_matrix_state", False):
+            h_seq, state = self.mingru(self.norm1(x), h_0, delta_t, return_state=True)
+        else:
+            h_seq = self.mingru(self.norm1(x), h_0, delta_t)
+            state = h_seq[:, -1:]
         x = x + self.drop(h_seq)
         if self.mlp is not None:
             x = x + self.mlp(self.norm2(x))
-        return x, h_seq[:, -1:]
+        return x, state
 
     @torch.no_grad()
     def step(
@@ -2676,8 +3121,11 @@ class MinGRUBlock(nn.Module):
         x_t : torch.Tensor
             Residual-stream input at time ``t``, shape ``(B, d_model)``.
         h_prev : torch.Tensor or None
-            This block's minGRU state from ``t-1``, shape
-            ``(B, d_model)``; None at the first step.
+            This block's mixer state from ``t-1``, shape ``(B,
+            d_model)`` for every mixer except ``"delta"`` (see
+            ``MinGRU.step``); for ``"delta"``, shape ``(B,
+            n_heads*d_k*d_v)`` (see ``DeltaMinGRU.step``). None at the
+            first step.
         delta_t : torch.Tensor, optional
             Time gap preceding this event, shape ``(B,)`` or ``(B, 1)``;
             forwarded to this block's mixer unchanged. Same
@@ -2686,8 +3134,9 @@ class MinGRUBlock(nn.Module):
         Returns
         -------
         tuple of torch.Tensor
-            The block output and the new minGRU state, each
-            ``(B, d_model)``.
+            The block output, shape ``(B, d_model)``, and the new mixer
+            state -- ``(B, d_model)`` for every mixer except ``"delta"``,
+            ``(B, n_heads*d_k*d_v)`` for ``"delta"``.
 
         Raises
         ------
@@ -2695,11 +3144,15 @@ class MinGRUBlock(nn.Module):
             If the mixer's ``decay`` is enabled without ``delta_t``, or
             ``delta_t`` is given without decay enabled.
         """
-        h = self.mingru.step(self.norm1(x_t), h_prev, delta_t)
-        x_t = x_t + h
+        if getattr(self.mingru, "carries_matrix_state", False):
+            y_t, state = self.mingru.step(self.norm1(x_t), h_prev, delta_t)
+        else:
+            y_t = self.mingru.step(self.norm1(x_t), h_prev, delta_t)
+            state = y_t
+        x_t = x_t + y_t
         if self.mlp is not None:
             x_t = x_t + self.mlp(self.norm2(x_t))
-        return x_t, h
+        return x_t, state
 
 
 def _resolve_stack_mixer_spec(
@@ -2814,10 +3267,11 @@ class MinGRUStack(nn.Module):
     learnable_h0 : bool, default=False
         Passed through to every block; routed to the block's mixer
         when ``mixer`` is ``"log"`` or ``"signed"``, unused for
-        ``"rotation"`` and ``"givens"`` (see ``MinGRUBlock``).
+        ``"rotation"``, ``"givens"``, and ``"delta"`` (see
+        ``MinGRUBlock``).
     mixer : str or list of str, default="log"
         Sequence mixer for the blocks; one of ``{"log", "signed",
-        "rotation", "givens"}`` (see ``MinGRUBlock``). A single ``str`` uses that
+        "rotation", "givens", "delta"}`` (see ``MinGRUBlock``). A single ``str`` uses that
         mixer for every block, bit-identical to prior versions: same
         construction order, same RNG consumption, same state_dict
         keys. Unknown ``str`` values raise ``ValueError`` (from
@@ -2873,10 +3327,16 @@ class MinGRUStack(nn.Module):
     -----
     Shapes: ``forward`` maps ``(B, T, input_size)`` to
     ``(B, T, d_model)``; ``step`` maps ``(B, input_size)`` and a state
-    (a list of ``n_layers`` tensors of shape ``(B, d_model)``) to the
-    output ``(B, d_model)`` and the updated state -- uniform across
-    mixer types, so mixed stacks use the same ``forward``/``step``
-    contract as homogeneous ones. Both also accept an optional
+    (a list of ``n_layers`` tensors, one per block) to the output
+    ``(B, d_model)`` and the updated state. Per-block state entries are
+    opaque to ``MinGRUStack`` -- ``init_state()`` returns ``None``
+    placeholders (no shape assumed) and ``step()`` only ever passes a
+    state entry through to its own block's ``.step()``, never inspects
+    or reshapes it -- so this is uniform across mixer types with one
+    caveat: the entry's shape is ``(B, d_model)`` for every mixer except
+    ``"delta"`` (``carries_matrix_state = True``), whose entry is
+    ``(B, n_heads*d_k*d_v)`` (see ``MinGRUBlock.step``). Both
+    ``forward``/``step`` also accept an optional
     ``delta_t`` (same shapes as the mixers' ``delta_t``): it is routed
     to a given block only if that block's mixer has decay enabled
     (checked via the mixer's own ``decay`` attribute), so a
@@ -3065,14 +3525,18 @@ class MinGRUStack(nn.Module):
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Streaming step.
 
-        Total cached state is ``n_layers * d_model`` per sample.
+        Total cached state is ``n_layers * d_model`` per sample, except
+        that a ``"delta"`` block's entry is ``n_heads*d_k*d_v`` instead
+        of ``d_model`` (see the class "Notes" section).
 
         Parameters
         ----------
         x_t : torch.Tensor
             Input at the current timestep, shape ``(B, input_size)``.
         state : list of (torch.Tensor or None)
-            From ``init_state()`` or a previous ``step()``.
+            From ``init_state()`` or a previous ``step()``. Each entry
+            is opaque to this method -- passed straight through to its
+            own block's ``.step()``, never inspected or reshaped here.
         delta_t : torch.Tensor, optional
             Time gap preceding this event, shape ``(B,)`` or ``(B, 1)``.
             Same per-block routing and ``ValueError`` contract as
@@ -3082,7 +3546,8 @@ class MinGRUStack(nn.Module):
         -------
         tuple
             The output, shape ``(B, d_model)``, and the updated state
-            (a list of ``n_layers`` tensors, each ``(B, d_model)``).
+            (a list of ``n_layers`` tensors, one per block -- see the
+            class "Notes" section for each entry's shape).
 
         Raises
         ------
