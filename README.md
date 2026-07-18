@@ -95,8 +95,8 @@ though, like the other continuous composers here, it buys no attractor at
 length and still decays by T=1024. See "The hierarchical task: S3-hier,"
 below, for the task's construction and the full cross-mechanism evidence
 table, and "Givens variant" for the mechanism, the measured decay, and
-the parallel-only design case for choosing it over the sequential
-delta-rule composer.
+the design case — scoped to this repo's implementations — for choosing
+it over the sequential delta-rule composer.
 
 Numbers below are multi-seed means (torch 2.5.1, CPU; seed counts stated
 per row). Protocol: seq2seq tagging (dense supervision), T_train=64,
@@ -1021,11 +1021,14 @@ suggestive only (p ≈ 0.22).
 Measured uncontended forward+backward at `B = 128, T = 64` (min of three
 runs), one training step costs 0.961s for the parallel-scan givens8
 transition against 0.179s for the sequential delta-rule path. The case for
-`GivensMinGRU` is the parallel-only design constraint together with fit
-reliability and length generalization within the rotation family, not
-training-step speed: no parallel-scan configuration measured here beats the
-sequential delta path on CPU, and the promotion rests on the first three
-properties rather than the last.
+`GivensMinGRU` is keeping the composer inside this repo's parallel
+associative scan together with fit reliability and length generalization
+within the rotation family, not training-step speed: no parallel-scan
+configuration measured here beats the sequential delta path on CPU. Scope
+note: the delta rule itself is parallelizable in the literature (the
+DeltaNet chunked-WY representation, with released kernels) — sequentiality
+describes this repo's reimplementation, and no comparison against tuned
+parallel delta kernels has been measured here.
 
 Practical differences from the other mixers: 3 linear heads (theta, z, h)
 vs. `RotationMinGRU`'s 4 / `SignedMinGRU`'s 3 (mind parameter-matched
