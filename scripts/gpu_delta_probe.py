@@ -19,9 +19,14 @@ Grid (five shapes, B=128 throughout):
   default to ``hidden_size // n_heads = 64``; state 16384) at T in {256,
   1024}.
 
-``chunk_size`` is left at ``DeltaMinGRU``'s default (64) for every shape.
+``chunk_size`` is left at ``DeltaMinGRU``'s default (64) for every shape --
+with ``nh=2`` that is ``nh * chunk_size = 128``, exactly at the Triton delta
+kernel's envelope ceiling (``mingru.triton_scans._DELTA_MAX_MICROSTEPS``),
+and both shapes' ``d_k`` (16, 64) sit in the kernel's supported
+``{4, 8, 16, 32, 64}`` set (``_DELTA_DK_ENVELOPE``) with ``d_k == d_v`` --
+every grid shape is in-envelope for the ``triton`` arm below.
 
-Three arms per shape:
+Four arms per shape:
 
 ``eager``
     Forward+backward (``.sum().backward()``), CUDA-event timed
@@ -30,6 +35,25 @@ Three arms per shape:
     memory via ``torch.cuda.reset_peak_memory_stats()`` /
     ``max_memory_allocated()`` reset AFTER warmup so the reported peak
     reflects steady-state allocator behavior, not one-time warmup growth.
+    Runs under ``MINGRU_SCAN=eager``, forced (see ``_scan_env``): now that
+    the Triton delta kernel is registered, leaving ``MINGRU_SCAN`` unset
+    would resolve to ``"auto"``, which prefers the kernel over the eager
+    math on CUDA inputs (``src/mingru/min_gru.py``'s
+    ``_resolve_scan_mode``) -- without forcing ``"eager"`` here, this arm
+    would silently measure the kernel instead of what its label claims.
+
+``triton``
+    Same forward+backward/timing/peak-memory protocol as ``eager``, but
+    under ``MINGRU_SCAN=triton`` forced. This mode is fail-loud by design
+    (``src/mingru/min_gru.py``'s ``_resolve_triton_dispatch``): if the
+    kernel can't engage for a shape (out of envelope, unavailable, or a
+    launch failure), the dispatch seam raises ``RuntimeError`` rather than
+    silently falling back to eager -- ``_triton_arm`` does NOT catch this
+    (unlike the ``compile`` arm's deliberate boundary catch below), so an
+    engagement failure crashes the whole probe instead of quietly timing
+    the eager fallback and mislabeling it "triton". This is intentional:
+    the whole point of this arm is proof of kernel engagement, not a best-
+    effort number.
 
 ``floor`` (approximate, explicitly labeled)
     Standalone batched-GEMM/triangular-solve ops replicating
@@ -60,16 +84,33 @@ Three arms per shape:
 
 ``compile``
     ``torch.compile(layer)``, same timing protocol as ``eager`` (warmup
-    absorbs graph compilation). If compilation or a compiled step raises,
-    the arm records ``compile_status: "failed"`` with the exception text
-    and the probe continues to the next shape -- a compile failure on one
-    shape must never crash the whole grid (the broad ``except Exception``
-    in ``_compile_arm`` is this script's one deliberately-disclosed
-    boundary catch, required by the task brief, not a silently swallowed
-    error: the message is threaded into the artifact verbatim). After
-    each shape's compile arm, ``_run_shape`` best-effort calls
-    ``torch._dynamo.reset()`` so this shape's guard cache does not persist
-    into the next shape's ``eager`` timing/peak-memory baseline.
+    absorbs graph compilation), also under ``MINGRU_SCAN=eager`` forced
+    (see the ``eager`` arm above): this arm measures how much of the
+    eager-vs-floor gap Inductor closes by fusing the eager math, not a
+    compiled wrapper around the Triton kernel's own dispatch. If
+    compilation or a compiled step raises, the arm records
+    ``compile_status: "failed"`` with the exception text and the probe
+    continues to the next shape -- a compile failure on one shape must
+    never crash the whole grid (the broad ``except Exception`` in
+    ``_compile_arm`` is this script's one deliberately-disclosed boundary
+    catch, required by the task brief, not a silently swallowed error: the
+    message is threaded into the artifact verbatim; contrast the
+    ``triton`` arm above, whose engagement failure is deliberately NOT
+    caught). After each shape's compile arm, ``_run_shape`` best-effort
+    calls ``torch._dynamo.reset()`` so this shape's guard cache does not
+    persist into the next shape's ``eager`` timing/peak-memory baseline.
+
+Bar judgment (spec section 9.1, acceptance criterion 1): each shape's row
+carries ``bar_met_vs_eager`` (``triton_step_secs_median <=
+eager_step_secs_median``), ``bar_met_vs_compile`` (``triton_step_secs_median
+<= _TRITON_VS_COMPILE_BAR_RATIO * compile_step_secs_median``, ``None`` if
+``compile_status != "ok"`` for that shape -- the bar cannot be judged
+against a compile median that doesn't exist), and ``bar_met`` (both,
+``None`` if either sub-judgment is ``None``) -- so a reader (or
+EXPERIMENTS.md's transcription) reads the pass/fail verdict straight off
+the artifact instead of re-deriving it from the raw medians by hand.
+``memory_bar_met`` (``triton_peak_mem_bytes <= eager_peak_mem_bytes``)
+carries the separate spec section 7 memory invariant the same way.
 
 Output protocol (mirrors ``scripts/scaling_probe.py``'s
 ``MINGRU_PROBE_HEADER``/``MINGRU_PROBE_RESULT`` line-marker pattern):
@@ -120,9 +161,12 @@ container's site-packages regardless of CWD), so this file needs no
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
 import platform
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -135,6 +179,12 @@ _BATCH_SIZE = 128
 _WARMUP_STEPS = 3
 _TIMED_STEPS = 10
 _SEED = 0
+
+# Speed bar (spec section 9.1, acceptance criterion 1): the triton arm's
+# fwd+bwd median must be within this factor of the same shape's compile
+# median (and never slower than eager, checked separately -- see
+# _run_shape's bar_met_vs_eager/bar_met_vs_compile/bar_met fields).
+_TRITON_VS_COMPILE_BAR_RATIO = 1.2
 
 # Standard fwd-GEMM convention: backward costs ~2x forward's matmul FLOPs
 # (one gradient matmul w.r.t. the input, one w.r.t. the weight), so
@@ -239,6 +289,40 @@ def _import_delta_mingru() -> type:
     return DeltaMinGRU
 
 
+@contextlib.contextmanager
+def _scan_env(mode: str) -> Iterator[None]:
+    """Force ``os.environ["MINGRU_SCAN"] = mode`` for the block, restoring
+    whatever was there before (including on an exception) on exit.
+
+    Every arm that drives ``DeltaMinGRU.forward`` (``eager``, ``compile``,
+    ``triton``) must force an explicit mode: leaving ``MINGRU_SCAN`` unset
+    resolves to ``"auto"``, which -- now that the Triton delta kernel is
+    registered -- prefers the kernel over the eager math on CUDA inputs
+    (``src/mingru/min_gru.py``'s ``_resolve_scan_mode``). Without this, the
+    ``eager``/``compile`` arms would silently measure the kernel instead of
+    what their labels claim.
+
+    DUPLICATION-PENDING: near-identical save/force/restore pattern to
+    ``mingru.triton_scans._scan_env`` and ``scripts/gpu_hetero_campaign.py``'s
+    own ``_scan_env`` -- this is the third independent copy. Kept local
+    rather than imported or hoisted: this script is an independent
+    job-runner entry point (mirrors ``scripts/gpu_check.py``'s
+    ``_extract_last`` docstring's identical DUPLICATION-PENDING reasoning --
+    no existing shared module owns cross-script job-runner helpers).
+    Flagged for the orchestrator to hoist into a shared helper if a fourth
+    site appears.
+    """
+    prior = os.environ.get("MINGRU_SCAN")
+    os.environ["MINGRU_SCAN"] = mode
+    try:
+        yield
+    finally:
+        if prior is None:
+            os.environ.pop("MINGRU_SCAN", None)
+        else:
+            os.environ["MINGRU_SCAN"] = prior
+
+
 def _median(values: list[float]) -> float | None:
     if not values:
         return None
@@ -267,13 +351,22 @@ def _time_cuda_steps(step_fn, warmup: int, timed: int) -> list[float]:
     return secs
 
 
-def _eager_arm(layer: torch.nn.Module, x: torch.Tensor) -> tuple[list[float], int]:
-    """Forward+backward, CUDA-event timed; returns (timed secs, peak mem bytes).
+def _timed_forward_backward_arm(
+    layer: torch.nn.Module, x: torch.Tensor, *, scan_mode: str
+) -> tuple[list[float], int]:
+    """Forward+backward under ``MINGRU_SCAN=scan_mode``, CUDA-event timed.
 
-    Peak memory is reset AFTER the untimed warmup (see the module
-    docstring's ``eager`` arm) so it reflects the timed loop's
-    steady-state allocations, not one-time warmup-only growth (e.g. the
-    caching allocator's first block reservations).
+    Shared by the ``eager`` and ``triton`` arms (identical warmup/timing/
+    peak-memory protocol -- see the module docstring's ``eager``/``triton``
+    arm sections -- differing only in which scan mode ``_scan_env`` forces).
+    Peak memory is reset AFTER the untimed warmup so it reflects the timed
+    loop's steady-state allocations, not one-time warmup-only growth (e.g.
+    the caching allocator's first block reservations).
+
+    Returns ``(timed secs, peak mem bytes)``. Does not catch any exception
+    ``step()`` raises (a ``MINGRU_SCAN=triton`` engagement failure included)
+    -- see the ``triton`` arm's module-docstring section for why that is
+    the intended behavior here.
     """
 
     def step() -> None:
@@ -283,13 +376,30 @@ def _eager_arm(layer: torch.nn.Module, x: torch.Tensor) -> tuple[list[float], in
         loss = layer(x).sum()
         loss.backward()
 
-    for _ in range(_WARMUP_STEPS):
-        step()
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    secs = _time_cuda_steps(step, warmup=0, timed=_TIMED_STEPS)
-    peak_mem = torch.cuda.max_memory_allocated()
+    with _scan_env(scan_mode):
+        for _ in range(_WARMUP_STEPS):
+            step()
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        secs = _time_cuda_steps(step, warmup=0, timed=_TIMED_STEPS)
+        peak_mem = torch.cuda.max_memory_allocated()
     return secs, peak_mem
+
+
+def _eager_arm(layer: torch.nn.Module, x: torch.Tensor) -> tuple[list[float], int]:
+    """``MINGRU_SCAN=eager`` forward+backward; returns (timed secs, peak mem bytes)."""
+    return _timed_forward_backward_arm(layer, x, scan_mode="eager")
+
+
+def _triton_arm(layer: torch.nn.Module, x: torch.Tensor) -> tuple[list[float], int]:
+    """``MINGRU_SCAN=triton`` forward+backward; returns (timed secs, peak mem bytes).
+
+    Fail-loud by design (see the module docstring's ``triton`` arm
+    section): an engagement failure raises uncaught out of this function
+    and crashes the probe rather than being silently timed as if it were
+    the kernel.
+    """
+    return _timed_forward_backward_arm(layer, x, scan_mode="triton")
 
 
 def _floor_forward_ops(
@@ -382,26 +492,31 @@ def _compile_arm(
 ) -> tuple[list[float] | None, str, str | None]:
     """``torch.compile`` arm; never raises -- returns ``(secs, status, error)``.
 
+    Runs under ``MINGRU_SCAN=eager`` forced (see the module docstring's
+    ``compile`` arm section) -- this arm measures Inductor's fusion of the
+    eager math, not a compiled wrapper around the Triton kernel dispatch.
     The broad ``except Exception`` here is this script's one deliberately
     -disclosed boundary catch (required by the task brief: "If compile
     fails, record compile_status: failed with the error string and
-    continue -- never crash the probe"). Catches both compilation
-    failures and failures during the first compiled step (Inductor lazily
-    traces on first call), so either failure mode degrades to
-    ``status="failed"`` with the exception text rather than aborting the
+    continue -- never crash the probe"; contrast the ``triton`` arm, whose
+    engagement failure is deliberately NOT caught). Catches both
+    compilation failures and failures during the first compiled step
+    (Inductor lazily traces on first call), so either failure mode degrades
+    to ``status="failed"`` with the exception text rather than aborting the
     whole grid.
     """
     try:
-        compiled = torch.compile(layer)
+        with _scan_env("eager"):
+            compiled = torch.compile(layer)
 
-        def step() -> None:
-            layer.zero_grad(set_to_none=True)
-            if x.grad is not None:
-                x.grad = None
-            loss = compiled(x).sum()
-            loss.backward()
+            def step() -> None:
+                layer.zero_grad(set_to_none=True)
+                if x.grad is not None:
+                    x.grad = None
+                loss = compiled(x).sum()
+                loss.backward()
 
-        secs = _time_cuda_steps(step, warmup=_WARMUP_STEPS, timed=_TIMED_STEPS)
+            secs = _time_cuda_steps(step, warmup=_WARMUP_STEPS, timed=_TIMED_STEPS)
         return secs, "ok", None
     except Exception as exc:  # disclosed boundary catch, see docstring above
         return None, "failed", f"{type(exc).__name__}: {exc}"
@@ -420,6 +535,9 @@ def _run_shape(cfg: _ShapeConfig, delta_mingru_cls: type, device: torch.device) 
 
     eager_secs, eager_peak_mem = _eager_arm(layer, x)
     eager_median = _median(eager_secs)
+
+    triton_secs, triton_peak_mem = _triton_arm(layer, x)
+    triton_median = _median(triton_secs)
 
     floor_step_secs, floor_fwd_secs, op_inventory = _floor_arm(
         layer, cfg.batch_size, cfg.seq_len, device
@@ -458,6 +576,36 @@ def _run_shape(cfg: _ShapeConfig, delta_mingru_cls: type, device: torch.device) 
         if denom != 0:
             compile_recovered = (eager_median - compile_median) / denom
 
+    # Bar judgment (spec section 9.1, acceptance criterion 1) -- see the
+    # module docstring's "Bar judgment" section for the field contract.
+    # triton_median/eager_median are never None in practice (the triton arm
+    # never degrades to a "failed" status the way the compile arm does --
+    # see _triton_arm's docstring -- and _TIMED_STEPS is a fixed nonzero
+    # count, so _median always returns a float), so the vs-eager judgment
+    # is always computable; the vs-compile judgment is only computable when
+    # this shape's compile arm actually succeeded. Narrow explicitly
+    # (mirrors the compile-arm's own None-guard above) rather than relying
+    # on that invariant implicitly -- `_median`'s real signature is
+    # `float | None`, and a bare `triton_median <= eager_median` would
+    # TypeError against a `None` if that invariant were ever violated.
+    assert triton_median is not None, "triton arm produced no timed samples"
+    assert eager_median is not None, "eager arm produced no timed samples"
+    triton_vs_eager_ratio = triton_median / eager_median if eager_median else None
+    bar_met_vs_eager = triton_median <= eager_median
+
+    triton_vs_compile_ratio = triton_median / compile_median if compile_median else None
+    bar_met_vs_compile = (
+        None
+        if compile_median is None
+        else triton_median <= _TRITON_VS_COMPILE_BAR_RATIO * compile_median
+    )
+    bar_met = None if bar_met_vs_compile is None else bar_met_vs_compile and bar_met_vs_eager
+
+    # Memory invariant (spec section 7): kernel-path peak training memory
+    # must never exceed the eager path's.
+    triton_vs_eager_peak_mem_ratio = triton_peak_mem / eager_peak_mem if eager_peak_mem else None
+    memory_bar_met = triton_peak_mem <= eager_peak_mem
+
     return {
         "label": cfg.label,
         "config_name": cfg.config_name,
@@ -486,6 +634,16 @@ def _run_shape(cfg: _ShapeConfig, delta_mingru_cls: type, device: torch.device) 
         "compile_error": compile_error,
         "headroom_eager_over_floor": headroom,
         "compile_recovered_fraction": compile_recovered,
+        "triton_step_secs_median": triton_median,
+        "triton_step_secs_all": triton_secs,
+        "triton_peak_mem_bytes": triton_peak_mem,
+        "triton_vs_eager_ratio": triton_vs_eager_ratio,
+        "triton_vs_compile_ratio": triton_vs_compile_ratio,
+        "bar_met_vs_eager": bar_met_vs_eager,
+        "bar_met_vs_compile": bar_met_vs_compile,
+        "bar_met": bar_met,
+        "triton_vs_eager_peak_mem_ratio": triton_vs_eager_peak_mem_ratio,
+        "memory_bar_met": memory_bar_met,
     }
 
 
@@ -555,10 +713,12 @@ def main(argv: list[str] | None = None) -> int:
         eager_s = row["eager_step_secs_median"]
         floor_s = row["floor_step_secs"]
         compile_s = row["compile_step_secs_median"]
+        triton_s = row["triton_step_secs_median"]
         print(
             f"    eager={eager_s:.4f}s floor={floor_s:.4f}s "
             f"compile={compile_s if compile_s is None else f'{compile_s:.4f}s'} "
-            f"({row['compile_status']}) headroom={row['headroom_eager_over_floor']}",
+            f"({row['compile_status']}) triton={triton_s:.4f}s "
+            f"headroom={row['headroom_eager_over_floor']} bar_met={row['bar_met']}",
             flush=True,
         )
         shapes.append(row)

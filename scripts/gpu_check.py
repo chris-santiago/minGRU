@@ -34,11 +34,12 @@ Job modes (``--job``, default ``check``, existing invocations unaffected):
 ``check`` (default)
   The conformance sweep described above -- unchanged.
 
-``delta-probe`` (Task 6)
+``delta-probe`` (Task 6, extended Task 5)
   Runs ``scripts/gpu_delta_probe.py`` instead: the CUDA fusion-headroom
   probe for ``DeltaMinGRU``'s chunked-WY forward (profiles eager vs. its
-  matmul-FLOP floor vs. ``torch.compile``, the speedup-worth-it judgment
-  for building a Triton chunked-WY kernel -- see that script's module
+  matmul-FLOP floor vs. ``torch.compile`` vs. the Triton chunked-WY kernel
+  under ``MINGRU_SCAN=triton`` -- the round's central speed-bar evidence,
+  spec section 9.1 acceptance criterion 1 -- see that script's module
   docstring and ``.git/sdd/task-6-brief.md``). No keepalive heartbeat:
   the Lightning idle auto-shutdown applies to interactive studios, not
   jobs, and a backgrounded loop outlives a studio-mode job's command
@@ -267,17 +268,46 @@ def _fmt_probe_cell(value: Any, spec: str = ".4f") -> str:
     return format(value, spec) if isinstance(value, (int, float)) else "n/a"
 
 
+def _fmt_bytes_mb(value: Any) -> str:
+    """Render a possibly-``None`` byte count as MB (1 decimal place)."""
+    return _fmt_probe_cell(value / 1e6, ".1f") if isinstance(value, (int, float)) else "n/a"
+
+
+def _fmt_bar_judgment(value: Any) -> str:
+    """Render a three-state bar-judgment field (``True``/``False``/``None``) as a table cell.
+
+    ``None`` means "not judged" (e.g. the vs-compile bar when that shape's
+    compile arm failed), not "failed" -- rendered distinctly from ``False``
+    so a reader never mistakes "can't judge" for "judged and failed".
+    """
+    if value is True:
+        return "PASS"
+    if value is False:
+        return "FAIL"
+    return "n/a"
+
+
 def _render_delta_probe_markdown(result: dict[str, Any]) -> str:
+    """Render the delta-probe JSON artifact as Markdown (Task 5/6).
+
+    Two tables: the first carries every arm's step-time medians (eager,
+    floor, compile, triton) plus the speed-bar judgment (spec section 9.1
+    acceptance criterion 1) per shape; the second carries the eager-vs-
+    triton peak-memory comparison and its own bar judgment (spec section 7
+    memory invariant) -- split out rather than crammed into the first
+    table's already-wide row, since MB figures and the PASS/FAIL/n/a bar
+    cells read as their own self-contained comparison.
+    """
     env = result.get("env", {})
     lines = [
         "# CUDA fusion-headroom probe: DeltaMinGRU chunked-WY (Task 6)",
         "",
         "Eager chunked-WY forward+backward vs. its matmul-FLOP floor "
-        "(approximate, see each row's `floor_method`) vs. `torch.compile`, "
-        "per `.git/sdd/task-6-brief.md` / `scripts/gpu_delta_probe.py`. "
-        "This is a GPU evidence stratum: nothing below is comparable to "
-        "the pinned-CPU rows in `experiments/lab_results.jsonl` / "
-        "`EXPERIMENTS.md`.",
+        "(approximate, see each row's `floor_method`) vs. `torch.compile` "
+        "vs. the Triton chunked-WY kernel, per `.git/sdd/task-6-brief.md` / "
+        "`scripts/gpu_delta_probe.py`. This is a GPU evidence stratum: "
+        "nothing below is comparable to the pinned-CPU rows in "
+        "`experiments/lab_results.jsonl` / `EXPERIMENTS.md`.",
         "",
         f"Env: torch {env.get('torch_version')} (CUDA {env.get('cuda_version')}), "
         f"device {env.get('cuda_device_name')} (capability "
@@ -288,9 +318,10 @@ def _render_delta_probe_markdown(result: dict[str, Any]) -> str:
         f"{env.get('timestamp')}.",
         "",
         "| shape | config | B | T | eager median (s) | floor (s, approx) | "
-        "compile median (s) | compile status | headroom (eager/floor) | "
-        "compile recovered |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "compile median (s) | compile status | triton median (s) | "
+        "headroom (eager/floor) | compile recovered | triton/compile | "
+        "triton/eager | bar met |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in result.get("shapes", []):
         cfg_str = ", ".join(f"{k}={v}" for k, v in row.get("live_config", {}).items())
@@ -301,8 +332,12 @@ def _render_delta_probe_markdown(result: dict[str, Any]) -> str:
             f"{_fmt_probe_cell(row.get('floor_step_secs'))} | "
             f"{_fmt_probe_cell(row.get('compile_step_secs_median'))} | "
             f"{row.get('compile_status')} | "
+            f"{_fmt_probe_cell(row.get('triton_step_secs_median'))} | "
             f"{_fmt_probe_cell(row.get('headroom_eager_over_floor'), '.2f')} | "
-            f"{_fmt_probe_cell(row.get('compile_recovered_fraction'), '.2%')} |"
+            f"{_fmt_probe_cell(row.get('compile_recovered_fraction'), '.2%')} | "
+            f"{_fmt_probe_cell(row.get('triton_vs_compile_ratio'), '.2f')} | "
+            f"{_fmt_probe_cell(row.get('triton_vs_eager_ratio'), '.2f')} | "
+            f"{_fmt_bar_judgment(row.get('bar_met'))} |"
         )
     lines += [
         "",
@@ -311,7 +346,31 @@ def _render_delta_probe_markdown(result: dict[str, Any]) -> str:
         "3x fwd-GEMM convention -- see each shape's `floor_method` in the "
         "JSON artifact for the full disclosure. A `compile status` other "
         "than `ok` means Inductor failed on that shape; see the JSON "
-        "artifact's `compile_error` for that row.",
+        "artifact's `compile_error` for that row. `bar met` is the spec "
+        "section 9.1 speed bar (triton fwd+bwd median <= 1.2x the recorded "
+        "compile median AND <= the recorded eager median, both judged on "
+        "this same run's own medians) -- `n/a` means the vs-compile leg "
+        "couldn't be judged because that shape's compile arm failed, not "
+        "that the bar failed.",
+        "",
+        "| shape | eager peak mem (MB) | triton peak mem (MB) | "
+        "triton/eager peak mem | memory bar met |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for row in result.get("shapes", []):
+        lines.append(
+            f"| {row.get('label')} | "
+            f"{_fmt_bytes_mb(row.get('eager_peak_mem_bytes'))} | "
+            f"{_fmt_bytes_mb(row.get('triton_peak_mem_bytes'))} | "
+            f"{_fmt_probe_cell(row.get('triton_vs_eager_peak_mem_ratio'), '.2f')} | "
+            f"{_fmt_bar_judgment(row.get('memory_bar_met'))} |"
+        )
+    lines += [
+        "",
+        "`memory bar met` is the spec section 7 memory invariant "
+        "(triton-path peak training memory <= eager-path peak training "
+        "memory), judged per shape from `eager_peak_mem_bytes`/"
+        "`triton_peak_mem_bytes` in the JSON artifact.",
         "",
     ]
     return "\n".join(lines) + "\n"

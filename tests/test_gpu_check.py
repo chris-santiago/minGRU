@@ -43,6 +43,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 _SCRIPT_PATH = Path(__file__).resolve().parent.parent / "scripts" / "gpu_check.py"
 _spec = importlib.util.spec_from_file_location("gpu_check", _SCRIPT_PATH)
@@ -523,3 +524,201 @@ def test_finish_hetero36_retry_is_idempotent_end_to_end(tmp_path, monkeypatch):
     assert sidecar_data["rows_skipped_invalid"] == 0
     assert sidecar_data["rows_deduped_in_batch"] == 0
     assert sidecar_data["rows_extracted"] == 2
+
+
+# --- _render_delta_probe_markdown (Task 5: triton arm + bar judgment) ------
+#
+# ``scripts/gpu_delta_probe.py``'s own arms are exercised nowhere in this
+# CPU-only test suite (no CUDA) -- these tests target the renderer in
+# complete isolation, on hand-crafted result dicts shaped like
+# ``_run_shape``'s return value, mirroring this file's existing
+# renderer-adjacent idiom (crafted strings/dicts only, no subprocess, no
+# torch).
+
+_fmt_bar_judgment = gpu_check._fmt_bar_judgment
+_fmt_bytes_mb = gpu_check._fmt_bytes_mb
+_render_delta_probe_markdown = gpu_check._render_delta_probe_markdown
+
+
+def _delta_probe_shape_row(**overrides: Any) -> dict:
+    """A ``_run_shape``-shaped row, all triton/bar fields present by default.
+
+    ``overrides`` replaces individual fields so each test only states what
+    it cares about (e.g. a failed compile arm, a failed speed bar).
+    """
+    row = {
+        "label": "pd1024_T64",
+        "config_name": "pd1024",
+        "config": {
+            "input_size": 64,
+            "hidden_size": 64,
+            "n_heads": 4,
+            "nh": 2,
+            "d_k": 16,
+            "d_v": 16,
+        },
+        "live_config": {
+            "n_heads": 4,
+            "nh": 2,
+            "d_k": 16,
+            "d_v": 16,
+            "chunk_size": 64,
+            "state_elements": 1024,
+        },
+        "B": 128,
+        "T": 64,
+        "eager_step_secs_median": 0.0074,
+        "eager_step_secs_all": [0.0074] * 10,
+        "eager_peak_mem_bytes": 186_914_816,
+        "floor_step_secs": 0.0028,
+        "floor_forward_only_secs_all": [0.00093] * 10,
+        "floor_method": "standalone GEMM/solve ops, see module docstring",
+        "floor_op_inventory": [],
+        "floor_suspect": False,
+        "compile_step_secs_median": 0.0041,
+        "compile_step_secs_all": [0.0041] * 10,
+        "compile_status": "ok",
+        "compile_error": None,
+        "headroom_eager_over_floor": 2.6,
+        "compile_recovered_fraction": 0.7163,
+        "triton_step_secs_median": 0.0045,
+        "triton_step_secs_all": [0.0045] * 10,
+        "triton_peak_mem_bytes": 150_000_000,
+        "triton_vs_eager_ratio": 0.6081,
+        "triton_vs_compile_ratio": 1.0976,
+        "bar_met_vs_eager": True,
+        "bar_met_vs_compile": True,
+        "bar_met": True,
+        "triton_vs_eager_peak_mem_ratio": 0.8025,
+        "memory_bar_met": True,
+    }
+    row.update(overrides)
+    return row
+
+
+def _delta_probe_result(*rows: dict) -> dict:
+    return {
+        "env": {
+            "torch_version": "2.8.0+cu128",
+            "cuda_version": "12.8",
+            "cuda_device_name": "NVIDIA L4",
+            "device_capability": [8, 9],
+            "platform": "Linux-x86_64",
+            "batch_size": 128,
+            "warmup_steps": 3,
+            "timed_steps": 10,
+            "timestamp": "2026-07-18T09:57:13+00:00",
+            "triton_version": "3.4.0",
+        },
+        "shapes": list(rows),
+    }
+
+
+def test_fmt_bar_judgment_three_states():
+    assert _fmt_bar_judgment(True) == "PASS"
+    assert _fmt_bar_judgment(False) == "FAIL"
+    assert _fmt_bar_judgment(None) == "n/a"
+
+
+def test_fmt_bytes_mb_renders_megabytes_and_none():
+    assert _fmt_bytes_mb(150_000_000) == "150.0"
+    assert _fmt_bytes_mb(None) == "n/a"
+    assert _fmt_bytes_mb("not a number") == "n/a"
+
+
+def test_render_delta_probe_markdown_includes_triton_column_and_bar_pass():
+    result = _delta_probe_result(_delta_probe_shape_row())
+    md = _render_delta_probe_markdown(result)
+    assert "triton median (s)" in md
+    assert "bar met" in md
+    assert "0.0045" in md  # triton_step_secs_median
+    # The pd1024_T64 row's bar_met=True renders as PASS somewhere on its row.
+    row_line = next(line for line in md.splitlines() if line.startswith("| pd1024_T64"))
+    assert row_line.strip().endswith("| PASS |")
+
+
+def test_render_delta_probe_markdown_bar_fail_when_triton_slower_than_eager():
+    row = _delta_probe_shape_row(
+        triton_step_secs_median=0.02,
+        triton_vs_eager_ratio=2.7,
+        bar_met_vs_eager=False,
+        bar_met=False,
+    )
+    md = _render_delta_probe_markdown(_delta_probe_result(row))
+    row_line = next(line for line in md.splitlines() if line.startswith("| pd1024_T64"))
+    assert row_line.strip().endswith("| FAIL |")
+
+
+def test_render_delta_probe_markdown_bar_na_when_compile_arm_failed():
+    # bar_met_vs_compile/bar_met are None (unjudgeable), not False -- a
+    # failed compile arm must never render as a failed speed bar.
+    row = _delta_probe_shape_row(
+        compile_step_secs_median=None,
+        compile_step_secs_all=[],
+        compile_status="failed",
+        compile_error="RuntimeError: backend compiler failed",
+        compile_recovered_fraction=None,
+        triton_vs_compile_ratio=None,
+        bar_met_vs_compile=None,
+        bar_met=None,
+    )
+    md = _render_delta_probe_markdown(_delta_probe_result(row))
+    row_line = next(line for line in md.splitlines() if line.startswith("| pd1024_T64"))
+    assert row_line.strip().endswith("| n/a |")
+    assert "FAIL" not in row_line
+
+
+def test_render_delta_probe_markdown_memory_table_present_with_bar_judgment():
+    result = _delta_probe_result(_delta_probe_shape_row())
+    md = _render_delta_probe_markdown(result)
+    assert "peak mem (MB)" in md
+    assert "memory bar met" in md
+    assert "186.9" in md  # eager_peak_mem_bytes / 1e6
+    assert "150.0" in md  # triton_peak_mem_bytes / 1e6
+
+
+def test_render_delta_probe_markdown_memory_bar_fail_renders_fail():
+    row = _delta_probe_shape_row(
+        triton_peak_mem_bytes=400_000_000,
+        triton_vs_eager_peak_mem_ratio=2.14,
+        memory_bar_met=False,
+    )
+    md = _render_delta_probe_markdown(_delta_probe_result(row))
+    memory_line = next(
+        line for line in md.splitlines() if line.startswith("| pd1024_T64") and "400.0" in line
+    )
+    assert memory_line.strip().endswith("| FAIL |")
+
+
+def test_render_delta_probe_markdown_missing_triton_fields_degrades_to_na_not_crash():
+    # A row shaped like the OLDER (pre-Task-5) artifact -- no triton/bar
+    # keys at all -- must render "n/a" for the new columns rather than
+    # raising KeyError, so the renderer stays usable against an
+    # un-regenerated artifact.
+    old_row = {
+        "label": "pd1024_T64",
+        "config_name": "pd1024",
+        "live_config": {"n_heads": 4, "nh": 2, "d_k": 16, "d_v": 16, "chunk_size": 64},
+        "B": 128,
+        "T": 64,
+        "eager_step_secs_median": 0.0074,
+        "eager_peak_mem_bytes": 186_914_816,
+        "floor_step_secs": 0.0028,
+        "compile_step_secs_median": 0.0041,
+        "compile_status": "ok",
+        "headroom_eager_over_floor": 2.6,
+        "compile_recovered_fraction": 0.7163,
+    }
+    md = _render_delta_probe_markdown(_delta_probe_result(old_row))
+    row_line = next(line for line in md.splitlines() if line.startswith("| pd1024_T64"))
+    assert row_line.strip().endswith("| n/a |")
+    memory_line = next(
+        line for line in md.splitlines() if line.startswith("| pd1024_T64") and "186.9" in line
+    )
+    assert "n/a" in memory_line
+
+
+def test_render_delta_probe_markdown_no_shapes_still_renders_headers():
+    md = _render_delta_probe_markdown(_delta_probe_result())
+    assert "triton median (s)" in md
+    assert "memory bar met" in md
