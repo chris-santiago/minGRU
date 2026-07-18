@@ -3605,7 +3605,10 @@ class MinGRUStack(nn.Module):
         -------
         tuple
             The output ``(B, T, d_model)`` and a list of ``n_layers``
-            per-block final states, each ``(B, 1, d_model)``.
+            per-block final states, each ``(B, 1, d_model)`` — except
+            matrix-state blocks (``mixer="delta"``), whose entry is the
+            flattened ``(B, 1, n_heads*d_k*d_v)`` state; treat entries
+            as opaque.
 
         Raises
         ------
