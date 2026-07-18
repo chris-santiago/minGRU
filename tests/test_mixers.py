@@ -362,10 +362,10 @@ class TestDeltaMinGRU:
         """forward(x2, h_0=s) after forward(x1, return_state=True) == forward(cat(x1,x2)).
 
         Split point (5) is deliberately not a multiple of the default
-        chunk_size (64) or of T (13) -- this sequential forward ignores
-        chunk_size entirely, but the chaining contract itself (spec
-        section 6) must hold regardless, since it is what Task 3's
-        chunked-WY forward will be tested against next.
+        chunk_size (64) or of T (13), so the chunked-WY forward must
+        carry state across a boundary that does not align with its
+        chunk grid -- the chaining contract (spec section 6) must hold
+        regardless of chunk alignment.
         """
         torch.manual_seed(SEED)
         layer = DeltaMinGRU(D_IN, D_H, n_heads=2, nh=2)
