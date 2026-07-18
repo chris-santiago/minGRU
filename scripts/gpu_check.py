@@ -117,6 +117,25 @@ def _sh(cmd: list[str]) -> str:
     return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
 
 
+def _job_preamble_steps(repo: str, ref: str) -> list[str]:
+    """Shared job-shell preamble: clone, checkout, CUDA assert, triton install.
+
+    Used by all three job builders (check, delta-probe, hetero36) to initialize
+    the container before running their respective workloads. Each builder appends
+    its own final step(s) to this list and joins them with `` && ``.
+    """
+    return [
+        "set -eux",  # job shell is dash: -o pipefail unsupported (no pipes used)
+        (
+            "python -c 'import torch; assert torch.cuda.is_available(), "
+            '"no CUDA device"; print(torch.__version__)\''
+        ),
+        "(python -c 'import triton' || pip install --no-cache-dir triton)",
+        f"git clone --filter=blob:none {repo} /tmp/minGRU",
+        f"cd /tmp/minGRU && git checkout --detach {ref}",
+    ]
+
+
 def _fetch_job_logs(job: Any) -> tuple[str | None, Exception | None]:
     """Best-effort ``job.logs`` fetch: ``(logs, None)`` or ``(None, exc)``.
 
@@ -137,17 +156,8 @@ def _fetch_job_logs(job: Any) -> tuple[str | None, Exception | None]:
 
 
 def build_command(repo: str, ref: str, bench: bool) -> str:
-    steps = [
-        "set -eux",  # job shell is dash: -o pipefail unsupported (no pipes used)
-        (
-            "python -c 'import torch; assert torch.cuda.is_available(), "
-            '"no CUDA device"; print(torch.__version__)\''
-        ),
-        "(python -c 'import triton' || pip install --no-cache-dir triton)",
-        f"git clone --filter=blob:none {repo} /tmp/minGRU",
-        f"cd /tmp/minGRU && git checkout --detach {ref}",
-        "cd /tmp/minGRU && python scripts/bench_scans.py --check",
-    ]
+    steps = _job_preamble_steps(repo, ref)
+    steps.append("cd /tmp/minGRU && python scripts/bench_scans.py --check")
     if bench:
         steps.append("cd /tmp/minGRU && python scripts/bench_scans.py --bench")
     return " && ".join(steps)
@@ -156,7 +166,7 @@ def build_command(repo: str, ref: str, bench: bool) -> str:
 def build_delta_probe_command(repo: str, ref: str) -> str:
     """Job-shell command for ``--job delta-probe``: clone + probe run.
 
-    Same clone/checkout/triton-install steps as ``build_command`` (Task 6
+    Uses the shared clone/checkout/triton-install preamble (Task 6
     brief: ``torch.compile``'s Inductor needs triton on GPU, same as the
     parity suite), running ``scripts/gpu_delta_probe.py`` instead of the
     parity suite.
@@ -171,51 +181,25 @@ def build_delta_probe_command(repo: str, ref: str) -> str:
     machine billing until stopped via the SDK. Jobs must keep their
     command chain foreground-only.
     """
-    steps = [
-        "set -eux",  # job shell is dash: -o pipefail unsupported (no pipes used)
-        (
-            "python -c 'import torch; assert torch.cuda.is_available(), "
-            '"no CUDA device"; print(torch.__version__)\''
-        ),
-        "(python -c 'import triton' || pip install --no-cache-dir triton)",
-        f"git clone --filter=blob:none {repo} /tmp/minGRU",
-        f"cd /tmp/minGRU && git checkout --detach {ref}",
-        "cd /tmp/minGRU && python scripts/gpu_delta_probe.py",
-    ]
+    steps = _job_preamble_steps(repo, ref)
+    steps.append("cd /tmp/minGRU && python scripts/gpu_delta_probe.py")
     return " && ".join(steps)
 
 
 def build_hetero36_command(repo: str, ref: str) -> str:
     """Job-shell command for ``--job hetero36``: clone + 36-seed campaign run.
 
-    Same clone/checkout/triton-install steps as ``build_delta_probe_command``
-    (``torch.compile``'s Inductor needs triton on GPU here too), running
-    ``scripts/gpu_hetero_campaign.py`` instead -- no extra args, the
-    campaign script's own CLI covers the full 3x36 arm matrix (spec §5/§6:
-    ``cd /tmp/minGRU && python scripts/gpu_hetero_campaign.py``).
-    Deliberately NO keepalive heartbeat, foreground-only command chain --
-    see ``build_delta_probe_command``'s docstring for why a backgrounded
-    loop outlives a studio-mode job's command chain and keeps it billing.
-
-    DUPLICATION-PENDING: this is now the third near-identical copy of the
-    clone/checkout/triton-install preamble in this file (``build_command``,
-    ``build_delta_probe_command``, this function). Not hoisted here to keep
-    this task's diff additive-only against ``build_command`` and
-    ``build_delta_probe_command`` (their dry-run output must stay
-    byte-identical pre/post this change) -- flagged for the orchestrator to
-    hoist into a shared preamble helper.
+    Uses the shared clone/checkout/triton-install preamble (``torch.compile``'s
+    Inductor needs triton on GPU here too), running ``scripts/gpu_hetero_campaign.py``
+    instead -- no extra args, the campaign script's own CLI covers the full
+    3x36 arm matrix (spec §5/§6: ``cd /tmp/minGRU && python
+    scripts/gpu_hetero_campaign.py``). Deliberately NO keepalive heartbeat,
+    foreground-only command chain -- see ``build_delta_probe_command``'s
+    docstring for why a backgrounded loop outlives a studio-mode job's
+    command chain and keeps it billing.
     """
-    steps = [
-        "set -eux",  # job shell is dash: -o pipefail unsupported (no pipes used)
-        (
-            "python -c 'import torch; assert torch.cuda.is_available(), "
-            '"no CUDA device"; print(torch.__version__)\''
-        ),
-        "(python -c 'import triton' || pip install --no-cache-dir triton)",
-        f"git clone --filter=blob:none {repo} /tmp/minGRU",
-        f"cd /tmp/minGRU && git checkout --detach {ref}",
-        "cd /tmp/minGRU && python scripts/gpu_hetero_campaign.py",
-    ]
+    steps = _job_preamble_steps(repo, ref)
+    steps.append("cd /tmp/minGRU && python scripts/gpu_hetero_campaign.py")
     return " && ".join(steps)
 
 
