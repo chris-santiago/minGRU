@@ -114,6 +114,7 @@ Decay = Literal["fixed", "learnable"] | None
 _VALID_SCAN_MODES = ("auto", "eager", "triton")
 _warned_scan_fallback = False
 _warned_angle_fallback = False
+_warned_delta_fallback = False
 
 
 def _resolve_scan_mode(is_cuda: bool) -> str | None:
@@ -406,6 +407,148 @@ def _dispatch_angle_scan(
             stacklevel=3,
         )
         _warned_angle_fallback = True
+    return None
+
+
+def _delta_scan_should_try(is_cuda: bool) -> bool:
+    """Cheap pre-check: should the DeltaMinGRU chunked-WY kernel be attempted?
+
+    Thin wrapper over ``_resolve_scan_mode`` -- returns ``False`` (run the
+    unchanged eager ``_forward_chunked``) for ``eager``, or for ``auto`` with
+    CPU inputs, WITHOUT importing ``triton_scans``. Keeping this gate ahead of
+    the ``_coeffs``/layout assembly means the recorded CPU evidence path
+    stays byte-identical and import-free -- exactly ``_angle_scan_should_try``'s
+    role, mirrored for the delta-rule mixer. ``True`` means assemble the
+    ``q``/``ks``/``vs``/``betas`` heads and call ``_dispatch_delta_scan``
+    (which independently re-validates via the same ``_resolve_scan_mode``
+    call -- see its docstring -- so this pre-check is a throughput
+    optimization for the CPU/eager path, not a correctness dependency
+    ``_dispatch_delta_scan`` relies on).
+
+    Parameters
+    ----------
+    is_cuda : bool
+        Whether the mixer's input is CUDA-resident.
+
+    Returns
+    -------
+    bool
+        ``True`` to attempt the chunked-WY kernel, ``False`` to stay eager.
+
+    Raises
+    ------
+    ValueError
+        If ``MINGRU_SCAN`` is not one of ``auto``/``eager``/``triton``.
+    """
+    return _resolve_scan_mode(is_cuda) is not None
+
+
+def _dispatch_delta_scan(
+    q: torch.Tensor,
+    ks: list[torch.Tensor],
+    vs: list[torch.Tensor],
+    betas: list[torch.Tensor],
+    H: torch.Tensor,
+    *,
+    chunk_size: int,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Run the DeltaMinGRU chunked-WY kernel, or return ``None`` to fall back to eager.
+
+    The module-forward analogue of ``_dispatch_scan``/``_dispatch_angle_scan``,
+    sharing both of their hoisted helpers (``_resolve_scan_mode``,
+    ``_resolve_triton_dispatch``). ``DeltaMinGRU._delta_fused_forward`` calls
+    this only after ``_delta_scan_should_try`` already returned ``True``
+    (mode is ``auto`` with CUDA inputs, or ``triton``) so the eager path
+    never pays for assembling the kernel's layouts -- but this function does
+    NOT depend on that ordering for correctness: it re-validates
+    ``MINGRU_SCAN`` itself via ``_resolve_scan_mode(q.is_cuda)``, exactly
+    like ``_dispatch_angle_scan`` does with its own tensor argument, so a
+    direct/out-of-order call is just as safe (redundant, not incorrect) as
+    the current call site. Shape/envelope validation and the launch-failure
+    funnel live in ``triton_scans.delta_scan_impl`` (mirroring how
+    ``_dispatch_angle_scan`` leaves those checks to ``angle_scan_impl``) --
+    this function catches only ``triton_scans.ScanFallback``, never a bare
+    exception, exactly like ``_dispatch_angle_scan``.
+
+    Owns the permute in both directions between ``_coeffs``'s per-token
+    layout and spec section 6's kernel layout: the ``K``/``V``/``beta``/
+    ``Q`` assembly below is exactly the ``torch.stack(...).permute(...)``
+    lines ``_forward_chunked`` builds before its per-chunk loop, and the
+    final ``y.permute(0, 2, 1, 3)`` is exactly the restore
+    ``_forward_chunked`` applies to its own ``y`` after the loop -- so eager
+    and kernel paths consume/produce identical layouts, and ``forward`` can
+    treat this function's non-``None`` result exactly like
+    ``_forward_chunked``'s.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Shape ``(B, T, n_heads, d_k)`` -- ``_coeffs``'s query output.
+    ks : list of torch.Tensor
+        Length-``nh``, each ``(B, T, n_heads, d_k)`` -- ``_coeffs``'s
+        per-micro-step keys, in micro-step order.
+    vs : list of torch.Tensor
+        Length-``nh``, each ``(B, T, n_heads, d_v)`` -- ``_coeffs``'s
+        per-micro-step values.
+    betas : list of torch.Tensor
+        Length-``nh``, each ``(B, T, n_heads)`` -- ``_coeffs``'s
+        per-micro-step beta gates.
+    H : torch.Tensor
+        Initial per-head state, shape ``(B, n_heads, d_k, d_v)``.
+    chunk_size : int
+        Tokens per UT-transform chunk (keyword-only, self-documenting at
+        the call site).
+
+    Returns
+    -------
+    tuple of torch.Tensor or None
+        ``(y, H_T)`` -- ``y`` shape ``(B, T, n_heads, d_v)`` (not yet
+        flattened/``out_proj``-ed -- the caller does that, same as
+        ``_forward_chunked``), ``H_T`` shape ``(B, n_heads, d_k, d_v)`` --
+        if the kernel ran; ``None`` to fall through to the unchanged eager
+        ``_forward_chunked``.
+
+    Raises
+    ------
+    ValueError
+        If ``MINGRU_SCAN`` is not one of ``"auto"``, ``"eager"``, ``"triton"``.
+    RuntimeError
+        If ``MINGRU_SCAN=triton`` but the DeltaMinGRU kernel is unavailable
+        (never a silent downgrade).
+    """
+    mode = _resolve_scan_mode(q.is_cuda)
+    if mode is None:
+        return None
+
+    def _call(triton_scans):
+        status = triton_scans.available()
+        if status is not True:
+            raise triton_scans.ScanFallback(str(status))
+        if not hasattr(triton_scans, "delta_scan_impl"):
+            raise triton_scans.ScanFallback("no DeltaMinGRU Triton kernel registered")
+        # Spec section 6 layouts -- exactly _forward_chunked's pre-loop
+        # stack/permute assembly, so eager and kernel paths consume
+        # identical projections.
+        K = torch.stack(ks, dim=2).permute(0, 3, 1, 2, 4)  # (B, n_heads, T, nh, d_k)
+        V = torch.stack(vs, dim=2).permute(0, 3, 1, 2, 4)  # (B, n_heads, T, nh, d_v)
+        beta = torch.stack(betas, dim=2).permute(0, 3, 1, 2)  # (B, n_heads, T, nh)
+        Q = q.permute(0, 2, 1, 3)  # (B, n_heads, T, d_k)
+        y, H_T = triton_scans.delta_scan_impl(Q, K, V, beta, H, chunk_size=chunk_size)
+        # Restore to _forward_chunked's (B, T, n_heads, d_v) convention.
+        return y.permute(0, 2, 1, 3), H_T
+
+    result, reason = _resolve_triton_dispatch(mode, "the DeltaMinGRU chunked-WY path", _call)
+    if reason is None:
+        return result
+
+    global _warned_delta_fallback
+    if not _warned_delta_fallback:
+        warnings.warn(
+            "MINGRU_SCAN=auto fell back to the eager DeltaMinGRU forward "
+            f"(chunked-WY path) despite CUDA inputs: {reason}",
+            stacklevel=3,
+        )
+        _warned_delta_fallback = True
     return None
 
 
@@ -2974,12 +3117,53 @@ class DeltaMinGRU(nn.Module):
             if tuple(h_0.shape) != expected:
                 raise ValueError(f"h_0 must have shape {expected} (got {tuple(h_0.shape)})")
             H = h_0.reshape(B, self.n_heads, self.d_k, self.d_v)
-        y, H = self._forward_chunked(x, H)
+        fused = self._delta_fused_forward(x, H)
+        y, H = fused if fused is not None else self._forward_chunked(x, H)
         y = y.reshape(B, T, self.n_heads * self.d_v)
         y = self.out_proj(y)
         if return_state:
             return y, H.reshape(*expected)
         return y
+
+    def _delta_fused_forward(
+        self, x: torch.Tensor, H: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """CUDA chunked-WY fast path for ``forward`` (returns ``None`` off-path).
+
+        On CUDA under ``MINGRU_SCAN=auto``/``triton`` and inside the
+        kernel's shape envelope, this assembles the same ``q``/``ks``/
+        ``vs``/``betas`` heads ``_coeffs`` produces and routes them through
+        the Triton chunked-WY kernel via ``_dispatch_delta_scan``, which
+        owns the permute into/out of the kernel's spec-section-6 layout. On
+        CPU, under ``eager``, or when the kernel declines (out-of-envelope
+        or unavailable under ``auto``), this returns ``None`` -- without
+        importing ``triton_scans`` at all on the CPU/eager path (mirrors
+        ``_angle_scan_should_try``'s gate), or after a warn-once fallback on
+        the CUDA ``auto`` path -- so ``forward`` runs its unchanged
+        ``_forward_chunked`` eager path, byte-identical to the recorded
+        eager evidence path in both cases.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input sequence, shape ``(B, T, input_size)``.
+        H : torch.Tensor
+            Initial per-head state, shape ``(B, n_heads, d_k, d_v)`` --
+            ``forward``'s already-resolved ``h_0`` (zero or reshaped).
+
+        Returns
+        -------
+        tuple of torch.Tensor or None
+            ``(y, H_T)`` in exactly ``_forward_chunked``'s return
+            convention (``y`` shape ``(B, T, n_heads, d_v)``, not yet
+            flattened/``out_proj``-ed; ``H_T`` shape ``(B, n_heads, d_k,
+            d_v)``) if the kernel ran; ``None`` to fall through to
+            ``_forward_chunked``.
+        """
+        if not _delta_scan_should_try(x.is_cuda):
+            return None
+        q, ks, vs, betas = self._coeffs(x)
+        return _dispatch_delta_scan(q, ks, vs, betas, H, chunk_size=self.chunk_size)
 
     @torch.no_grad()
     def step(
