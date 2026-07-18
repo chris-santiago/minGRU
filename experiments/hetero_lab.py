@@ -230,6 +230,13 @@ HETERO_FACTORY_MODELS = {
     # (pdelta1024, mirrors deltaproduct2/hetero-sd2).
     "hetero-pd64": ("signed-tanh", "pdelta64"),
     "hetero-pd1024": ("signed-tanh", "pdelta1024"),
+    # GPU 36-seed round (2026-07-18-gpu36-round-design.md §4): packaged
+    # min_gru.GivensMinGRU in place of the lab's frozen GivensMinGRU, at
+    # the same block_size=8/rounds=3 config as hetero-sg8 -- the bridge
+    # selftest (_selftest_bridge) already proves the packaged class
+    # bit-identical to the lab class, so this arm's evidence is directly
+    # comparable to hetero-sg8's without rerunning that campaign.
+    "hetero-pg8": ("signed-tanh", "pgivens8"),
 }
 
 class GivensMinGRU(nn.Module):
@@ -465,6 +472,11 @@ LOCAL_FACTORIES = {
     "pdelta1024": lambda d_in, d_h: _PromotedDeltaMinGRU(
         d_in, d_h, nh=2, n_heads=4, d_k=16, d_v=16
     ),
+    # GPU 36-seed round: packaged GivensMinGRU, same config as this lab's
+    # frozen "givens8" factory (block_size=8, rounds=3).
+    "pgivens8": lambda d_in, d_h: _PromotedGivensMinGRU(
+        d_in, d_h, block_size=8, rounds=3
+    ),
 }
 
 
@@ -593,6 +605,32 @@ def _hard_mode_eval(model, rot, make, T, seed, n_batches):
     return acc
 
 
+class _DeviceCastTagger(nn.Module):
+    """CPU-in / CPU-out shim around a device-resident tagger (GPU 36-seed
+    round, spec §4: "model + every train/eval batch move to device;
+    RNG seeding semantics unchanged"). ``run_arm``'s training loop and
+    ``probes.accuracy``/``_hard_mode_eval`` are frozen protocol code that
+    draws CPU tensors from CPU-seeded generators and compares CPU
+    predictions to CPU labels; rather than touch that protocol code (or
+    probes.py) per batch, this wraps the already-device-placed tagger so
+    it keeps accepting and returning CPU tensors from the caller's point
+    of view, moving each tensor to ``device`` for the wrapped forward and
+    back to CPU for the result. ``Tensor.to`` is autograd-tracked, so
+    ``loss.backward()`` on the CPU-side output still flows gradients back
+    through to the device-resident parameters -- training dynamics are
+    unaffected, only the physical compute location moves.
+    """
+
+    def __init__(self, tagger, device):
+        super().__init__()
+        self.tagger = tagger
+        self.device = device
+
+    def forward(self, *inputs):
+        moved = [t.to(self.device) if torch.is_tensor(t) else t for t in inputs]
+        return self.tagger(*moved).to("cpu")
+
+
 def run_arm(args):
     if args.require_torch is not None and torch.__version__ != args.require_torch:
         raise SystemExit(
@@ -607,6 +645,14 @@ def run_arm(args):
         raise SystemExit(
             f"--ckpt-t {args.ckpt_t} is a reported test length (or invalid); "
             f"selection must not leak into the metric. Test lengths: {GEN_LENGTHS}"
+        )
+    device = torch.device(args.device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise SystemExit(
+            "--device cuda requested but CUDA is not available in this "
+            f"environment (torch.cuda.is_available() is False, "
+            f"torch=={torch.__version__}); run on a CUDA-enabled machine, "
+            "or omit --device to use cpu."
         )
     make, vocab, n_cls = TASKS[args.task]
     torch.manual_seed(args.seed)
@@ -648,6 +694,26 @@ def run_arm(args):
             "--commit-lambda/--soft-warmup need a snap grid, but a rotation "
             "mixer has snap=None (continuous angles)"
         )
+    # `model` stays the raw, uncompiled tagger for the rest of the run --
+    # state_dict()/load_state_dict() (checkpoint selection) and
+    # model.stack.blocks (layer-count logging) key off it directly, so
+    # they're unaffected by compile-wrapper attribute-forwarding quirks.
+    # `.to(device)` mutates the module's parameters/buffers in place and
+    # returns self, so `model` keeps its identity (rot/mixer submodule
+    # references stay valid) while becoming device-resident. `run_model`
+    # is the forward-call target used by training/eval below: torch.compile
+    # (if requested) wraps the BUILT, device-placed tagger; the device-cast
+    # shim (only added when device != cpu) then keeps that callable
+    # CPU-in/CPU-out so the frozen probes.py protocol (accuracy(),
+    # generators, labels) stays exactly as it runs today.
+    if device.type != "cpu":
+        model = model.to(device)
+    compute_model = model
+    if args.compile:
+        compute_model = torch.compile(model)
+    run_model = compute_model
+    if device.type != "cpu":
+        run_model = _DeviceCastTagger(compute_model, device)
     # dedicated generators so interventions never perturb the train-data
     # or init RNG stream (keeps arms matched-seed comparable)
     noise_gen = torch.Generator().manual_seed(90_001 + args.seed)
@@ -684,7 +750,7 @@ def run_arm(args):
         if args.commit_lambda > 0.0:
             for m in rot:
                 m._capture_theta = True
-        loss = F.cross_entropy(model(x).reshape(-1, n_cls), y.reshape(-1))
+        loss = F.cross_entropy(run_model(x).reshape(-1, n_cls), y.reshape(-1))
         # VQ-VAE codebook/commitment penalties from this forward, if any
         # (VQBottleneck._pen; same collection idea as variants.aux_penalty)
         for m in model.modules():
@@ -709,10 +775,14 @@ def run_arm(args):
             with torch.no_grad():
                 for p in model.parameters():
                     if p.grad is not None:
-                        p.grad.add_(torch.randn(p.shape, generator=noise_gen) * sigma)
+                        # noise draw stays on the CPU generator (RNG stream
+                        # unchanged); only the resulting tensor moves, to
+                        # match p.grad's (possibly device-resident) location.
+                        noise = torch.randn(p.shape, generator=noise_gen) * sigma
+                        p.grad.add_(noise.to(p.device))
         opt.step()
         if step % EVAL_EVERY == 0:
-            val = _hard_mode_eval(model, rot, make, args.ckpt_t, seed=5, n_batches=2)
+            val = _hard_mode_eval(run_model, rot, make, args.ckpt_t, seed=5, n_batches=2)
             if val > best_val:
                 best_val, best_step = val, step
                 best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -722,9 +792,9 @@ def run_arm(args):
         m.snap_alpha, m.identity_mode = 1.0, False
     if best_state is not None:
         model.load_state_dict(best_state)
-    accs = {str(T_TRAIN): round(accuracy(model, make, T_TRAIN, seed=3), 4)}
+    accs = {str(T_TRAIN): round(accuracy(run_model, make, T_TRAIN, seed=3), 4)}
     for T in GEN_LENGTHS:
-        accs[str(T)] = round(accuracy(model, make, T, seed=4), 4)
+        accs[str(T)] = round(accuracy(run_model, make, T, seed=4), 4)
     config = {
         k: v
         for k, v in {
@@ -742,6 +812,16 @@ def run_arm(args):
     }
     if args.curriculum_p > 0.0:
         config["n_short_batches"] = n_cur_short
+    # GPU 36-seed round stratum keys (spec §6): recorded only when
+    # non-default, so existing CPU/no-flag rows are unaffected.
+    if device.type != "cpu":
+        config["device"] = args.device
+        config["torch"] = torch.__version__
+    if args.compile:
+        config["compile"] = True
+    scan_mode = os.environ.get("MINGRU_SCAN")
+    if scan_mode:
+        config["scan"] = scan_mode
     rec = {
         "round": args.round,
         "task": args.task,
@@ -795,6 +875,21 @@ def main():
         "2.5.1, the repo's evidence pin); mismatch exits nonzero before "
         "any training work and writes no row. Omit to preserve current "
         "behavior (no version check).",
+    )
+    p.add_argument(
+        "--device", choices=["cpu", "cuda"], default="cpu",
+        help="device for the model and every train/eval batch (GPU 36-seed "
+        "round, spec §4). Default cpu preserves existing behavior exactly; "
+        "generators stay CPU-side either way (only tensors move). "
+        "--device cuda fails fast if CUDA is unavailable.",
+    )
+    p.add_argument(
+        "--compile", action="store_true",
+        help="wrap the built tagger with torch.compile before training "
+        "(GPU 36-seed round, spec §4). Compile/first-call failure raises "
+        "-- no silent eager fallback. Eval at each of T in "
+        "{128,256,512,1024} triggers a per-shape recompile; expected, not "
+        "suppressed.",
     )
     args = p.parse_args()
     if args.selftest:
