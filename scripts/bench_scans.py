@@ -7,8 +7,9 @@ orchestrates what already exists and adds timing/memory measurement:
 
 ``--check``
     Runs the full equivalence suite (``triton_scans._run_forward_parity``,
-    ``_run_grad_parity``, ``_run_angle_fused_parity``) by calling those
-    module-level runners directly. Skips LOUDLY (prints the reason, exits
+    ``_run_grad_parity``, ``_run_angle_fused_parity``,
+    ``_run_delta_forward_parity``, ``_run_delta_grad_parity``) by calling
+    those module-level runners directly. Skips LOUDLY (prints the reason, exits
     0) when CUDA/Triton are unavailable, or when the installed torch is
     below ``triton_scans``'s ``torch>=2.8`` floor -- a vacuous pass would
     be a bug. This is the parity half of the design spec's "done bar"
@@ -329,11 +330,12 @@ def _write_parity_artifacts(rows: list[dict]) -> None:
 def run_check() -> int:
     """Run the full equivalence suite via ``triton_scans``'s own runners.
 
-    Mirrors ``triton_scans.py``'s own ``__main__`` block exactly (same
-    skip convention, same three runners, same exit-code combination) --
-    this does not reimplement any parity sweep or tolerance. Additionally
-    passes a shared ``collect`` accumulator list into each runner (an
-    optional parameter on all three, defaulting to ``None`` so
+    Mirrors ``triton_scans.py``'s own ``__main__`` block (same skip
+    convention, same first three runners) plus the two DeltaMinGRU parity
+    runners (Task 4; not part of that frozen ``__main__`` block, only this
+    script's ``--check``) -- this does not reimplement any parity sweep or
+    tolerance. Passes a shared ``collect`` accumulator list into each
+    runner (an optional parameter on all five, defaulting to ``None`` so
     ``triton_scans.py``'s own ``__main__`` invocation is unaffected) and
     persists the collected rows as the parity-conformance artifact.
     """
@@ -351,10 +353,14 @@ def run_check() -> int:
     grad = triton_scans._run_grad_parity(collect=parity_rows)
     print()
     angle = triton_scans._run_angle_fused_parity(collect=parity_rows)
+    print()
+    delta_fwd = triton_scans._run_delta_forward_parity(collect=parity_rows)
+    print()
+    delta_grad = triton_scans._run_delta_grad_parity(collect=parity_rows)
 
     _write_parity_artifacts(parity_rows)
 
-    return fwd or grad or angle
+    return fwd or grad or angle or delta_fwd or delta_grad
 
 
 # --- --bench --------------------------------------------------------------

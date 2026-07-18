@@ -2,7 +2,12 @@
 
 CPU-only: no GPU/Triton execution paths are exercised here (dispatch
 semantics are covered in ``test_dispatch.py``). Every scan runs its eager
-implementation because ``MINGRU_SCAN`` is unset / ``auto`` on CPU.
+implementation because ``MINGRU_SCAN`` is unset / ``auto`` on CPU. Section 6
+is the one exception to "no Triton" in spirit only: it imports a handful of
+``mingru.triton_scans``' pure-Python/CPU-runnable parity-harness helpers
+(never the gated Triton kernel path itself, which requires CUDA and is
+untestable here) to regression-guard the delta parity harness's own
+comparison-pipeline plumbing.
 
 Sections
 --------
@@ -13,13 +18,17 @@ Sections
 4. matrix_affine_scan -- k x k transitions, shapes, correctness, the
    k=2/v=1 reduction to matrix_scan, gradcheck
 5. Gradient flow -- non-None, non-zero grads after one backward
+6. Delta parity harness y-layout regression guard -- CPU-only pin for
+   ``_run_delta_forward_parity_body``/``_run_delta_grad_parity_body``'s
+   ``delta_scan_impl``-vs-eager ``y`` axis-order restore
 """
 
 from __future__ import annotations
 
+import pytest
 import torch
 
-from mingru import linear_scan, matrix_affine_scan, matrix_scan, parallel_scan_log
+from mingru import linear_scan, matrix_affine_scan, matrix_scan, parallel_scan_log, triton_scans
 
 SEED = 42
 
@@ -289,3 +298,116 @@ class TestGradientFlow:
         for grad in (a.grad, b.grad):
             assert grad is not None
             assert grad.abs().sum() > 0
+
+
+# ===========================================================================
+# 6. Delta parity harness y-layout regression guard
+# ===========================================================================
+#
+# ``delta_scan_impl``'s ``y`` is documented (spec section 6) as
+# ``(B, n_heads, T, d_v)``; ``triton_scans._delta_ref_forward`` (via
+# ``DeltaMinGRU._forward_chunked``) returns ``y`` as ``(B, T, n_heads, d_v)``
+# -- the same axis-order gap the real module seam bridges with
+# ``y.permute(0, 2, 1, 3)`` in ``_dispatch_delta_scan._call``
+# (``min_gru.py``; pinned at that seam by
+# ``test_dispatch.TestDeltaSeamLayoutRoundTrip``).
+# ``_run_delta_forward_parity_body``'s ``check`` and
+# ``_run_delta_grad_parity_body``'s ``check_raw`` (``triton_scans.py``) must
+# apply that identical restore to the kernel's ``y`` before comparing it
+# against the eager reference -- a prior revision of that code compared the
+# two axis orders directly, which either raises (``T != n_heads``) or
+# silently broadcasts a wrong cross-axis comparison (``T == 1`` or
+# ``n_heads == 1``).
+#
+# Both raw-grid runners hardcode ``device="cuda"`` (GPU-only by design, like
+# every sibling runner in ``triton_scans.py``), so they cannot be invoked
+# directly here. Instead this reproduces their exact
+# permute-then-shape-assert-then-compare sequence on CPU, driven by the same
+# building blocks the runners use (``_delta_inputs``, ``_delta_ref_forward``,
+# ``_max_abs_rel``) plus a fake ``delta_scan_impl`` stand-in -- eager's own
+# output permuted to the kernel's documented ``(B, n_heads, T, d_v)`` layout,
+# exactly what a CORRECT real kernel would return -- so this is a genuine
+# pipeline check, not a hand-rolled reimplementation of the comparison logic.
+# No Triton/CUDA path runs: every tensor here stays on CPU.
+
+
+class TestDeltaParityHarnessYLayout:
+    # T != n_heads (7 != 3) so an unrestored comparison hits the crash case
+    # the L4 review report described, not just a shape coincidence.
+    B, N_HEADS, T, NH, D_K, D_V, CHUNK_SIZE = 2, 3, 7, 2, 4, 4, 4
+
+    def _fake_kernel_y(self, device: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Eager reference ``y_e`` plus a fake kernel ``y`` permuted to
+        ``delta_scan_impl``'s documented ``(B, n_heads, T, d_v)`` contract --
+        i.e. exactly the inverse of the restore the runner code must apply.
+        """
+        Q, K, V, beta, H0 = triton_scans._delta_inputs(
+            self.B, self.N_HEADS, self.T, self.NH, self.D_K, self.D_V, device
+        )
+        y_e, H_T_e = triton_scans._delta_ref_forward(Q, K, V, beta, H0, self.CHUNK_SIZE)
+        y_fake_kernel = y_e.permute(0, 2, 1, 3)  # (B, n_heads, T, d_v)
+        assert tuple(y_fake_kernel.shape) == (self.B, self.N_HEADS, self.T, self.D_V)
+        return y_fake_kernel, y_e, H_T_e
+
+    def test_restore_reproduces_the_runners_exact_sequence(self):
+        """With the fix's restore, the fake kernel's ``y`` matches the eager
+        reference exactly -- both the shape assert and ``_max_abs_rel`` see a
+        perfect round trip."""
+        torch.manual_seed(SEED)
+        y_fake_kernel, y_e, _ = self._fake_kernel_y("cpu")
+
+        # Exactly _run_delta_forward_parity_body's `check` / _run_delta_grad_
+        # parity_body's `check_raw`: `y_t = y_t.permute(0, 2, 1, 3)` then a
+        # shape assert before any comparison.
+        y_t = y_fake_kernel.permute(0, 2, 1, 3)  # (B, T, n_heads, d_v)
+        assert y_t.shape == y_e.shape, (
+            f"y layout mismatch after restore -- kernel {tuple(y_t.shape)} vs "
+            f"eager {tuple(y_e.shape)}"
+        )
+        abs_err, rel_err = triton_scans._max_abs_rel(y_t, y_e)
+        assert abs_err == 0.0
+        assert rel_err == 0.0
+        assert torch.equal(y_t, y_e)
+
+    def test_unrestored_comparison_raises_when_t_ne_n_heads(self):
+        """Negative control: without the restore, comparing the kernel's raw
+        ``(B, n_heads, T, d_v)`` against eager's ``(B, T, n_heads, d_v)``
+        directly is not broadcastable at this T != n_heads shape -- exactly
+        the ``RuntimeError`` the L4 review report described aborting
+        ``--check``. Proves this suite would have caught the bug the restore
+        fixes.
+        """
+        torch.manual_seed(SEED)
+        y_fake_kernel, y_e, _ = self._fake_kernel_y("cpu")
+        assert tuple(y_fake_kernel.shape) != tuple(y_e.shape)
+        with pytest.raises(RuntimeError):
+            triton_scans._max_abs_rel(y_fake_kernel, y_e)
+
+    def test_unrestored_comparison_silently_broadcasts_when_t_is_one(self):
+        """At T=1, the unrestored shapes ARE broadcastable (size-1 dims
+        broadcast against anything) -- no crash, but a silently wrong
+        cross-``n_heads`` comparison instead of the intended elementwise one.
+        The restore is required to prevent this case too, not just the
+        T != n_heads crash above.
+        """
+        torch.manual_seed(SEED)
+        device = "cpu"
+        Q, K, V, beta, H0 = triton_scans._delta_inputs(
+            self.B, self.N_HEADS, 1, self.NH, self.D_K, self.D_V, device
+        )
+        y_e, _ = triton_scans._delta_ref_forward(Q, K, V, beta, H0, self.CHUNK_SIZE)
+        assert tuple(y_e.shape) == (self.B, 1, self.N_HEADS, self.D_V)
+        y_fake_kernel = y_e.permute(0, 2, 1, 3)  # (B, n_heads, T=1, d_v)
+
+        # Unrestored: broadcasts to (B, n_heads, n_heads, d_v) -- inflated
+        # against the intended (B, 1, n_heads, d_v)/(B, n_heads, 1, d_v)
+        # shapes, i.e. silently NOT the per-position comparison the harness
+        # means to make.
+        unrestored_diff = y_fake_kernel - y_e
+        assert tuple(unrestored_diff.shape) == (self.B, self.N_HEADS, self.N_HEADS, self.D_V)
+
+        # Restored (the fix): exact shape match, no broadcasting, an honest
+        # elementwise comparison.
+        y_t = y_fake_kernel.permute(0, 2, 1, 3)
+        assert y_t.shape == y_e.shape
+        assert torch.equal(y_t, y_e)

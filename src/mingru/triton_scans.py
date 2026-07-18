@@ -99,7 +99,9 @@ turns into a loud eager fallback under `auto` (and a raised error under
 """
 
 import contextlib
+import copy
 import os
+import types
 
 import torch
 import torch.nn.functional as F
@@ -2400,8 +2402,10 @@ def _parity_row(
     max_abs_err: float | None,
     max_rel_err: float | None,
     passed: bool,
+    *,
+    ref_fp64_dev: float | None = None,
 ) -> dict:
-    """Build one parity-conformance artifact row (shared by all three runners).
+    """Build one parity-conformance artifact row (shared by every runner).
 
     One dict per GATED case (never the informational bf16 rows -- those have
     no pass/fail verdict and are not part of the persisted parity-conformance
@@ -2410,6 +2414,17 @@ def _parity_row(
     re-deriving a separate structured shape dict avoids a second shape
     representation to keep in sync with the console output. ``dtype_sample``
     is any tensor from this case's inputs; only its dtype is read.
+
+    ``ref_fp64_dev``, keyword-only, defaults to ``None`` so the three
+    pre-existing runners (whose gates are fixed constants, not derived from a
+    per-case fp64 reference) are unaffected. The DeltaMinGRU parity runners
+    (``_run_delta_forward_parity``, ``_run_delta_grad_parity``) pass the
+    eager path's own fp32-vs-fp64 deviation on this case's inputs here --
+    the tolerance-justification rule's ``max_abs_err <= 10 * ref_fp64_dev``
+    reference value (spec 9.2/9.3) -- alongside ``gate_atol`` (the gate
+    actually applied, ``max(10 * ref_fp64_dev, a flat floor)``) and
+    ``max_abs_err`` (the gated kernel-vs-eager deviation), so both
+    deviations this rule compares land in the persisted artifact.
     """
     return {
         "op": op,
@@ -2421,6 +2436,7 @@ def _parity_row(
         "max_abs_err": max_abs_err,
         "max_rel_err": max_rel_err,
         "pass": passed,
+        "ref_fp64_dev": ref_fp64_dev,
     }
 
 
@@ -3029,4 +3045,609 @@ def _run_angle_fused_parity_body(collect: list[dict] | None = None) -> int:
         f"atol={out_atol:.0e}, parameter grads within "
         f"atol={grad_atol:.0e} rtol={grad_rtol:.0e}"
     )
+    return 0
+
+
+# --- DeltaMinGRU chunked-WY parity selftest ----------------------------
+#
+# The forward/grad-parity conformance evidence for Task 4 (intent ledger
+# statement 5): "kernel outputs and gradients match the eager chunked path
+# within stated parity tolerances, verified by conformance rows in the
+# existing parity harness." Two grids: a raw ``delta_scan_impl``-level
+# sweep spanning the full kernel envelope (every ``d_k``, every ``nh``,
+# ragged/T=1/T<chunk_size/multi-chunk ``T``), checked against
+# ``_run_delta_forward_parity``/``_run_delta_grad_parity``; and a
+# module-level end-to-end case (parameters through ``_coeffs``/
+# ``out_proj``, ``MINGRU_SCAN=triton`` vs ``eager``) folded into the grad
+# sweep, mirroring ``_run_angle_fused_parity``'s ``check_mixer``.
+#
+# Tolerance-justification rule (spec 9.2/9.3, binding): the gate must be
+# justified against the eager path's OWN fp32-vs-fp64 deviation on the same
+# inputs (kernel-vs-eager tolerance <= 10x that reference deviation). Both
+# runners therefore compute an in-runner fp64 eager reference per case (via
+# ``_delta_ref_forward``, dtype-polymorphic) and record both deviations on
+# the collected row: ``max_abs_err`` (kernel vs eager fp32, the gated
+# value) and ``ref_fp64_dev`` (eager fp32 vs eager fp64, the reference this
+# rule scales by) -- see ``_parity_row``.
+
+
+# Flat floors matching this file's existing affine-op gates (forward
+# atol=1e-5, grad atol=1e-3, both rtol=0 -- see ``_run_forward_parity_body``
+# / ``_run_grad_parity_body``). ``_delta_gate`` never drops BELOW these; it
+# only tightens above them when a case's own eager fp32-vs-fp64 noise is
+# larger than the floor implies.
+_DELTA_GATE_FLOOR_FWD = 1e-5
+_DELTA_GATE_FLOOR_GRAD = 1e-3
+
+
+def _delta_gate(own_dev: float, floor: float) -> float:
+    """Tolerance-justification gate (spec 9.2/9.3).
+
+    ``>= 10x`` the eager path's own fp32-vs-fp64 deviation (``own_dev``) on
+    this case's inputs, floored at ``floor`` so a near-zero ``own_dev``
+    (e.g. a tiny T=1 case, where fp32 and fp64 barely differ) never yields
+    an unreasonably tight gate below the other kernels' flat baseline.
+    """
+    return max(10.0 * own_dev, floor)
+
+
+_DELTA_PARITY_DK = tuple(sorted(_DELTA_DK_ENVELOPE))  # (4, 8, 16, 32, 64)
+_DELTA_PARITY_NH = (1, 2, 4)
+
+
+def _delta_chunk_size_for_nh(nh: int) -> int:
+    """Largest sweep ``chunk_size`` for ``nh`` keeping ``nh * chunk_size <= 128``.
+
+    ``nh`` in ``{1, 2}`` use the class-default ``64``; ``nh=4`` is halved to
+    ``32`` (task brief: "nh=4 requires chunk_size <= 32") -- both land at or
+    exactly on ``_DELTA_MAX_MICROSTEPS``, exercising that envelope edge
+    rather than staying comfortably inside it.
+    """
+    return 64 if nh <= 2 else 32
+
+
+def _delta_T_grid(chunk_size: int) -> tuple[int, int, int, int, int]:
+    """T values spanning spec 9.2's forward-parity shape bullets, in order:
+    T=1, T < chunk_size, exactly one full chunk, a clean multi-chunk
+    sequence, and a ragged multi-chunk sequence.
+    """
+    partial = max(1, chunk_size // 8)
+    return (1, partial, chunk_size, 2 * chunk_size, 2 * chunk_size + chunk_size // 4)
+
+
+def _delta_inputs(
+    B: int, n_heads: int, T: int, nh: int, d_k: int, d_v: int, device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Random ``(Q, K, V, beta, H0)`` at ``delta_scan_impl``'s spec-section-6 layout.
+
+    ``K`` is L2-normalized (last dim) and ``beta`` drawn as
+    ``2 * sigmoid(randn)`` (in ``(0, 2)``) -- the same ranges
+    ``DeltaMinGRU._coeffs`` actually produces -- so the UT-transform's
+    unit-triangular system stays as well-conditioned as real training
+    inputs, not an adversarial worst case. ``Q``/``V`` are scaled down
+    (``* 0.3``) and ``H0`` further (``* 0.1``), mirroring this file's
+    existing ``_rand_contractive_matrix``/``* 0.1`` scaling convention, so a
+    flat absolute tolerance stays meaningful across the whole ``d_k``/``T``
+    grid. ``H0`` is always nonzero/randomized here -- ``H0 = 0`` is
+    exercised separately by the module-level end-to-end case's default
+    ``h_0=None``. Shared by the forward- and gradient-parity raw-tensor
+    sweeps.
+    """
+    Q = torch.randn(B, n_heads, T, d_k, device=device) * 0.3
+    K = F.normalize(torch.randn(B, n_heads, T, nh, d_k, device=device), dim=-1)
+    V = torch.randn(B, n_heads, T, nh, d_v, device=device) * 0.3
+    beta = 2 * torch.sigmoid(torch.randn(B, n_heads, T, nh, device=device))
+    H0 = torch.randn(B, n_heads, d_k, d_v, device=device) * 0.1
+    return Q, K, V, beta, H0
+
+
+def _delta_ref_forward(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    beta: torch.Tensor,
+    H0: torch.Tensor,
+    chunk_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Eager chunked-WY reference at ``delta_scan_impl``'s raw tensor layout.
+
+    Delegates to ``DeltaMinGRU._forward_chunked`` -- the certified eager
+    oracle, unchanged by this task -- through a duck-typed shim exposing
+    only the attributes that method reads (``nh``, ``n_heads``, ``d_k``,
+    ``d_v``, ``chunk_size``, ``_coeffs``), rather than re-deriving the
+    chunked-WY math a second time in this file: ``_coeffs`` is stubbed to
+    hand back ``(Q, K, V, beta)`` un-projected, via the exact inverse of the
+    ``stack``/``permute`` assembly ``_dispatch_delta_scan._call`` builds in
+    ``min_gru.py`` (``K = torch.stack(ks, dim=2).permute(0, 3, 1, 2, 4)``
+    and so on) -- so this reference and the kernel's real dispatch seam
+    consume/produce identical layouts. Fully differentiable: the shim's
+    ``_coeffs`` closure closes over VIEWS (``.permute``/``.unbind``, never
+    copies) of ``Q``/``K``/``V``/``beta``, and ``H0`` is passed straight
+    through as the initial state, so gradients flow back to all five
+    inputs exactly like the kernel path's ``_DeltaScanFn`` does.
+    dtype-polymorphic (whatever dtype the inputs carry) so this one
+    function serves as both the fp32 gate reference and the fp64
+    tolerance-justification reference (spec 9.2/9.3).
+
+    DUPLICATION-PENDING note: this shim technique exists specifically to
+    AVOID a third copy of the chunked-WY forward math (a first copy already
+    lives in ``DeltaMinGRU._forward_chunked``, a second -- of the
+    backward's recompute half only -- in this file's ``_DeltaScanFn.backward``).
+    If a future task needs a plain-function raw-tensor eager reference
+    (not routed through a shim), that would be the point to hoist one --
+    but it could only live in ``min_gru.py`` (the file that owns the
+    oracle), which this task's brief places out of scope ("do not touch
+    min_gru.py").
+
+    Parameters mirror ``delta_scan_impl``'s spec-section-6 layout: ``Q``
+    ``(B, n_heads, T, d_k)``; ``K`` ``(B, n_heads, T, nh, d_k)``; ``V``
+    ``(B, n_heads, T, nh, d_v)``; ``beta`` ``(B, n_heads, T, nh)``; ``H0``
+    ``(B, n_heads, d_k, d_v)``.
+
+    Returns
+    -------
+    tuple of torch.Tensor
+        ``(y, H_T)``, exactly ``_forward_chunked``'s return convention:
+        ``y`` shape ``(B, T, n_heads, d_v)``, ``H_T`` shape ``(B, n_heads,
+        d_k, d_v)``.
+    """
+    from mingru import min_gru
+
+    B, n_heads, T, d_k = Q.shape
+    nh = K.shape[3]
+    d_v = V.shape[4]
+    q = Q.permute(0, 2, 1, 3)  # (B, T, n_heads, d_k)
+    ks = list(K.permute(0, 2, 3, 1, 4).unbind(2))  # nh x (B, T, n_heads, d_k)
+    vs = list(V.permute(0, 2, 3, 1, 4).unbind(2))  # nh x (B, T, n_heads, d_v)
+    betas = list(beta.permute(0, 2, 3, 1).unbind(2))  # nh x (B, T, n_heads)
+    shim = types.SimpleNamespace(
+        nh=nh,
+        n_heads=n_heads,
+        d_k=d_k,
+        d_v=d_v,
+        chunk_size=chunk_size,
+        _coeffs=lambda x: (q, ks, vs, betas),
+    )
+    x_dummy = Q.new_empty(B, T, 1)
+    return min_gru.DeltaMinGRU._forward_chunked(shim, x_dummy, H0)
+
+
+def _run_delta_forward_parity(collect: list[dict] | None = None) -> int:
+    """Run the DeltaMinGRU forward-parity matrix (``y``, ``H_T``); return exit code.
+
+    ``collect``: see ``_run_forward_parity`` -- same optional append-only
+    parity-conformance-artifact seam, same ``None``-default no-op contract.
+
+    ``delta_scan_impl`` is called directly (not through ``DeltaMinGRU``'s
+    ``MINGRU_SCAN`` module dispatch), so unlike the four-scan-op sweeps
+    this runner does not actually need ``MINGRU_SCAN`` forced to
+    ``"eager"`` for correctness -- ``_scan_env("eager")`` is used anyway,
+    purely so this runner still restores ``MINGRU_SCAN`` on exit exactly
+    like every sibling runner in this file (``--check`` runs all of them in
+    one process; see ``_scan_env``'s docstring). The actual sweep is
+    ``_run_delta_forward_parity_body``.
+    """
+    with _scan_env("eager"):
+        return _run_delta_forward_parity_body(collect)
+
+
+def _run_delta_forward_parity_body(collect: list[dict] | None = None) -> int:
+    """The DeltaMinGRU forward-parity sweep; see ``_run_delta_forward_parity``.
+
+    Grid: every envelope ``d_k`` (``== d_v``, spec 9.2), ``nh`` in
+    ``{1, 2, 4}`` (``chunk_size`` chosen per ``_delta_chunk_size_for_nh`` so
+    ``nh * chunk_size <= 128`` always holds -- ``nh=4`` lands exactly on
+    that bound), and T spanning ``_delta_T_grid``'s five shapes (T=1, T <
+    chunk_size, one full chunk, a clean and a ragged multi-chunk sequence).
+    ``H0`` is always randomized/nonzero (see ``_delta_inputs``).
+
+    Each case computes THREE forward passes on identical inputs: the
+    Triton kernel (fp32, via ``delta_scan_impl``), the eager reference
+    (fp32), and the eager reference again in fp64 -- both eager passes via
+    ``_delta_ref_forward``, so they can never independently drift from each
+    other -- the tolerance-justification rule (spec 9.2). The gate is
+    ``_delta_gate(own_dev, 1e-5)`` where ``own_dev`` is the eager path's
+    own fp32-vs-fp64 deviation on that case's inputs; both deviations are
+    recorded on the collected row (``max_abs_err`` = kernel-vs-eager,
+    ``ref_fp64_dev`` = eager's own fp32-vs-fp64).
+    """
+    device = "cuda"
+    torch.manual_seed(0)
+    B, n_heads = 2, 2
+
+    failures: list[str] = []
+    n_pass = 0
+
+    def check(tag: str, d_k: int, nh: int, chunk_size: int, T: int) -> None:
+        nonlocal n_pass
+        label = f"delta_forward {tag}"
+        Q, K, V, beta, H0 = _delta_inputs(B, n_heads, T, nh, d_k, d_k, device)
+        try:
+            y_t, HT_t = delta_scan_impl(Q, K, V, beta, H0, chunk_size=chunk_size)
+        except Exception as exc:  # ScanFallback or a kernel launch/compile error
+            failures.append(f"{label}: Triton path raised {type(exc).__name__}: {exc}")
+            print(f"  [FAIL] {label}: {type(exc).__name__}: {exc}")
+            if collect is not None:
+                collect.append(
+                    _parity_row(
+                        "delta_forward",
+                        tag,
+                        Q,
+                        "fwd",
+                        _DELTA_GATE_FLOOR_FWD,
+                        0.0,
+                        None,
+                        None,
+                        False,
+                    )
+                )
+            return
+        # delta_scan_impl returns y as (B, n_heads, T, d_v) (spec section 6);
+        # _delta_ref_forward returns y as (B, T, n_heads, d_v)
+        # (_forward_chunked's own convention). Restore the kernel's y to that
+        # convention here -- exactly the `y.permute(0, 2, 1, 3)` the real
+        # module seam applies in `_dispatch_delta_scan._call` (min_gru.py) --
+        # BEFORE any comparison, so this sweep compares like-for-like instead
+        # of silently transposing the n_heads/T axes against each other.
+        y_t = y_t.permute(0, 2, 1, 3)  # (B, T, n_heads, d_v)
+
+        y_e, HT_e = _delta_ref_forward(Q, K, V, beta, H0, chunk_size)
+        assert y_t.shape == y_e.shape, (
+            f"{label}: y layout mismatch after restore -- kernel {tuple(y_t.shape)} vs "
+            f"eager {tuple(y_e.shape)} (B, T, n_heads, d_v expected for both); a future "
+            "delta_scan_impl/_forward_chunked layout change broke this sweep's assumption"
+        )
+        Q64, K64, V64, beta64, H064 = (t.double() for t in (Q, K, V, beta, H0))
+        y_e64, HT_e64 = _delta_ref_forward(Q64, K64, V64, beta64, H064, chunk_size)
+
+        kernel_abs_y, kernel_rel_y = _max_abs_rel(y_t, y_e)
+        kernel_abs_H, kernel_rel_H = _max_abs_rel(HT_t, HT_e)
+        kernel_abs = max(kernel_abs_y, kernel_abs_H)
+        kernel_rel = max(kernel_rel_y, kernel_rel_H)
+
+        own_abs_y, _ = _max_abs_rel(y_e, y_e64)
+        own_abs_H, _ = _max_abs_rel(HT_e, HT_e64)
+        own_dev = max(own_abs_y, own_abs_H)
+
+        gate = _delta_gate(own_dev, _DELTA_GATE_FLOOR_FWD)
+        ok = kernel_abs <= gate
+        if ok:
+            n_pass += 1
+        else:
+            failures.append(
+                f"{label}: max_abs={kernel_abs:.2e} gate={gate:.2e} own_dev={own_dev:.2e}"
+            )
+            print(
+                f"  [FAIL] {label}: max_abs={kernel_abs:.2e} gate={gate:.2e} own_dev={own_dev:.2e}"
+            )
+        if collect is not None:
+            collect.append(
+                _parity_row(
+                    "delta_forward",
+                    tag,
+                    Q,
+                    "fwd",
+                    gate,
+                    0.0,
+                    kernel_abs,
+                    kernel_rel,
+                    ok,
+                    ref_fp64_dev=own_dev,
+                )
+            )
+
+    print(
+        "delta_scan_impl forward parity (y, H_T; gate = max(10x eager "
+        f"fp32-vs-fp64 dev, {_DELTA_GATE_FLOOR_FWD:.0e})):"
+    )
+    for d_k in _DELTA_PARITY_DK:
+        for nh in _DELTA_PARITY_NH:
+            chunk_size = _delta_chunk_size_for_nh(nh)
+            for T in _delta_T_grid(chunk_size):
+                check(f"d_k={d_k} nh={nh} chunk_size={chunk_size} T={T}", d_k, nh, chunk_size, T)
+
+    print()
+    if failures:
+        print(f"DELTA FORWARD PARITY FAILED: {len(failures)} case(s), {n_pass} passed")
+        for line in failures:
+            print(f"  {line}")
+        return 1
+    print(f"DELTA FORWARD PARITY PASSED: {n_pass} case(s)")
+    return 0
+
+
+def _run_delta_grad_parity(collect: list[dict] | None = None) -> int:
+    """Run the DeltaMinGRU gradient-parity matrix; return process exit code.
+
+    ``collect``: see ``_run_forward_parity`` -- same optional append-only
+    parity-conformance-artifact seam, same ``None``-default no-op contract.
+
+    Covers TWO things (task brief): raw ``Q``/``K``/``V``/``beta``/``H0``
+    grads driven directly through ``delta_scan_impl`` (no ``MINGRU_SCAN``
+    involvement, same rationale as ``_run_delta_forward_parity``), and an
+    end-to-end module-level case that DOES toggle ``MINGRU_SCAN`` between
+    ``"eager"``/``"triton"`` itself (mirroring ``_run_angle_fused_parity``'s
+    ``check_mixer``) -- so ``_scan_env()`` (no forced mode) only guarantees
+    ``MINGRU_SCAN`` is restored once this call returns, exactly like
+    ``_run_angle_fused_parity``. The actual sweep is
+    ``_run_delta_grad_parity_body``.
+    """
+    with _scan_env():
+        return _run_delta_grad_parity_body(collect)
+
+
+def _run_delta_grad_parity_body(collect: list[dict] | None = None) -> int:
+    """The DeltaMinGRU gradient-parity sweep; see ``_run_delta_grad_parity``."""
+    from mingru import min_gru
+
+    device = "cuda"
+    torch.manual_seed(0)
+    B, n_heads = 2, 2
+
+    failures: list[str] = []
+    n_pass = 0
+
+    def check_raw(tag: str, d_k: int, nh: int, chunk_size: int, T: int) -> None:
+        """Compare kernel-path vs eager Q/K/V/beta/H0 grads for one raw case.
+
+        Same three-pass structure as ``_run_delta_forward_parity_body``'s
+        ``check`` (kernel fp32, eager fp32, eager fp64), but comparing the
+        INPUT grads of a scalar loss ``sum(cot_y * y) + sum(cot_H * H_T)``
+        (identical cotangents across all three passes) instead of the
+        outputs themselves.
+        """
+        nonlocal n_pass
+        label = f"delta_grad {tag}"
+        base = _delta_inputs(B, n_heads, T, nh, d_k, d_k, device)
+        tri_in = [t.detach().clone().requires_grad_(True) for t in base]
+        eager_in = [t.detach().clone().requires_grad_(True) for t in base]
+        eager64_in = [t.detach().clone().double().requires_grad_(True) for t in base]
+
+        try:
+            y_t, HT_t = delta_scan_impl(*tri_in, chunk_size=chunk_size)
+        except Exception as exc:  # ScanFallback or a kernel launch/compile error
+            failures.append(f"{label}: Triton path raised {type(exc).__name__}: {exc}")
+            print(f"  [FAIL] {label}: {type(exc).__name__}: {exc}")
+            if collect is not None:
+                collect.append(
+                    _parity_row(
+                        "delta_grad",
+                        tag,
+                        base[0],
+                        "grad",
+                        _DELTA_GATE_FLOOR_GRAD,
+                        0.0,
+                        None,
+                        None,
+                        False,
+                    )
+                )
+            return
+        # Same layout restore as _run_delta_forward_parity_body's `check` --
+        # delta_scan_impl's y is (B, n_heads, T, d_v); _delta_ref_forward's
+        # (via _forward_chunked) is (B, T, n_heads, d_v). Must happen before
+        # `loss_t` is built below, or the cotangent (shaped from y_e) would
+        # silently broadcast against the wrong axes instead of raising.
+        y_t = y_t.permute(0, 2, 1, 3)  # (B, T, n_heads, d_v)
+
+        y_e, HT_e = _delta_ref_forward(*eager_in, chunk_size)
+        assert y_t.shape == y_e.shape, (
+            f"{label}: y layout mismatch after restore -- kernel {tuple(y_t.shape)} vs "
+            f"eager {tuple(y_e.shape)} (B, T, n_heads, d_v expected for both); a future "
+            "delta_scan_impl/_forward_chunked layout change broke this sweep's assumption"
+        )
+        y_e64, HT_e64 = _delta_ref_forward(*eager64_in, chunk_size)
+
+        torch.manual_seed(1234)
+        cot_y = torch.randn_like(y_e)
+        cot_H = torch.randn_like(HT_e)
+        loss_t = (cot_y * y_t).sum() + (cot_H * HT_t).sum()
+        loss_t.backward()
+        loss_e = (cot_y * y_e).sum() + (cot_H * HT_e).sum()
+        loss_e.backward()
+        loss_e64 = (cot_y.double() * y_e64).sum() + (cot_H.double() * HT_e64).sum()
+        loss_e64.backward()
+
+        max_err = 0.0
+        max_rel = 0.0
+        own_dev = 0.0
+        ok = True
+        for ti, ei, ei64 in zip(tri_in, eager_in, eager64_in):
+            gt, ge, ge64 = ti.grad, ei.grad, ei64.grad
+            if gt is None or ge is None or ge64 is None:
+                ok = False
+                failures.append(
+                    f"{label}: grad presence mismatch (triton={gt is not None}, "
+                    f"eager={ge is not None}, eager64={ge64 is not None})"
+                )
+                continue
+            ka, kr = _max_abs_rel(gt, ge)
+            oa, _ = _max_abs_rel(ge, ge64)
+            max_err = max(max_err, ka)
+            max_rel = max(max_rel, kr)
+            own_dev = max(own_dev, oa)
+
+        gate = _delta_gate(own_dev, _DELTA_GATE_FLOOR_GRAD)
+        ok = ok and max_err <= gate
+        if ok:
+            n_pass += 1
+        else:
+            failures.append(
+                f"{label}: max_grad_abs={max_err:.2e} gate={gate:.2e} own_dev={own_dev:.2e}"
+            )
+            print(
+                f"  [FAIL] {label}: max_grad_abs={max_err:.2e} gate={gate:.2e} "
+                f"own_dev={own_dev:.2e}"
+            )
+        if collect is not None:
+            collect.append(
+                _parity_row(
+                    "delta_grad",
+                    tag,
+                    base[0],
+                    "grad",
+                    gate,
+                    0.0,
+                    max_err,
+                    max_rel,
+                    ok,
+                    ref_fp64_dev=own_dev,
+                )
+            )
+
+    print(
+        "delta_scan_impl grad parity (Q/K/V/beta/H0; gate = max(10x eager "
+        f"fp32-vs-fp64 dev, {_DELTA_GATE_FLOOR_GRAD:.0e})):"
+    )
+    for d_k in _DELTA_PARITY_DK:
+        for nh in _DELTA_PARITY_NH:
+            chunk_size = _delta_chunk_size_for_nh(nh)
+            for T in _delta_T_grid(chunk_size):
+                check_raw(
+                    f"d_k={d_k} nh={nh} chunk_size={chunk_size} T={T}", d_k, nh, chunk_size, T
+                )
+
+    print()
+    print(
+        "DeltaMinGRU module end-to-end (params through _coeffs/out_proj, "
+        "MINGRU_SCAN=triton vs eager):"
+    )
+
+    def check_module(name: str, mixer_fn) -> None:
+        """Build and check one DeltaMinGRU config; mirrors ``check_mixer`` in
+        ``_run_angle_fused_parity_body``, plus the fp64 tolerance-justification
+        pass (``mixer64``, a deep-copied double-precision clone run only under
+        ``MINGRU_SCAN=eager`` -- the kernel is fp32-only, so it is never asked
+        to run in fp64). Exercises the real, non-contiguous module seam
+        ``_dispatch_delta_scan._call`` builds (permuted views straight into
+        ``delta_scan_impl``, whose launch calls ``.contiguous()``)."""
+        nonlocal n_pass
+        torch.manual_seed(0)
+        mixer = mixer_fn().to(device)
+        B_m = 3
+        T_m = 2 * mixer.chunk_size + max(1, mixer.chunk_size // 3)
+        shape = (
+            f"B={B_m} T={T_m} n_heads={mixer.n_heads} nh={mixer.nh} "
+            f"d_k={mixer.d_k} chunk_size={mixer.chunk_size}"
+        )
+        x = torch.randn(B_m, T_m, mixer.input_size, device=device)
+
+        os.environ["MINGRU_SCAN"] = "eager"
+        mixer.zero_grad(set_to_none=True)
+        out_e = mixer(x)
+        torch.manual_seed(1234)
+        cot = torch.randn_like(out_e)
+        (cot * out_e).sum().backward()
+        grads_e = {nm: p.grad.detach().clone() for nm, p in mixer.named_parameters()}
+
+        mixer64 = copy.deepcopy(mixer).double()
+        mixer64.zero_grad(set_to_none=True)
+        out_e64 = mixer64(x.double())
+        (cot.double() * out_e64).sum().backward()
+        grads_e64 = {nm: p.grad.detach().clone() for nm, p in mixer64.named_parameters()}
+
+        os.environ["MINGRU_SCAN"] = "triton"
+        mixer.zero_grad(set_to_none=True)
+        try:
+            out_t = mixer(x)
+        except Exception as exc:
+            failures.append(f"{name}: fused forward raised {type(exc).__name__}: {exc}")
+            print(f"  [FAIL] {name}: {type(exc).__name__}: {exc}")
+            os.environ["MINGRU_SCAN"] = "eager"
+            if collect is not None:
+                collect.append(
+                    _parity_row(
+                        name, shape, x, "fwd", _DELTA_GATE_FLOOR_FWD, 0.0, None, None, False
+                    )
+                )
+                collect.append(
+                    _parity_row(
+                        name, shape, x, "grad", _DELTA_GATE_FLOOR_GRAD, 0.0, None, None, False
+                    )
+                )
+            return
+        (cot * out_t).sum().backward()
+        grads_t = {nm: p.grad.detach().clone() for nm, p in mixer.named_parameters()}
+        os.environ["MINGRU_SCAN"] = "eager"
+
+        out_abs, out_rel = _max_abs_rel(out_t, out_e)
+        out_own, _ = _max_abs_rel(out_e, out_e64)
+        out_gate = _delta_gate(out_own, _DELTA_GATE_FLOOR_FWD)
+        out_ok = out_abs <= out_gate
+
+        grad_abs = 0.0
+        grad_rel = 0.0
+        grad_own = 0.0
+        grad_ok = True
+        for nm in grads_e:
+            gt = grads_t.get(nm)
+            if gt is None:
+                grad_ok = False
+                failures.append(f"{name}: missing fused grad for {nm}")
+                continue
+            a, r = _max_abs_rel(gt, grads_e[nm])
+            oa, _ = _max_abs_rel(grads_e[nm], grads_e64[nm])
+            grad_abs = max(grad_abs, a)
+            grad_rel = max(grad_rel, r)
+            grad_own = max(grad_own, oa)
+        grad_gate = _delta_gate(grad_own, _DELTA_GATE_FLOOR_GRAD)
+        grad_ok = grad_ok and grad_abs <= grad_gate
+
+        ok = out_ok and grad_ok
+        if ok:
+            n_pass += 1
+            print(f"  [ok]   {name}: out={out_abs:.2e} grad={grad_abs:.2e}")
+        else:
+            failures.append(f"{name}: out={out_abs:.2e} grad={grad_abs:.2e}")
+            print(f"  [FAIL] {name}: out={out_abs:.2e} grad={grad_abs:.2e}")
+        if collect is not None:
+            collect.append(
+                _parity_row(
+                    name,
+                    shape,
+                    x,
+                    "fwd",
+                    out_gate,
+                    0.0,
+                    out_abs,
+                    out_rel,
+                    out_ok,
+                    ref_fp64_dev=out_own,
+                )
+            )
+            collect.append(
+                _parity_row(
+                    name,
+                    shape,
+                    x,
+                    "grad",
+                    grad_gate,
+                    0.0,
+                    grad_abs,
+                    grad_rel,
+                    grad_ok,
+                    ref_fp64_dev=grad_own,
+                )
+            )
+
+    check_module(
+        "delta module nh=1 (DeltaNet)",
+        lambda: min_gru.DeltaMinGRU(32, 128, n_heads=4, nh=1, chunk_size=16),
+    )
+    check_module(
+        "delta module nh=2 (DeltaProduct) explicit d_k/d_v",
+        lambda: min_gru.DeltaMinGRU(32, 64, n_heads=2, nh=2, d_k=16, d_v=16, chunk_size=8),
+    )
+    check_module(
+        "delta module nh=4 chunk boundary (nh*chunk_size=128)",
+        lambda: min_gru.DeltaMinGRU(32, 64, n_heads=2, nh=4, d_k=8, d_v=8, chunk_size=32),
+    )
+
+    print()
+    if failures:
+        print(f"DELTA GRAD PARITY FAILED: {len(failures)} case(s), {n_pass} passed")
+        for line in failures:
+            print(f"  {line}")
+        return 1
+    print(f"DELTA GRAD PARITY PASSED: {n_pass} case(s)")
     return 0
