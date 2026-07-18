@@ -1,0 +1,84 @@
+{
+  "meta": {
+    "config": {
+      "input_size": 64,
+      "hidden_size": 64,
+      "n_heads": 4,
+      "nh": 2,
+      "d_k": 16,
+      "d_v": 16,
+      "chunk_size": 64,
+      "seed": 0
+    },
+    "givens_config": {
+      "block_size": 8,
+      "rounds": 3
+    },
+    "warmup": 1,
+    "reps": 3,
+    "torch_version": "2.5.1",
+    "cpu_info": "Apple M2 Pro",
+    "num_threads": 6,
+    "platform": "macOS-15.7.5-arm64-arm-64bit",
+    "git_commit": "5e8d8147d09897deb1d81d12a350ab4e3af2bf10",
+    "timestamp": "2026-07-18T03:42:59.879631+00:00"
+  },
+  "rows": [
+    {
+      "arm": "sequential step-loop (oracle)",
+      "shape_label": "T=64",
+      "B": 128,
+      "T": 64,
+      "seconds": 0.1616517088841647
+    },
+    {
+      "arm": "naive affine-scan reduction (oracle)",
+      "shape_label": "T=64",
+      "B": 128,
+      "T": 64,
+      "seconds": 2.051432624924928
+    },
+    {
+      "arm": "chunked-WY (shipped forward)",
+      "shape_label": "T=64",
+      "B": 128,
+      "T": 64,
+      "seconds": 0.05770291690714657
+    },
+    {
+      "arm": "GivensMinGRU (packaged, cross-mixer reference)",
+      "shape_label": "T=64",
+      "B": 128,
+      "T": 64,
+      "seconds": 0.9493147500324994
+    },
+    {
+      "arm": "sequential step-loop (oracle)",
+      "shape_label": "T=1024",
+      "B": 128,
+      "T": 1024,
+      "seconds": 19.974245707970113
+    },
+    {
+      "arm": "naive affine-scan reduction (oracle)",
+      "shape_label": "T=1024",
+      "B": 128,
+      "T": 1024,
+      "seconds": 71.75615116697736
+    },
+    {
+      "arm": "chunked-WY (shipped forward)",
+      "shape_label": "T=1024",
+      "B": 128,
+      "T": 1024,
+      "seconds": 1.4541009578388184
+    },
+    {
+      "arm": "GivensMinGRU (packaged, cross-mixer reference)",
+      "shape_label": "T=1024",
+      "B": 128,
+      "T": 1024,
+      "seconds": 24.999575790949166
+    }
+  ]
+}

@@ -94,6 +94,12 @@ select = ["E", "F", "I", "UP", "B", "W"]
 "min_gru.py" = ["F401", "F403", "F405", "E402", "I001"]
 "triton_scans.py" = ["F401", "F403", "F405", "E402", "I001"]
 "src/mingru/__init__.py" = ["F401", "F403"]
+# scripts/bench_delta.py needs the same src/-onto-sys.path bootstrap as the
+# two evidence drivers above (it must import `mingru` even when this
+# project isn't installed, e.g. under the evidence-pin `--with
+# torch==2.5.1` invocation) -- the sys.path.insert necessarily precedes the
+# `mingru` import, which ruff's import-order checker otherwise flags.
+"scripts/bench_delta.py" = ["E402"]
 # Frozen library modules (Phase-4 packaging move): executable content is
 # AST-identical to `main` and must not change this phase. B905 (zip strict=)
 # would alter the executable call; E501 lines predate the ruff config. Both
