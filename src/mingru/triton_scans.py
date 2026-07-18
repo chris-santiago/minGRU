@@ -64,22 +64,29 @@ use exact per-step recompute and no interval parameter exists to re-enable
 division-based reversal. Registered via `torch.library.register_autograd`
 like the four scan ops.
 
-DeltaMinGRU chunked-WY forward pair (Kernel 5, Kernel 6). `delta_scan_impl`
-drives two `@triton.jit` kernels implementing the two-stage WY decomposition
-of `DeltaMinGRU._forward_chunked` (the eager oracle). The unit-lower-
-triangular system `T = I + (K K^T (.) beta) (.) strict-lower` depends only
-on `K`/`beta`, never on the carried state `H`, so its solves parallelize
-across chunks: the pre-pass (`_delta_prepass_kernel`, Kernel 5, grid over
-`(batch*head, chunk)`) builds each chunk's `T` in registers and forward-
-substitutes it against the two H-independent right-hand sides, producing
-`T^-1 V` and `T^-1 K` for the whole sequence in one launch. The sequential
-pass (`_delta_sequential_kernel`, Kernel 6, grid over `(batch*head)`) then
-loops over chunks in-kernel carrying `H` (d_k x d_v fp32), forming
-`U = T^-1 V - (T^-1 K) H`, the block-causal masked readout `y = Q H +
-(Q K^T (.) beta (.) read_mask) U`, and the state update `H += K^T (beta
-U)`; it writes `y`, the per-chunk boundary states (`Hbound`, the start-of-
-chunk `H`), and the final `H_T`. Unlike the four scan ops and the angle-
-fused path, this pair is plain `@triton.jit` launched directly via
+DeltaMinGRU chunked-WY forward trio (Kernel 5, Kernel 6a, Kernel 6b).
+`delta_scan_impl` drives three `@triton.jit` kernels implementing the
+two-stage WY decomposition of `DeltaMinGRU._forward_chunked` (the eager
+oracle). The unit-lower-triangular system `T = I + (K K^T (.) beta) (.)
+strict-lower` depends only on `K`/`beta`, never on the carried state `H`, so
+its solves parallelize across chunks: the pre-pass (`_delta_prepass_kernel`,
+Kernel 5, grid over `(batch*head, chunk)`) builds each chunk's `T` in
+registers and forward-substitutes it against the two H-independent right-hand
+sides, producing `T^-1 V` and `T^-1 K` for the whole sequence in one launch.
+The state pass (`_delta_state_kernel`, Kernel 6a, grid over `(batch*head)`)
+then loops over chunks in-kernel carrying `H` (d_k x d_v fp32), forming
+`U = T^-1 V - (T^-1 K) H` and the state update `H += K^T (beta U)`; it writes
+ONLY the per-chunk boundary states (`Hbound`, the start-of-chunk `H`) and the
+final `H_T`. The readout (`_delta_readout_kernel`, Kernel 6b, grid over
+`(batch*head, chunk)`) then runs one program per chunk -- reading `Hbound[c]`,
+recomputing `U`, and writing the block-causal masked readout `y = Q H +
+(Q K^T (.) beta (.) read_mask) U` -- so the expensive readout parallelizes
+across chunks instead of being serialized in the `H`-chain, and each program
+carries a small tile set (no `C x M` readout tile in the serial pass, no
+`H`-carry in the parallel pass). `Hbound[c]` is exactly the `H` the readout
+sees at chunk `c`, so the split is numerically identical to a single fused
+sequential pass. Unlike the four scan ops and the angle-fused path, this trio
+is plain `@triton.jit` launched directly via
 `_delta_forward_launch` (not `triton_op`/`register_autograd`): the delta
 path's backward is a hand-derived `torch.autograd.Function` (`_DeltaScanFn`,
 which `delta_scan_impl` routes through) whose recompute-based reverse-chunk
@@ -253,7 +260,7 @@ def parallel_scan_log_recompute(log_coeffs: torch.Tensor, log_values: torch.Tens
 # whose per-head state is a ``d_k x d_v`` associative-memory matrix updated by
 # ``nh`` rank-1 corrections per token, processed ``chunk_size`` tokens at a
 # time through a unit-lower-triangular UT-transform solve. The kernel path
-# (two Triton kernels launched from ``_delta_forward_launch``) is gated to the
+# (three Triton kernels launched from ``_delta_forward_launch``) is gated to the
 # recorded probe-grid shapes. These constants and the pure-Python validators
 # below live OUTSIDE the ``if _HAS_TRITON:`` block (like
 # ``parallel_scan_log_recompute``) so the envelope reasons are importable and
@@ -1662,12 +1669,20 @@ if _HAS_TRITON:
     #   H-independent solve products `T^-1 V` and `T^-1 K`. One launch covers
     #   the whole sequence.
     #
-    #   Sequential pass (_delta_sequential_kernel): grid over (batch*head).
-    #   Each program loops over chunks carrying `H` (d_k x d_v fp32), forming
-    #   `U = T^-1 V - (T^-1 K) H`, the block-causal readout `y = Q H + (Q K^T
-    #   (.) beta (.) mask) U`, and the state update `H += K^T (beta U)`; it
-    #   writes `y`, the per-chunk boundary states (the start-of-chunk `H`, for
-    #   the Task-2 recompute backward), and the final `H_T`.
+    #   State pass (_delta_state_kernel): grid over (batch*head). Each program
+    #   loops over chunks carrying `H` (d_k x d_v fp32), forming `U = T^-1 V -
+    #   (T^-1 K) H` and the state update `H += K^T (beta U)`; it writes ONLY the
+    #   per-chunk boundary states (start-of-chunk `H`, for both the readout pass
+    #   and the Task-2 recompute backward) and the final `H_T`. The readout is
+    #   NOT computed here.
+    #
+    #   Readout pass (_delta_readout_kernel): grid over (batch*head, chunk). One
+    #   program per chunk reads `Hbound[c]`, recomputes `U`, and writes the
+    #   block-causal readout `y = Q H + (Q K^T (.) beta (.) mask) U`. Splitting
+    #   the readout out of the serial `H`-chain restores parallelism
+    #   proportional to num_chunks and shrinks per-program shared memory; the
+    #   result is bit-identical to a single fused sequential pass because
+    #   `Hbound[c]` is exactly the `H` the fused readout used at chunk `c`.
     #
     # Both are plain `@triton.jit` kernels launched directly (not
     # `triton_op`/`register_autograd`): the delta path is differentiated by a
@@ -1784,14 +1799,12 @@ if _HAS_TRITON:
         )
 
     @triton.jit
-    def _delta_sequential_kernel(
-        Q_ptr,
+    def _delta_state_kernel(
         K_ptr,
         beta_ptr,
         TinvV_ptr,
         TinvK_ptr,
         H0_ptr,
-        y_ptr,
         Hbound_ptr,
         HT_ptr,
         T,
@@ -1801,28 +1814,34 @@ if _HAS_TRITON:
         d_k: tl.constexpr,
         d_v: tl.constexpr,
         BLOCK_M: tl.constexpr,
-        BLOCK_C: tl.constexpr,
         BLOCK_K: tl.constexpr,
         BLOCK_V: tl.constexpr,
     ):
-        """Sequential pass: per (batch*head), loop chunks carrying ``H``.
+        """Serial state pass (Kernel 6a): per (batch*head), carry ``H`` across chunks.
 
         One program owns a ``(batch, head)`` lane and walks chunks
         ``0..num_chunks-1``, carrying the ``d_k x d_v`` state ``H`` (seeded
         from ``H0``). Per chunk, using the pre-pass products ``T^-1 V`` /
-        ``T^-1 K``: ``U = T^-1 V - (T^-1 K) H``; the block-causal readout
-        ``y = Q H + (Q K^T (.) beta (.) read_mask) U`` (``read_mask[t, m] =
-        1{token(m) <= t}``, token-granularity, inclusive of a token's own
-        ``nh`` micro-steps); and the state update ``H += K^T (beta U)``. It
-        stores the start-of-chunk ``H`` as the chunk's boundary state (for the
-        Task-2 recompute backward) BEFORE updating, ``y`` for the chunk's
-        tokens, and the final ``H_T`` after the loop. Padded rows/cols load as
-        zero and never contribute to the contractions or to stored outputs.
+        ``T^-1 K``: it stores the start-of-chunk ``H`` as the chunk boundary
+        state ``Hbound[c]`` (chunk 0's is ``H0``) BEFORE updating, forms
+        ``U = T^-1 V - (T^-1 K) H`` and applies the state update
+        ``H += K^T (beta U)``; after the loop it writes the final ``H_T``.
+
+        This kernel carries ONLY the state recurrence -- it computes no readout
+        (no ``Q``, no ``Q K^T`` term, no ``y``). That work moves to the
+        chunk-parallel ``_delta_readout_kernel``, which consumes the
+        ``Hbound[c]`` this pass produces. Splitting the readout out of the
+        serial ``H``-chain (a) restores parallelism proportional to
+        ``num_chunks`` for the expensive readout, and (b) shrinks this pass's
+        per-program tiles to only ``M x d_k`` / ``M x d_v`` / ``d_k x d_v``
+        (no ``C x M`` readout tile), so the serial grid (one program per
+        ``batch*head``) is light. ``num_stages=1`` on the launch: the ``H``
+        carry is a strict serial dependency the pipeliner cannot overlap.
+        Padded rows/cols load as zero and never contribute.
         """
         bh = tl.program_id(0)
 
         m = tl.arange(0, BLOCK_M)
-        cc = tl.arange(0, BLOCK_C)
         kk = tl.arange(0, BLOCK_K)
         vv = tl.arange(0, BLOCK_V)
         kcol = kk < d_k
@@ -1843,17 +1862,15 @@ if _HAS_TRITON:
             row0 = start_tok * nh
 
             row_valid = m < M
-            tok_valid = cc < C
 
             K_base = bh * (T * nh * d_k) + row0 * d_k
             V_base = bh * (T * nh * d_v) + row0 * d_v
             beta_base = bh * (T * nh) + row0
-            Q_base = bh * (T * d_k) + start_tok * d_k
-            y_base = bh * (T * d_v) + start_tok * d_v
             Hb_base = bh * (num_chunks * d_k * d_v) + c * (d_k * d_v)
 
             # Boundary state = start-of-chunk H (chunk 0's is H0), stored
-            # before the update for the reverse-chunk backward.
+            # before the update for the reverse-chunk backward AND for the
+            # chunk-parallel readout pass.
             tl.store(
                 Hbound_ptr + Hb_base + kk[:, None] * d_v + vv[None, :],
                 H,
@@ -1876,33 +1893,9 @@ if _HAS_TRITON:
                 other=0.0,
             ).to(tl.float32)  # (BLOCK_M, BLOCK_V)
             beta_tile = tl.load(beta_ptr + beta_base + m, mask=row_valid, other=0.0).to(tl.float32)
-            Qtile = tl.load(
-                Q_ptr + Q_base + cc[:, None] * d_k + kk[None, :],
-                mask=tok_valid[:, None] & kcol[None, :],
-                other=0.0,
-            ).to(tl.float32)  # (BLOCK_C, BLOCK_K)
 
-            # U = T^-1 V - (T^-1 K) H
+            # U = T^-1 V - (T^-1 K) H, then H += K^T (beta U).
             U = TinvV - tl.dot(TinvK, H, input_precision="ieee")  # (BLOCK_M, BLOCK_V)
-
-            # Block-causal masked readout. read_mask[t, m] = 1 iff the token
-            # owning micro-step m (m // nh) is <= t; padded rows/cols zeroed.
-            R = tl.dot(Qtile, tl.trans(Ktile), input_precision="ieee")  # (BLOCK_C, BLOCK_M)
-            tok_of_m = m // nh
-            read_mask = (
-                (tok_of_m[None, :] <= cc[:, None]) & row_valid[None, :] & tok_valid[:, None]
-            ).to(tl.float32)  # (BLOCK_C, BLOCK_M)
-            masked = R * beta_tile[None, :] * read_mask
-            y = tl.dot(Qtile, H, input_precision="ieee") + tl.dot(
-                masked, U, input_precision="ieee"
-            )  # (BLOCK_C, BLOCK_V)
-            tl.store(
-                y_ptr + y_base + cc[:, None] * d_v + vv[None, :],
-                y,
-                mask=tok_valid[:, None] & vcol[None, :],
-            )
-
-            # H += K^T (beta U)
             bU = beta_tile[:, None] * U  # (BLOCK_M, BLOCK_V)
             H = H + tl.dot(tl.trans(Ktile), bU, input_precision="ieee")  # (BLOCK_K, BLOCK_V)
 
@@ -1910,6 +1903,125 @@ if _HAS_TRITON:
             HT_ptr + H0_base + kk[:, None] * d_v + vv[None, :],
             H,
             mask=kcol[:, None] & vcol[None, :],
+        )
+
+    @triton.jit
+    def _delta_readout_kernel(
+        Q_ptr,
+        K_ptr,
+        beta_ptr,
+        TinvV_ptr,
+        TinvK_ptr,
+        Hbound_ptr,
+        y_ptr,
+        T,
+        nh,
+        num_chunks,
+        chunk_size,
+        d_k: tl.constexpr,
+        d_v: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_C: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        BLOCK_V: tl.constexpr,
+    ):
+        """Chunk-parallel readout (Kernel 6b): per (batch*head, chunk), write ``y``.
+
+        Grid is ``(batch*head, num_chunks)`` -- one independent program per
+        chunk, so the whole readout runs in parallel across chunks instead of
+        being serialized inside the state pass's ``H``-chain. Each program
+        reads its chunk's start-of-chunk state ``H = Hbound[c]`` (produced by
+        ``_delta_state_kernel``) and recomputes ``U = T^-1 V - (T^-1 K) H``
+        from the pre-pass products (cheaper in memory than persisting a whole-
+        sequence ``U`` buffer -- one ``(M, d_k) x (d_k, d_v)`` dot per chunk vs.
+        a ``V``-sized workspace), then forms the block-causal masked readout
+        ``y = Q H + (Q K^T (.) beta (.) read_mask) U`` (``read_mask[t, m] =
+        1{token(m) <= t}``, token-granularity, inclusive of a token's own
+        ``nh`` micro-steps).
+
+        Because ``H`` is read (not carried), there is no cross-chunk
+        dependency and no in-kernel chunk loop, so the launch multi-buffers
+        nothing (``num_stages`` is irrelevant -- single-buffer footprint) and
+        latency is hidden by occupancy across the ``batch*head * num_chunks``
+        grid rather than by software pipelining. The per-program tile set is a
+        strict subset of the pre-split fused kernel's single-chunk tiles, so
+        its shared-memory footprint fits wherever that single-chunk case fit.
+        The ``y`` this writes is bit-identical to the pre-split fused readout:
+        ``Hbound[c]`` is exactly the ``H`` the fused kernel held at chunk
+        ``c``'s readout. Padded rows/cols load as zero and never contribute.
+        """
+        bh = tl.program_id(0)
+        c = tl.program_id(1)
+
+        m = tl.arange(0, BLOCK_M)
+        cc = tl.arange(0, BLOCK_C)
+        kk = tl.arange(0, BLOCK_K)
+        vv = tl.arange(0, BLOCK_V)
+        kcol = kk < d_k
+        vcol = vv < d_v
+
+        start_tok = c * chunk_size
+        rem = T - start_tok
+        C = tl.where(rem < chunk_size, rem, chunk_size)
+        M = nh * C
+        row0 = start_tok * nh
+
+        row_valid = m < M
+        tok_valid = cc < C
+
+        K_base = bh * (T * nh * d_k) + row0 * d_k
+        V_base = bh * (T * nh * d_v) + row0 * d_v
+        beta_base = bh * (T * nh) + row0
+        Q_base = bh * (T * d_k) + start_tok * d_k
+        y_base = bh * (T * d_v) + start_tok * d_v
+        Hb_base = bh * (num_chunks * d_k * d_v) + c * (d_k * d_v)
+
+        H = tl.load(
+            Hbound_ptr + Hb_base + kk[:, None] * d_v + vv[None, :],
+            mask=kcol[:, None] & vcol[None, :],
+            other=0.0,
+        ).to(tl.float32)  # (BLOCK_K, BLOCK_V) -- start-of-chunk state
+
+        Ktile = tl.load(
+            K_ptr + K_base + m[:, None] * d_k + kk[None, :],
+            mask=row_valid[:, None] & kcol[None, :],
+            other=0.0,
+        ).to(tl.float32)  # (BLOCK_M, BLOCK_K)
+        TinvK = tl.load(
+            TinvK_ptr + K_base + m[:, None] * d_k + kk[None, :],
+            mask=row_valid[:, None] & kcol[None, :],
+            other=0.0,
+        ).to(tl.float32)  # (BLOCK_M, BLOCK_K)
+        TinvV = tl.load(
+            TinvV_ptr + V_base + m[:, None] * d_v + vv[None, :],
+            mask=row_valid[:, None] & vcol[None, :],
+            other=0.0,
+        ).to(tl.float32)  # (BLOCK_M, BLOCK_V)
+        beta_tile = tl.load(beta_ptr + beta_base + m, mask=row_valid, other=0.0).to(tl.float32)
+        Qtile = tl.load(
+            Q_ptr + Q_base + cc[:, None] * d_k + kk[None, :],
+            mask=tok_valid[:, None] & kcol[None, :],
+            other=0.0,
+        ).to(tl.float32)  # (BLOCK_C, BLOCK_K)
+
+        # Recompute U = T^-1 V - (T^-1 K) H (same math the state pass used).
+        U = TinvV - tl.dot(TinvK, H, input_precision="ieee")  # (BLOCK_M, BLOCK_V)
+
+        # Block-causal masked readout. read_mask[t, m] = 1 iff the token owning
+        # micro-step m (m // nh) is <= t; padded rows/cols zeroed.
+        R = tl.dot(Qtile, tl.trans(Ktile), input_precision="ieee")  # (BLOCK_C, BLOCK_M)
+        tok_of_m = m // nh
+        read_mask = (
+            (tok_of_m[None, :] <= cc[:, None]) & row_valid[None, :] & tok_valid[:, None]
+        ).to(tl.float32)  # (BLOCK_C, BLOCK_M)
+        masked = R * beta_tile[None, :] * read_mask
+        y = tl.dot(Qtile, H, input_precision="ieee") + tl.dot(
+            masked, U, input_precision="ieee"
+        )  # (BLOCK_C, BLOCK_V)
+        tl.store(
+            y_ptr + y_base + cc[:, None] * d_v + vv[None, :],
+            y,
+            mask=tok_valid[:, None] & vcol[None, :],
         )
 
     def _delta_forward_launch(
@@ -1920,7 +2032,7 @@ if _HAS_TRITON:
         H0: torch.Tensor,
         chunk_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Raw two-kernel forward launch (no envelope validation).
+        """Raw three-kernel forward launch (no envelope validation).
 
         Assumes the inputs are already in-envelope (the caller --
         ``delta_scan_impl`` or the Task-2 ``autograd.Function`` -- validates
@@ -1955,7 +2067,7 @@ if _HAS_TRITON:
         block_m, block_c, block_k, block_v = _delta_block_sizes(nh, chunk_size, d_k, d_v)
 
         # Pre-pass: T^-1 V / T^-1 K, laid out exactly like V / K so the
-        # sequential pass reads each chunk at the same offset.
+        # state and readout passes read each chunk at the same offset.
         TinvV = torch.empty_like(V)
         TinvK = torch.empty_like(K)
         _delta_prepass_kernel[(bh, num_chunks)](
@@ -1977,32 +2089,56 @@ if _HAS_TRITON:
         y = torch.empty(B, n_heads, T, d_v, device=Q.device, dtype=torch.float32)
         Hbound = torch.empty(B, n_heads, num_chunks, d_k, d_v, device=Q.device, dtype=torch.float32)
         H_T = torch.empty(B, n_heads, d_k, d_v, device=Q.device, dtype=torch.float32)
-        # num_stages=1 (single-buffer, pipelining OFF) on the sequential pass.
-        # This kernel's in-kernel `for c in range(num_chunks)` loop carries the
-        # state H across iterations: iteration c's readout/update read H written
-        # by iteration c-1, a strict serial dependency the software pipeliner
-        # cannot overlap. Left at the default (num_stages=3 on sm_89), Triton
-        # still multi-buffers the loop's per-chunk tile LOADS (Ktile, TinvK,
-        # TinvV, Qtile) across 3 stages, tripling their shared-memory footprint
-        # and pushing every multi-chunk x wide-tile envelope shape past the L4's
-        # 101376 B SMEM limit -- while the single-chunk cases of the SAME shapes
-        # fit, because Triton's `equal_to_1` specialization compiles num_chunks==1
-        # as a constant, sees a single trip, and allocates ONE buffer. Forcing
-        # num_stages=1 makes the multi-chunk launch reuse that identical, already-
-        # accepted single-buffer footprint. The prefetch it forgoes buys nothing
-        # here (the dependent H-chain, not load latency, bounds the loop), so
-        # already-passing cases keep their measured performance; the kernel math
-        # is byte-for-byte unchanged.
-        _delta_sequential_kernel[(bh,)](
-            Q,
+
+        # Serial state pass (Kernel 6a): grid over (batch*head), carries H
+        # across chunks and writes Hbound / H_T. num_stages=1 (single-buffer,
+        # pipelining OFF): the in-kernel `for c in range(num_chunks)` loop
+        # carries H (iteration c reads the H iteration c-1 wrote), a strict
+        # serial dependency the software pipeliner cannot overlap, so the
+        # multi-buffered prefetch a higher num_stages would allocate buys
+        # nothing here (the dependent H-chain, not load latency, bounds the
+        # loop) while enlarging shared memory. Its per-program tiles are now
+        # only M x d_k / M x d_v / d_k x d_v (the readout's C x M tile moved to
+        # the parallel pass), a strict subset of the pre-split fused kernel's
+        # single-chunk footprint, so num_stages=1 fits with room to spare.
+        _delta_state_kernel[(bh,)](
             K,
             beta,
             TinvV,
             TinvK,
             H0,
-            y,
             Hbound,
             H_T,
+            T,
+            nh,
+            num_chunks,
+            chunk_size,
+            d_k,
+            d_v,
+            block_m,
+            block_k,
+            block_v,
+            num_stages=1,
+        )
+
+        # Chunk-parallel readout (Kernel 6b): grid over (batch*head, chunk),
+        # so the expensive readout runs one program per chunk instead of being
+        # serialized inside the state pass. num_warps is widened for the wide
+        # (d_k >= 32) tiles -- their C x M / M x d_v dots have enough
+        # per-program work to use 8 warps, where the narrow tiles are saturated
+        # by the default 4. The kernel has no in-kernel chunk loop, so it
+        # multi-buffers nothing (num_stages irrelevant, single-buffer footprint
+        # = a subset of the fused single-chunk footprint that already fit);
+        # latency is hidden by occupancy across the batch*head * num_chunks grid.
+        readout_warps = 8 if d_k >= 32 else 4
+        _delta_readout_kernel[(bh, num_chunks)](
+            Q,
+            K,
+            beta,
+            TinvV,
+            TinvK,
+            Hbound,
+            y,
             T,
             nh,
             num_chunks,
@@ -2013,12 +2149,12 @@ if _HAS_TRITON:
             block_c,
             block_k,
             block_v,
-            num_stages=1,
+            num_warps=readout_warps,
         )
         return y, H_T, Hbound
 
     class _DeltaScanFn(torch.autograd.Function):
-        """Autograd wrapper making the two-kernel delta forward differentiable.
+        """Autograd wrapper making the three-kernel delta forward differentiable.
 
         The forward is the raw Triton launch (``_delta_forward_launch``); the
         backward is a hand-derived reverse-chunk recurrence (no autograd
@@ -2051,12 +2187,12 @@ if _HAS_TRITON:
 
         @staticmethod
         def forward(ctx, Q, K, V, beta, H0, chunk_size):
-            """Run the two-kernel launch; save inputs + boundary states for backward.
+            """Run the three-kernel launch; save inputs + boundary states for backward.
 
             Returns the public ``(y, H_T)`` pair; the boundary states
             ``Hbound`` are stashed on the tape (not returned) so the reverse
             chunk loop can seed each chunk's start-of-chunk state without
-            re-running the sequential pass.
+            re-running the forward passes.
             """
             y, H_T, Hbound = _delta_forward_launch(Q, K, V, beta, H0, chunk_size)
             ctx.save_for_backward(Q, K, V, beta, H0, Hbound)
@@ -2125,42 +2261,59 @@ if _HAS_TRITON:
                 U = torch.linalg.solve_triangular(
                     T_mat, Vc - Kc @ Hc, upper=False, unitriangular=True
                 )  # (B, n_heads, M, d_v)
+                del Vc  # only feeds U's rhs; free the M x d_v recompute copy
                 S = Qc @ mT(Kc)  # (B, n_heads, C, M)
                 read_mask = torch.tril(Qc.new_ones(C, C)).repeat_interleave(nh, dim=1)  # (C, M)
                 P = S * betac_col * read_mask  # (B, n_heads, C, M)
 
                 # --- backward through y = Q H + P U --------------------------
+                # Large intra-chunk intermediates (the batched (M, M) and
+                # (C, M) tensors: KK, T_mat, S, P, dP, dS, dT, dKK) are freed
+                # with `del` at their last use so the recompute backward's
+                # instantaneous peak stays at a couple of them at once rather
+                # than the whole set -- the spec section 7 kernel-peak <= eager
+                # -peak invariant is tightest at the widest single-chunk shape
+                # (M = nh * chunk_size = 128), where each (M, M) batched tensor
+                # is the dominant allocation. Pure memory hygiene; the math is
+                # unchanged.
                 dQc = dyc @ mT(Hc)  # (B, n_heads, C, d_k)
                 dHc = mT(Qc) @ dyc  # (B, n_heads, d_k, d_v)
                 dP = dyc @ mT(U)  # (B, n_heads, C, M)
                 dU = mT(P) @ dyc  # (B, n_heads, M, d_v)
+                del P  # last use above
 
                 # --- backward through H_out = H + K^T (beta * U) -------------
                 dK_local = (betac.unsqueeze(-1) * U) @ mT(dH)  # from K^T (beta U)
                 dbU = Kc @ dH  # (B, n_heads, M, d_v)
                 dU = dU + betac.unsqueeze(-1) * dbU
                 dbeta_local = (U * dbU).sum(-1)  # (B, n_heads, M)
+                del dbU  # last use above
                 dHc = dHc + dH  # identity term of H_out = H + ...
 
                 # --- backward through P = (Q K^T) * beta * read_mask ---------
                 dS = dP * betac_col * read_mask  # (B, n_heads, C, M)
                 dbeta_local = dbeta_local + (dP * S * read_mask).sum(-2)
+                del dP, S  # last use above (read_mask already consumed into dS)
                 dQc = dQc + dS @ Kc
                 dK_local = dK_local + mT(dS) @ Qc
+                del dS  # last use above
 
                 # --- backward through U = T^-1 (V - K H): transpose solve ----
                 G = torch.linalg.solve_triangular(
                     mT(T_mat), dU, upper=True, unitriangular=True
                 )  # T^-T dU, (B, n_heads, M, d_v)
+                del T_mat, dU  # both consumed by the transpose solve
                 dT = -(G @ mT(U))  # (B, n_heads, M, M)
-                dV_local = G
+                dV_local = G  # alias -- G stays live via dV_local until the scatter
                 dK_local = dK_local - G @ mT(Hc)
                 dHc = dHc - mT(Kc) @ G
 
                 # --- backward through T = I + (K K^T) * beta * strict --------
                 dKK = dT * betac_col * strict  # (B, n_heads, M, M)
                 dbeta_local = dbeta_local + (dT * KK * strict).sum(-2)
+                del dT, KK  # last use above
                 dK_local = dK_local + dKK @ Kc + mT(dKK) @ Kc
+                del dKK  # last use above
 
                 # --- scatter chunk grads; carry dH to the previous chunk -----
                 dQ[:, :, start:end] = dQc
