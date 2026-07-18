@@ -34,8 +34,9 @@ On ``--device cuda`` (the production path), before touching seed 0:
 2. ``torch.__version__`` starts with ``2.8.`` (this round's pinned CUDA
    stratum) -- clear ``SystemExit`` if not.
 3. If the ``sg8`` arm is selected: one tiny forward+backward through a
-   ``hetero-pg8``-config ``GivensMinGRU(block_size=8, rounds=3)`` on CUDA
-   under ``MINGRU_SCAN=triton``. The packaged scan dispatch
+   ``hetero-pg8``-config ``GivensMinGRU`` (``block_size=8, rounds=3``,
+   matching ``hetero_lab``'s ``pgivens8`` factory exactly) on CUDA under
+   ``MINGRU_SCAN=triton``. The packaged scan dispatch
    (``src/mingru/min_gru.py``'s ``_dispatch_scan``) itself raises
    ``SystemExit``-worthy ``RuntimeError`` if no usable Triton path exists --
    that raise IS the gate; this probe only guarantees it runs before seed 0.
@@ -153,6 +154,16 @@ _ARMS: tuple[_Arm, ...] = (
 )
 _ARM_BY_KEY: dict[str, _Arm] = {arm.key: arm for arm in _ARMS}
 
+# Derived campaign-contract facts for _env_block's MINGRU_LAB_ENV payload,
+# always read off the FULL arm matrix above -- never off a particular
+# invocation's --arms subset -- so they can never independently drift from
+# _ARMS the way two separately hardcoded literals could (design-review
+# finding: "scan_mode_givens"/"compile_delta" used to be their own string/
+# bool literals inside _env_block, duplicating facts already structural
+# here). Values are unchanged from before this derivation ("triton" / True).
+_GIVENS_SCAN_MODE: str | None = _ARM_BY_KEY["sg8"].scan_mode
+_ALL_DELTA_ARMS_COMPILE: bool = all(_ARM_BY_KEY[k].compile for k in ("pd64", "pd1024"))
+
 _DEFAULT_SEEDS: tuple[int, ...] = tuple(range(36))
 _DEFAULT_STEPS = 1600
 
@@ -223,10 +234,21 @@ def _assert_cuda_and_torch_version() -> None:
         )
 
 
+# GivensMinGRU kwargs for the sg8 arm's engagement probe, matching
+# hetero_lab's pgivens8 factory exactly (experiments/hetero_lab.py
+# LOCAL_FACTORIES: block_size=8, rounds=3 -- the same config the hetero-pg8
+# model trains on). Named the same way as _PD64_DELTA_KWARGS/
+# _PD1024_DELTA_KWARGS below so a drift test can introspect the real
+# factory's constructed module the same way (see
+# tests/test_gpu_hetero_campaign.py's
+# test_givens_engagement_probe_config_matches_hetero_lab_factory).
+_PGIVENS8_KWARGS: dict[str, int] = {"block_size": 8, "rounds": 3}
+
+
 def _assert_givens_triton_engages(givens_cls: type) -> None:
     """Force ``MINGRU_SCAN=triton`` and run one tiny forward+backward
-    through a ``hetero-pg8``-config (``block_size=8, rounds=3``)
-    ``GivensMinGRU`` on CUDA.
+    through a ``hetero-pg8``-config (``_PGIVENS8_KWARGS``) ``GivensMinGRU``
+    on CUDA.
 
     The packaged scan dispatch raises if no usable Triton path exists under
     ``MINGRU_SCAN=triton`` (``src/mingru/min_gru.py``'s ``_dispatch_scan``)
@@ -235,7 +257,7 @@ def _assert_givens_triton_engages(givens_cls: type) -> None:
     of outcome.
     """
     with _scan_env("triton"):
-        mixer = givens_cls(64, 64, block_size=8, rounds=3).to("cuda")
+        mixer = givens_cls(64, 64, **_PGIVENS8_KWARGS).to("cuda")
         x = torch.randn(2, 8, 64, device="cuda", requires_grad=True)
         mixer(x).sum().backward()
 
@@ -291,10 +313,12 @@ def _env_block() -> dict[str, Any]:
         "cuda_device_name": torch.cuda.get_device_name(0),
         "device_capability": list(torch.cuda.get_device_capability(0)),
         "triton": triton_version,
-        # Fixed campaign backend contract (spec section 6), not "what this
-        # invocation's --arms subset happened to run" -- see module docstring.
-        "scan_mode_givens": "triton",
-        "compile_delta": True,
+        # Fixed campaign backend contract (spec section 6), derived from the
+        # full _ARMS matrix (module-level constants above), not from "what
+        # this invocation's --arms subset happened to run" -- see module
+        # docstring.
+        "scan_mode_givens": _GIVENS_SCAN_MODE,
+        "compile_delta": _ALL_DELTA_ARMS_COMPILE,
         "platform": platform.platform(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "git_commit": _git_commit(),

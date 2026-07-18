@@ -105,6 +105,40 @@ def test_delta_compile_probe_kwargs_match_hetero_lab_factories():
     assert pd1024_layer.d_v == probe_kwargs["d_v"]
 
 
+def test_givens_engagement_probe_config_matches_hetero_lab_factory():
+    """The pre-flight givens-triton engagement probe must build the exact
+    same ``GivensMinGRU`` shape the sg8 arm (``hetero-pg8``) trains on.
+    Introspects the REAL ``hetero_lab.LOCAL_FACTORIES["pgivens8"]``
+    construction -- the packaged ``GivensMinGRU`` stores the block size as
+    ``.k`` and the round count as ``.rounds`` (plain instance attributes,
+    see ``src/mingru/min_gru.py``'s ``GivensMinGRU.__init__``) -- the same
+    genuine-introspection standard as
+    ``test_delta_compile_probe_kwargs_match_hetero_lab_factories``, guarding
+    against the identical asymmetry: a second hardcoded dict transcription
+    in the test would stay green even if the probe's config and the
+    factory's actual config drifted apart from each other.
+    """
+    hetero_lab = gpu_hetero_campaign._import_hetero_lab()
+    d_in = d_h = 64
+
+    pgivens8_layer = hetero_lab.LOCAL_FACTORIES["pgivens8"](d_in, d_h)
+    probe_kwargs = gpu_hetero_campaign._PGIVENS8_KWARGS
+    assert pgivens8_layer.k == probe_kwargs["block_size"]
+    assert pgivens8_layer.rounds == probe_kwargs["rounds"]
+
+
+def test_env_block_backend_fields_derived_from_full_arm_matrix():
+    # scan_mode_givens/compile_delta must be derived from the fixed _ARMS
+    # matrix (design-review fix: these used to be independent hardcoded
+    # literals inside _env_block), and the derivation must land on the same
+    # values the MINGRU_LAB_ENV contract has always emitted.
+    assert gpu_hetero_campaign._GIVENS_SCAN_MODE == _ARM_BY_KEY["sg8"].scan_mode == "triton"
+    assert gpu_hetero_campaign._ALL_DELTA_ARMS_COMPILE is True
+    assert gpu_hetero_campaign._ALL_DELTA_ARMS_COMPILE == all(
+        _ARM_BY_KEY[k].compile for k in ("pd64", "pd1024")
+    )
+
+
 # --- _lab_args: the argparse.Namespace hetero_lab.run_arm consumes --------
 
 
