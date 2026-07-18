@@ -6,7 +6,7 @@ Both articles are grounded in the committed measured evidence. Every quantitativ
 
 ## Articles
 
-- [**The expressivity ladder**](expressivity-ladder.md) — why the parallel-scan discipline caps what these RNNs can track (the abelian ceiling and the illusion of state), what each rung of the ladder buys against it (fade, flip, turn, read), and what each rung measurably cannot do, including the length decay and the sequential delta-rule counterfactual.
+- [**The expressivity ladder**](expressivity-ladder.md) — why the parallel-scan discipline caps what these RNNs can track (the abelian ceiling and the illusion of state), what each rung of the ladder buys against it (fade, flip, turn, read), and what each rung measurably cannot do, including the length decay and the delta-rule comparison.
 - [**GivensMinGRU deep dive**](givens-mingru.md) — why the non-commutative rung of the ladder gets a richer per-token map, how the brick-wall Givens parameterization is built and why that specific mesh, what the `S3-hier` evidence does and does not demonstrate against diagonal-transition RNNs, the rounds ablation that separates map richness from block size, and the backward-pass design decision that rejected division-based reversal in favor of an exact $C=1$ stored-state recompute.
 - [**Triton scan kernels**](triton-scans.md) — why the four scan operations are one associative-scan family, how the kernels are laid out (one program per lane, a sequential-in-$T$ register prefix), the fp32-accumulation and TF32/IEEE precision story, the dispatch seam that keeps the kernels optional, and the measured speedups — including the honest rows where the Triton path is slower than eager.
 

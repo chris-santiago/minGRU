@@ -12,6 +12,7 @@ Ask what the running state has to *do*, then read across:
 | Flip sign on a running property (e.g. parity) | `SignedMinGRU` | `"signed"` | parity 0.994 @1024 (n=6) |
 | Track non-commutative ops where tokens *are* the ops | `RotationMinGRU` | `"rotation"` | S3 0.958 @1024 (n=8), 1 layer |
 | Compose a non-commutative op that must first be extracted | `SignedMinGRU` → `GivensMinGRU` | `["signed", "givens"]` | S3-hier fit 8/12 seeds |
+| Hold a large associative memory at ~1/16 the Givens scan's CPU step cost | `DeltaMinGRU` | `"delta"` | 0.0577s vs 0.9493s per step (pinned bench) |
 
 ## SignedMinGRU — sign-flipping state
 
@@ -51,6 +52,23 @@ model = MinGRUStack(
 ```
 
 On the hierarchical `S3-hier` probe, swapping the composer from a 2D rotation to `GivensMinGRU` raises the fit rate from **1 of 12 seeds to 8 of 12** (Fisher exact $p \approx 0.009$) at a matched 64-element per-token state. It is the recommended composer for extract-then-compose problems — see the [two-layer stacks tutorial](../tutorials/two-layer-stacks.md) for the full ordering evidence. Like the other continuous composers here, it still decays by $T{=}1024$ rather than forming an exact length-invariant attractor.
+
+## DeltaMinGRU — delta-rule memory, the cheap parallel path
+
+Reach for `"delta"` when you want a delta-rule associative memory (DeltaNet/DeltaProduct-style) or the cheapest measured training step. Unlike the other mixers, its per-token state is a per-head $d_k \times d_v$ *matrix* (capacity set by `n_heads`, `nh`, `d_k`, `d_v`, not by `d_model` alone), and its `forward` runs the chunked-WY parallel form of the recurrence. Under the pinned bench (`experiments/bench/delta_paths.md`; torch 2.5.1, the same machine as all recorded evidence), one uncontended forward+backward step at $B{=}128$, $T{=}64$ costs $0.0577$s against $0.9493$s for the eager `GivensMinGRU` scan — roughly $16\times$ cheaper on CPU, and still so at $T{=}1024$ ($1.4541$s against $24.9996$s).
+
+```python
+model = MinGRUStack(
+    input_size=6, d_model=64, n_layers=2, mixer=["signed", "delta"],
+    mixer_kwargs={"delta": {"n_heads": 4, "nh": 2}},
+)
+```
+
+Three caveats before you commit to it:
+
+- **No packaged-path fit campaign yet.** The `S3-hier` fit evidence for the delta rule comes from the lab's sequential implementation of the same function: $6/6$ seeds at full size — which carries $16\times$ the minGRU variants' per-token state — dropping to $4/12$ when shrunk to a matched 64-element state (against `GivensMinGRU`'s $8/12$, a suggestive $p \approx 0.22$). If matched-state fit reliability on extract-then-compose problems is what you need, prefer `"givens"`; on GPU, `"givens"` also carries the angle-fused Triton kernel, while no GPU comparison for `"delta"` has been measured.
+- **No time decay.** `DeltaMinGRU` rejects any `decay=` other than `None` with a `ValueError`.
+- **Different state contract.** `step` returns `(y_t, h_t)` — the readout is not the carried state — and the state is the flattened memory matrix; see the [API reference](../reference/mixers.md).
 
 ## When order matters, choose it from the task
 

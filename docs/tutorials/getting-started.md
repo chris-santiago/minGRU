@@ -145,5 +145,5 @@ You installed the package, verified a layer's shapes, and trained a two-layer `S
 
 - [Two-layer stacks](two-layer-stacks.md) — compose *different* mixers in the right order for hierarchical tasks.
 - [Triton on GPU](triton-on-gpu.md) — enable the Triton scan kernels and confirm they engage.
-- [Choose a mixer](../how-to/choose-a-mixer.md) — which of the four mixers fits your problem.
+- [Choose a mixer](../how-to/choose-a-mixer.md) — which of the five mixers fits your problem.
 - [Why the mixers differ](../explanation/index.md) — the state-tracking ideas behind the ladder.

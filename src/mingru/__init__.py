@@ -1,10 +1,11 @@
 """minGRU-scans: parallel-scan minGRU variants with an optional Triton backend.
 
-The eager library (the four mixers ``MinGRU``/``SignedMinGRU``/
-``RotationMinGRU``/``GivensMinGRU``, the ``MinGRUBlock``/``MinGRUStack``
-wrappers, and the four scan functions) is re-exported eagerly from
-:mod:`mingru.min_gru`. The Triton kernel surface (:mod:`mingru.triton_scans`)
-is exposed *lazily* via :pep:`562` module ``__getattr__``: ``import mingru``
+The eager library (the five mixers ``MinGRU``/``SignedMinGRU``/
+``RotationMinGRU``/``GivensMinGRU``/``DeltaMinGRU``, the
+``MinGRUBlock``/``MinGRUStack`` wrappers, and the four scan functions) is
+re-exported eagerly from :mod:`mingru.min_gru`. The Triton kernel surface
+(:mod:`mingru.triton_scans`) is exposed *lazily* via :pep:`562` module
+``__getattr__``: ``import mingru``
 never imports the Triton module, and only touching a Triton-backed name
 (e.g. ``mingru.ScanFallback``, ``mingru.angle_scan_impl``) triggers its
 import. This keeps ``import mingru`` working wherever the eager library works

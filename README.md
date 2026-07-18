@@ -95,8 +95,11 @@ though, like the other continuous composers here, it buys no attractor at
 length and still decays by T=1024. See "The hierarchical task: S3-hier,"
 below, for the task's construction and the full cross-mechanism evidence
 table, and "Givens variant" for the mechanism, the measured decay, and
-the design case — scoped to this repo's implementations — for choosing
-it over the sequential delta-rule composer.
+the design case for choosing it over the delta-rule composer
+(`DeltaMinGRU`, `mixer="delta"`): a case resting on fit reliability at
+matched state, not on speed or parallelism, since the delta composer's
+chunked-WY `forward` trains parallel over T at roughly 1/16 the eager
+Givens scan's CPU step cost (see "Measured CPU cost").
 
 Numbers below are multi-seed means (torch 2.5.1, CPU; seed counts stated
 per row). Protocol: seq2seq tagging (dense supervision), T_train=64,
@@ -200,10 +203,11 @@ the "vanilla" minGRU in the paper's Appendix A.
 | `SignedMinGRU` | signed diagonal transitions (linear-space scan, `a_t ∈ (−1,1)`, unconstrained states); `coupled=False` (default, decoupled eigenvalue) or `coupled=True` (legacy reproduction); same API; same time-decay kwargs as `MinGRU` |
 | `RotationMinGRU` | 2x2 block rotation transitions (non-diagonal, matrix scan); `snap` grid manufactures exact-angle attractors; depth is a measured tradeoff, not a fixed limit (see "Rotation variant"); same API; same time-decay kwargs, scaling the whole 2x2 block (direction unaffected) |
 | `GivensMinGRU` | k-dim block-rotation transitions (non-diagonal, `matrix_affine_scan`); each transition is a product of `rounds` brick-wall Givens layers per `block_size`-dim block, special-orthogonal and continuous (no snap) — richer per-token maps than `RotationMinGRU`'s 2x2 at the same per-token state (see "Givens variant"); same API; same time-decay kwargs, scaling the whole block by a scalar (rotation unaffected) |
+| `DeltaMinGRU` | DeltaNet/DeltaProduct delta-rule mixer (`mixer="delta"`): per-head `d_k×d_v` associative-memory matrix state updated by `nh` generalized-Householder rank-1 corrections per token (kwargs `n_heads`, `nh`, `d_k`, `d_v`); parallel chunked-WY `forward` (`chunk_size` is a performance-only knob — results invariant), sequential `step` returns `(y_t, h_t)` since readout ≠ state (`carries_matrix_state=True`); state flattened `(B, n_heads·d_k·d_v)`, zero-init (no learned `h_0`); time-decay unsupported: `decay=` must be `None` and any `delta_t` raises `ValueError` — see "Measured CPU cost" under "Givens variant" for the measured step cost |
 | `linear_scan` | Hillis–Steele associative scan for `h_t = a_t·h_{t−1} + b_t` with signed scalar coefficients |
 | `matrix_scan` | Hillis–Steele associative scan for `h_t = M_t @ h_{t−1} + b_t` with 2x2 matrix coefficients (non-commutative composition) |
 | `matrix_affine_scan` | Hillis–Steele associative scan for `h_t = M_t @ h_{t−1} + b_t` with k×k matrix coefficients (the `block_size` generalization of `matrix_scan`, used by `GivensMinGRU`) |
-| `MinGRUBlock` | pre-norm residual block: LN → mixer → +x, LN → MLP → +x (`mixer` selects `"log"`, `"signed"`, `"rotation"`, or `"givens"`; `mixer_kwargs` forwarded to its constructor); `forward`/`step` take an optional `delta_t`, forwarded to the block's mixer unchanged |
+| `MinGRUBlock` | pre-norm residual block: LN → mixer → +x, LN → MLP → +x (`mixer` selects `"log"`, `"signed"`, `"rotation"`, `"givens"`, or `"delta"`; `mixer_kwargs` forwarded to its constructor); `forward`/`step` take an optional `delta_t`, forwarded to the block's mixer unchanged |
 | `MinGRUStack` | input projection → N blocks → final LN; full state threading; `mixer=` is a `str` (applied to every block, unchanged) or a `list[str]` of length `n_layers` mixing types per block (e.g. one rotation block inside a signed/log stack); `mixer_kwargs` is the current flat dict for a `str` mixer, or `None`/a dict keyed by mixer type for a `list` mixer, applied to every block of that type (two blocks of the same type share one config); more than one `"rotation"` entry warns once per construction (STE-compounding, doesn't block construction) and proceeds, while multiple `"givens"` entries do **not** warn (the continuous Givens transition has no straight-through snap to compound); `decay_layers="all"` (default) or `"last"` selects which blocks receive the resolved kwargs' decay keys, positionally, whatever each block's type; `forward`/`step` take an optional `delta_t`, routed only to blocks whose mixer has decay enabled |
 
 `MinGRU` is deliberately atomic. A single layer's gates cannot condition on
@@ -435,7 +439,7 @@ and "Expressivity limits" below is the formal version of this picture.
   range is worth checking in a proxy run rather than assuming parity
   with a standard GRU. `SignedMinGRU` removes this constraint.
 - **Expressivity class.** Input-dependent, state-independent transitions
-  put all four mixers in the same broad class as Mamba/S6 and GLA:
+  put all five mixers in the same broad class as Mamba/S6 and GLA:
   fixed-depth stacks are TC⁰ (Merrill et al., *The Illusion of State in
   State-Space Models*) and cannot do unbounded state tracking that a
   single nonlinear GRU layer can. (Circuit-complexity shorthand used
@@ -1017,18 +1021,30 @@ shrunk to the same 64-element state (which fits 4 of 12 seeds), the
 comparison is parameter-unmatched (14,624 vs 3,306) and reads as
 suggestive only (p ≈ 0.22).
 
-**Measured CPU cost.** The parallel k×k scan is not the cheap path on CPU.
-Measured uncontended forward+backward at `B = 128, T = 64` (min of three
-runs), one training step costs 0.961s for the parallel-scan givens8
-transition against 0.179s for the sequential delta-rule path. The case for
-`GivensMinGRU` is keeping the composer inside this repo's parallel
-associative scan together with fit reliability and length generalization
-within the rotation family, not training-step speed: no parallel-scan
-configuration measured here beats the sequential delta path on CPU. Scope
-note: the delta rule itself is parallelizable in the literature (the
-DeltaNet chunked-WY representation, with released kernels) — sequentiality
-describes this repo's reimplementation, and no comparison against tuned
-parallel delta kernels has been measured here.
+**Measured CPU cost.** The parallel k×k scan is not the cheap path on
+CPU, and neither is any sequential loop: the cheap path is
+`DeltaMinGRU`'s chunked-WY `forward` (`mixer="delta"`), the DeltaNet
+literature's parallel form of the delta rule, implemented in this
+package. Under the pinned bench (`experiments/bench/delta_paths.md`;
+torch 2.5.1, the same machine as every number in this README), one
+uncontended forward+backward step at `B = 128, T = 64` (min of three
+runs) costs 0.0577s for the chunked-WY delta against 0.1617s for the
+sequential delta step-loop and 0.9493s for the parallel-scan givens8
+transition; the givens8 arm reproduces the recorded 0.961s within
+~1.2%, so these rows sit on the recorded evidence scale. At `T = 1024`
+the figures are 1.4541s / 19.9742s / 24.9996s. Two consequences:
+sequentiality is not what makes a delta path cheap (the chunked
+parallel form beats the sequential loop 2.80x at T=64 and 13.74x at
+T=1024), and the case for `GivensMinGRU` is fit reliability and length
+generalization within the rotation family, not training-step speed and
+not keeping the composer parallel — the delta composer trains parallel
+over T too, at roughly 1/16 the step cost. Caveats: the delta/givens
+timing is same-environment context, not a like-for-like comparison
+(different mechanism, different math); the S3-hier fit rates above come
+from the lab's sequential implementation of the same function (no
+trainability run of the packaged chunked path is recorded); and no
+comparison against the incumbents' released tuned kernels has been
+measured.
 
 Practical differences from the other mixers: 3 linear heads (theta, z, h)
 vs. `RotationMinGRU`'s 4 / `SignedMinGRU`'s 3 (mind parameter-matched
@@ -1049,7 +1065,10 @@ an optional per-event forgetting term so a gap between events shrinks
 whatever the recurrence was already going to keep, without touching
 how it injects new information. Available on `MinGRU`, `SignedMinGRU`,
 `RotationMinGRU`, and `GivensMinGRU` alike, and threaded through
-`MinGRUBlock` / `MinGRUStack`.
+`MinGRUBlock` / `MinGRUStack`. `DeltaMinGRU` is the exception: it
+accepts the decay kwargs for signature uniformity but rejects any
+`decay` other than `None` with a `ValueError` (folding per-token decay
+into the delta-rule composition is unimplemented).
 
 What follows works mechanism-first: the transition math and the
 `delta_t` contract below, then two experiments — a channel ablation
