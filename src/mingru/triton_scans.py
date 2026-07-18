@@ -64,6 +64,33 @@ use exact per-step recompute and no interval parameter exists to re-enable
 division-based reversal. Registered via `torch.library.register_autograd`
 like the four scan ops.
 
+DeltaMinGRU chunked-WY forward pair (Kernel 5, Kernel 6). `delta_scan_impl`
+drives two `@triton.jit` kernels implementing the two-stage WY decomposition
+of `DeltaMinGRU._forward_chunked` (the eager oracle). The unit-lower-
+triangular system `T = I + (K K^T (.) beta) (.) strict-lower` depends only
+on `K`/`beta`, never on the carried state `H`, so its solves parallelize
+across chunks: the pre-pass (`_delta_prepass_kernel`, Kernel 5, grid over
+`(batch*head, chunk)`) builds each chunk's `T` in registers and forward-
+substitutes it against the two H-independent right-hand sides, producing
+`T^-1 V` and `T^-1 K` for the whole sequence in one launch. The sequential
+pass (`_delta_sequential_kernel`, Kernel 6, grid over `(batch*head)`) then
+loops over chunks in-kernel carrying `H` (d_k x d_v fp32), forming
+`U = T^-1 V - (T^-1 K) H`, the block-causal masked readout `y = Q H +
+(Q K^T (.) beta (.) read_mask) U`, and the state update `H += K^T (beta
+U)`; it writes `y`, the per-chunk boundary states (`Hbound`, the start-of-
+chunk `H`), and the final `H_T`. Unlike the four scan ops and the angle-
+fused path, this pair is plain `@triton.jit` launched directly via
+`_delta_forward_launch` (not `triton_op`/`register_autograd`): the delta
+path's backward is a hand-derived `torch.autograd.Function` (a later task)
+built on `Hbound`, and its target user is eager-only, so the
+compile-tracing machinery the four scan ops use is deliberately not in this
+path. Every tile is padded to `max(16, next_pow2(...))`
+(`_delta_block_sizes`) so all `tl.dot`s route through
+`input_precision="ieee"` and stay bit-exact fp32, matching Kernel 5/6's
+`d_k == d_v`, fp32-only envelope (`_delta_validate_envelope`/
+`_delta_envelope_reason`), which is separate from the four-op envelope
+below but raises `ScanFallback` the same way.
+
 Envelope: k, v in {1, 2, 4, 8, 16}, any T >= 1 including non-power-of-two.
 Out-of-envelope shapes raise `ScanFallback`, which `min_gru._dispatch_scan`
 turns into a loud eager fallback under `auto` (and a raised error under
@@ -214,6 +241,186 @@ def parallel_scan_log_recompute(log_coeffs: torch.Tensor, log_values: torch.Tens
     a_star = F.pad(torch.cumsum(log_coeffs, dim=1), (0, 0, 1, 0))
     log_h = a_star + torch.logcumsumexp(log_values - a_star, dim=1)
     return torch.exp(log_h)[:, 1:]
+
+
+# --- DeltaMinGRU chunked-WY kernel envelope -----------------------------
+#
+# The delta path is its own envelope (distinct from the four scan ops'
+# ``_ENVELOPE`` above): the eager oracle is ``DeltaMinGRU._forward_chunked``,
+# whose per-head state is a ``d_k x d_v`` associative-memory matrix updated by
+# ``nh`` rank-1 corrections per token, processed ``chunk_size`` tokens at a
+# time through a unit-lower-triangular UT-transform solve. The kernel path
+# (two Triton kernels launched from ``_delta_forward_launch``) is gated to the
+# recorded probe-grid shapes. These constants and the pure-Python validators
+# below live OUTSIDE the ``if _HAS_TRITON:`` block (like
+# ``parallel_scan_log_recompute``) so the envelope reasons are importable and
+# unit-testable on a CPU-only/no-Triton install -- the reasons carry the whole
+# gate contract and must be checkable without a GPU.
+
+# Per-head key/query/value dimension: the WY solve tiles ``d_k`` exactly and
+# the readout/state contractions assume ``d_k == d_v``. Restricted to this set
+# (the probe grid) so every kernel contraction has all three matmul dims >= 16
+# after padding (see ``_delta_block_sizes``), keeping every ``tl.dot`` both
+# legal and bit-exact fp32 on the target arch.
+_DELTA_DK_ENVELOPE = frozenset({4, 8, 16, 32, 64})
+# Upper bound on ``chunk_size`` (tokens per UT-transform chunk).
+_DELTA_MAX_CHUNK_SIZE = 64
+# Upper bound on ``nh * chunk_size`` -- the micro-step count ``M`` of a full
+# chunk, which is the side length of the in-kernel triangular system ``T`` and
+# of the ``(M, M)`` shared-memory tile the pre-pass builds.
+_DELTA_MAX_MICROSTEPS = 128
+
+
+def _next_pow2(n: int) -> int:
+    """Smallest power of two ``>= n`` (``>= 1``). Pure Python; no Triton needed."""
+    if n <= 1:
+        return 1
+    return 1 << (n - 1).bit_length()
+
+
+def _delta_block_sizes(nh: int, chunk_size: int, d_k: int, d_v: int) -> tuple[int, int, int, int]:
+    """Constexpr tile sizes ``(BLOCK_M, BLOCK_C, BLOCK_K, BLOCK_V)`` for the delta kernels.
+
+    Every tile is padded to a power of two AND to a floor of 16. The floor
+    matters for correctness, not just occupancy: on the target arch a
+    Triton contraction auto-lowers to a tensor-core MMA (defaulting to
+    lossy TF32, or hard-crashing when a dim < 16) whenever both output free
+    dims are >= 16. Padding the micro-step axis ``M``, the token axis ``C``,
+    and the ``d_k``/``d_v`` axes all to >= 16 guarantees every kernel
+    ``tl.dot`` has all three matmul dims >= 16, so each is routed through an
+    explicit ``input_precision="ieee"`` dot that is bit-exact fp32 -- no
+    per-dim TF32/legality guard combinatorics are needed inside the kernels.
+    Padded rows/cols are masked to zero on load, so the widened contractions
+    contribute exactly zero and the result is identical to the unpadded math.
+
+    Pure Python (no Triton import), so it is callable for unit tests on a
+    CPU-only install.
+    """
+    block_m = max(16, _next_pow2(nh * chunk_size))
+    block_c = max(16, _next_pow2(chunk_size))
+    block_k = max(16, _next_pow2(d_k))
+    block_v = max(16, _next_pow2(d_v))
+    return block_m, block_c, block_k, block_v
+
+
+def _delta_envelope_reason(
+    *,
+    is_cuda: bool,
+    q_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    v_dtype: torch.dtype,
+    beta_dtype: torch.dtype,
+    h0_dtype: torch.dtype,
+    d_k: int,
+    d_v: int,
+    chunk_size: int,
+    nh: int,
+) -> str | None:
+    """Return a human-readable rejection reason, or ``None`` if in-envelope.
+
+    Operates on plain descriptors (not tensors), so every branch is
+    reachable from a CPU-only unit test by passing the descriptors that
+    satisfy the earlier checks (e.g. ``is_cuda=True`` with all five dtypes
+    ``float32`` and ``d_k==d_v`` to reach the ``d_k`` membership branch) --
+    the whole gate contract is testable without a GPU. Checks are ordered so
+    each violation yields one distinct string: non-CUDA, dtype (checked
+    across all five of ``Q``, ``K``, ``V``, ``beta``, ``H0``, in that order),
+    ``d_k != d_v``, ``d_k`` membership, ``chunk_size`` bound,
+    ``nh * chunk_size`` bound.
+    """
+    if not is_cuda:
+        return "DeltaMinGRU Triton kernel requires CUDA tensors (got a non-CUDA tensor)"
+    if q_dtype != torch.float32:
+        return f"DeltaMinGRU Triton kernel is fp32-only (got Q dtype {q_dtype})"
+    if k_dtype != torch.float32:
+        return f"DeltaMinGRU Triton kernel is fp32-only (got K dtype {k_dtype})"
+    if v_dtype != torch.float32:
+        return f"DeltaMinGRU Triton kernel is fp32-only (got V dtype {v_dtype})"
+    if beta_dtype != torch.float32:
+        return f"DeltaMinGRU Triton kernel is fp32-only (got beta dtype {beta_dtype})"
+    if h0_dtype != torch.float32:
+        return f"DeltaMinGRU Triton kernel is fp32-only (got H0 dtype {h0_dtype})"
+    if d_k != d_v:
+        return f"DeltaMinGRU Triton kernel requires d_k == d_v (got d_k={d_k}, d_v={d_v})"
+    if d_k not in _DELTA_DK_ENVELOPE:
+        return (
+            f"DeltaMinGRU Triton kernel d_k must be in {sorted(_DELTA_DK_ENVELOPE)} (got d_k={d_k})"
+        )
+    if chunk_size > _DELTA_MAX_CHUNK_SIZE:
+        return (
+            f"DeltaMinGRU Triton kernel chunk_size must be <= {_DELTA_MAX_CHUNK_SIZE} "
+            f"(got chunk_size={chunk_size})"
+        )
+    if nh * chunk_size > _DELTA_MAX_MICROSTEPS:
+        return (
+            "DeltaMinGRU Triton kernel requires nh * chunk_size <= "
+            f"{_DELTA_MAX_MICROSTEPS} (got nh={nh}, chunk_size={chunk_size}, "
+            f"product={nh * chunk_size})"
+        )
+    return None
+
+
+def _delta_validate_envelope(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    beta: torch.Tensor,
+    H0: torch.Tensor,
+    chunk_size: int,
+) -> None:
+    """Raise ``ScanFallback`` unless ``(Q, K, V, beta, H0)`` are kernel-eligible.
+
+    Guards the kernels' pointer arithmetic (rank + shape agreement of the
+    post-permute assemblies ``DeltaMinGRU._forward_chunked`` builds) before
+    delegating the value-envelope checks (CUDA/fp32/``d_k``/``chunk_size``/
+    ``nh``) to ``_delta_envelope_reason``. Every rejection carries a distinct
+    reason string. Pure torch/Python (no Triton), so ``min_gru``'s delta
+    dispatch seam only ever needs to catch ``ScanFallback`` and the reasons
+    are unit-testable without a GPU.
+
+    Expected layouts (spec section 6): ``Q`` ``(B, n_heads, T, d_k)``; ``K``
+    ``(B, n_heads, T, nh, d_k)``; ``V`` ``(B, n_heads, T, nh, d_v)``;
+    ``beta`` ``(B, n_heads, T, nh)``; ``H0`` ``(B, n_heads, d_k, d_v)``.
+    """
+    if Q.ndim != 4 or K.ndim != 5 or V.ndim != 5 or beta.ndim != 4 or H0.ndim != 4:
+        raise ScanFallback(
+            "DeltaMinGRU Triton kernel needs 4-D Q (B, n_heads, T, d_k), 5-D K "
+            "(B, n_heads, T, nh, d_k), 5-D V (B, n_heads, T, nh, d_v), 4-D beta "
+            "(B, n_heads, T, nh), and 4-D H0 (B, n_heads, d_k, d_v); got ranks "
+            f"Q={Q.ndim}, K={K.ndim}, V={V.ndim}, beta={beta.ndim}, H0={H0.ndim}"
+        )
+    B, n_heads, T, d_k = Q.shape
+    nh = K.shape[3]
+    d_v = V.shape[4]
+    if (
+        K.shape[:3] != (B, n_heads, T)
+        or K.shape[4] != d_k
+        or V.shape[:3] != (B, n_heads, T)
+        or V.shape[3] != nh
+        or tuple(beta.shape) != (B, n_heads, T, nh)
+        or tuple(H0.shape) != (B, n_heads, d_k, d_v)
+    ):
+        raise ScanFallback(
+            "DeltaMinGRU Triton kernel shapes disagree: from Q=(B, n_heads, T, "
+            f"d_k)={tuple(Q.shape)} expected K={(B, n_heads, T, nh, d_k)}, "
+            f"V={(B, n_heads, T, nh, d_v)}, beta={(B, n_heads, T, nh)}, "
+            f"H0={(B, n_heads, d_k, d_v)}; got K={tuple(K.shape)}, "
+            f"V={tuple(V.shape)}, beta={tuple(beta.shape)}, H0={tuple(H0.shape)}"
+        )
+    reason = _delta_envelope_reason(
+        is_cuda=Q.is_cuda and K.is_cuda and V.is_cuda and beta.is_cuda and H0.is_cuda,
+        q_dtype=Q.dtype,
+        k_dtype=K.dtype,
+        v_dtype=V.dtype,
+        beta_dtype=beta.dtype,
+        h0_dtype=H0.dtype,
+        d_k=d_k,
+        d_v=d_v,
+        chunk_size=chunk_size,
+        nh=nh,
+    )
+    if reason is not None:
+        raise ScanFallback(reason)
 
 
 # Populated below only when Triton is importable (see ``_HAS_TRITON``).
@@ -1440,6 +1647,396 @@ if _HAS_TRITON:
         except Exception as exc:  # kernel launch/compile failure -> loud fallback
             raise ScanFallback(f"angle-fused Triton kernel failed: {exc}") from exc
 
+    # --- DeltaMinGRU chunked-WY forward (two kernels) --------------------
+    #
+    # Two-stage WY decomposition of `DeltaMinGRU._forward_chunked` (the eager
+    # oracle). Exploits that the unit-lower-triangular system `T = I + (K K^T
+    # * beta) (.) strict-lower` depends only on `K`/`beta`, never on the
+    # carried state `H`, so its solves parallelize across chunks:
+    #
+    #   Pre-pass (_delta_prepass_kernel): grid over (batch*head, chunk). Each
+    #   program builds its chunk's `T` and forward-substitutes to the two
+    #   H-independent solve products `T^-1 V` and `T^-1 K`. One launch covers
+    #   the whole sequence.
+    #
+    #   Sequential pass (_delta_sequential_kernel): grid over (batch*head).
+    #   Each program loops over chunks carrying `H` (d_k x d_v fp32), forming
+    #   `U = T^-1 V - (T^-1 K) H`, the block-causal readout `y = Q H + (Q K^T
+    #   (.) beta (.) mask) U`, and the state update `H += K^T (beta U)`; it
+    #   writes `y`, the per-chunk boundary states (the start-of-chunk `H`, for
+    #   the Task-2 recompute backward), and the final `H_T`.
+    #
+    # Both are plain `@triton.jit` kernels launched directly (not
+    # `triton_op`/`register_autograd`): the delta path is differentiated by a
+    # hand-derived `torch.autograd.Function` (Task 2), and its target user is
+    # eager-only ("compiling isn't always an option"), so the compile-tracing
+    # machinery the four scan ops use is deliberately not in this path. The
+    # raw launch (`_delta_forward_launch`) is factored apart from the envelope
+    # validation so the autograd Function can call it directly (it also needs
+    # the boundary states `delta_scan_impl` drops).
+    #
+    # Every contraction uses `input_precision="ieee"` and all three matmul
+    # dims are >= 16 by construction (see `_delta_block_sizes`), so no per-dim
+    # TF32/legality guard is needed -- unlike the generic affine kernels,
+    # whose small `k`/`v` cases must branch between `tl.dot` and the
+    # elementwise-sum idiom. fp32 throughout; the only division is the
+    # implicit unit diagonal of the triangular substitution (the repo's one
+    # permitted division), matching the eager `solve_triangular(...,
+    # unitriangular=True)`.
+
+    @triton.jit
+    def _delta_prepass_kernel(
+        K_ptr,
+        V_ptr,
+        beta_ptr,
+        TinvV_ptr,
+        TinvK_ptr,
+        T,
+        nh,
+        chunk_size,
+        d_k: tl.constexpr,
+        d_v: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        BLOCK_V: tl.constexpr,
+    ):
+        """Pre-pass: per (batch*head, chunk), build ``T`` and solve ``T^-1 V``, ``T^-1 K``.
+
+        One program owns a single chunk of a single ``(batch, head)`` lane.
+        The chunk's ``M = nh * C`` micro-steps (``C`` tokens, token-major /
+        micro-step-minor) are the contiguous block ``[start_tok*nh :
+        start_tok*nh + M)`` of the flattened ``(T*nh, d)`` view of ``K``/``V``
+        -- the same reshape convention ``_forward_chunked`` uses. Builds the
+        unit-lower-triangular ``T[i, l] = 1{i==l} + (k_i . k_l) beta_l
+        1{l<i}`` in registers, then forward-substitutes both right-hand sides
+        (``V`` and ``K``) row by row. Padded rows (``m >= M``) load as zero
+        and get an identity ``T`` row, so their solution is zero and never
+        corrupts the real rows. Writes ``T^-1 V`` and ``T^-1 K`` back into the
+        ``V``/``K``-shaped output tensors at the same chunk offset.
+        """
+        bh = tl.program_id(0)
+        c = tl.program_id(1)
+
+        start_tok = c * chunk_size
+        rem = T - start_tok
+        C = tl.where(rem < chunk_size, rem, chunk_size)  # ragged final chunk
+        M = nh * C
+        row0 = start_tok * nh  # first micro-step row in the (T*nh, d) view
+
+        m = tl.arange(0, BLOCK_M)
+        kk = tl.arange(0, BLOCK_K)
+        vv = tl.arange(0, BLOCK_V)
+        row_valid = m < M
+        kcol = kk < d_k
+        vcol = vv < d_v
+
+        K_base = bh * (T * nh * d_k) + row0 * d_k
+        V_base = bh * (T * nh * d_v) + row0 * d_v
+        beta_base = bh * (T * nh) + row0
+
+        Ktile = tl.load(
+            K_ptr + K_base + m[:, None] * d_k + kk[None, :],
+            mask=row_valid[:, None] & kcol[None, :],
+            other=0.0,
+        ).to(tl.float32)  # (BLOCK_M, BLOCK_K)
+        Vtile = tl.load(
+            V_ptr + V_base + m[:, None] * d_v + vv[None, :],
+            mask=row_valid[:, None] & vcol[None, :],
+            other=0.0,
+        ).to(tl.float32)  # (BLOCK_M, BLOCK_V)
+        beta_tile = tl.load(beta_ptr + beta_base + m, mask=row_valid, other=0.0).to(tl.float32)
+
+        # T = I + (K K^T) (.) beta_l (.) strict-lower. K K^T is MMA-shaped
+        # (all dims >= 16 after padding) -> exact ieee dot.
+        KK = tl.dot(Ktile, tl.trans(Ktile), input_precision="ieee")  # (BLOCK_M, BLOCK_M)
+        strict = (m[:, None] > m[None, :]).to(tl.float32)
+        eye = (m[:, None] == m[None, :]).to(tl.float32)
+        Tmat = eye + KK * beta_tile[None, :] * strict
+
+        # Forward substitution (unit lower triangular): for real row i,
+        # x_i = rhs_i - sum_{l<i} T[i, l] x_l. Summing T[i, :] @ X over ALL
+        # rows is equivalent -- T[i, i]=1 hits the not-yet-written zero row i,
+        # and T[i, l]=0 for l>i -- so no strict-lower re-masking is needed.
+        XV = tl.zeros((BLOCK_M, BLOCK_V), dtype=tl.float32)
+        XK = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+        for i in range(M):
+            sel = m == i
+            T_row = tl.sum(tl.where(sel[:, None], Tmat, 0.0), axis=0)  # (BLOCK_M,)
+            rhs_v = tl.sum(tl.where(sel[:, None], Vtile, 0.0), axis=0)  # (BLOCK_V,)
+            rhs_k = tl.sum(tl.where(sel[:, None], Ktile, 0.0), axis=0)  # (BLOCK_K,)
+            xv = rhs_v - tl.sum(T_row[:, None] * XV, axis=0)
+            xk = rhs_k - tl.sum(T_row[:, None] * XK, axis=0)
+            XV = tl.where(sel[:, None], xv[None, :], XV)
+            XK = tl.where(sel[:, None], xk[None, :], XK)
+
+        tl.store(
+            TinvV_ptr + V_base + m[:, None] * d_v + vv[None, :],
+            XV,
+            mask=row_valid[:, None] & vcol[None, :],
+        )
+        tl.store(
+            TinvK_ptr + K_base + m[:, None] * d_k + kk[None, :],
+            XK,
+            mask=row_valid[:, None] & kcol[None, :],
+        )
+
+    @triton.jit
+    def _delta_sequential_kernel(
+        Q_ptr,
+        K_ptr,
+        beta_ptr,
+        TinvV_ptr,
+        TinvK_ptr,
+        H0_ptr,
+        y_ptr,
+        Hbound_ptr,
+        HT_ptr,
+        T,
+        nh,
+        num_chunks,
+        chunk_size,
+        d_k: tl.constexpr,
+        d_v: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_C: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        BLOCK_V: tl.constexpr,
+    ):
+        """Sequential pass: per (batch*head), loop chunks carrying ``H``.
+
+        One program owns a ``(batch, head)`` lane and walks chunks
+        ``0..num_chunks-1``, carrying the ``d_k x d_v`` state ``H`` (seeded
+        from ``H0``). Per chunk, using the pre-pass products ``T^-1 V`` /
+        ``T^-1 K``: ``U = T^-1 V - (T^-1 K) H``; the block-causal readout
+        ``y = Q H + (Q K^T (.) beta (.) read_mask) U`` (``read_mask[t, m] =
+        1{token(m) <= t}``, token-granularity, inclusive of a token's own
+        ``nh`` micro-steps); and the state update ``H += K^T (beta U)``. It
+        stores the start-of-chunk ``H`` as the chunk's boundary state (for the
+        Task-2 recompute backward) BEFORE updating, ``y`` for the chunk's
+        tokens, and the final ``H_T`` after the loop. Padded rows/cols load as
+        zero and never contribute to the contractions or to stored outputs.
+        """
+        bh = tl.program_id(0)
+
+        m = tl.arange(0, BLOCK_M)
+        cc = tl.arange(0, BLOCK_C)
+        kk = tl.arange(0, BLOCK_K)
+        vv = tl.arange(0, BLOCK_V)
+        kcol = kk < d_k
+        vcol = vv < d_v
+
+        H0_base = bh * (d_k * d_v)
+        H = tl.load(
+            H0_ptr + H0_base + kk[:, None] * d_v + vv[None, :],
+            mask=kcol[:, None] & vcol[None, :],
+            other=0.0,
+        ).to(tl.float32)  # (BLOCK_K, BLOCK_V)
+
+        for c in range(num_chunks):
+            start_tok = c * chunk_size
+            rem = T - start_tok
+            C = tl.where(rem < chunk_size, rem, chunk_size)
+            M = nh * C
+            row0 = start_tok * nh
+
+            row_valid = m < M
+            tok_valid = cc < C
+
+            K_base = bh * (T * nh * d_k) + row0 * d_k
+            V_base = bh * (T * nh * d_v) + row0 * d_v
+            beta_base = bh * (T * nh) + row0
+            Q_base = bh * (T * d_k) + start_tok * d_k
+            y_base = bh * (T * d_v) + start_tok * d_v
+            Hb_base = bh * (num_chunks * d_k * d_v) + c * (d_k * d_v)
+
+            # Boundary state = start-of-chunk H (chunk 0's is H0), stored
+            # before the update for the reverse-chunk backward.
+            tl.store(
+                Hbound_ptr + Hb_base + kk[:, None] * d_v + vv[None, :],
+                H,
+                mask=kcol[:, None] & vcol[None, :],
+            )
+
+            Ktile = tl.load(
+                K_ptr + K_base + m[:, None] * d_k + kk[None, :],
+                mask=row_valid[:, None] & kcol[None, :],
+                other=0.0,
+            ).to(tl.float32)  # (BLOCK_M, BLOCK_K)
+            TinvK = tl.load(
+                TinvK_ptr + K_base + m[:, None] * d_k + kk[None, :],
+                mask=row_valid[:, None] & kcol[None, :],
+                other=0.0,
+            ).to(tl.float32)  # (BLOCK_M, BLOCK_K)
+            TinvV = tl.load(
+                TinvV_ptr + V_base + m[:, None] * d_v + vv[None, :],
+                mask=row_valid[:, None] & vcol[None, :],
+                other=0.0,
+            ).to(tl.float32)  # (BLOCK_M, BLOCK_V)
+            beta_tile = tl.load(beta_ptr + beta_base + m, mask=row_valid, other=0.0).to(tl.float32)
+            Qtile = tl.load(
+                Q_ptr + Q_base + cc[:, None] * d_k + kk[None, :],
+                mask=tok_valid[:, None] & kcol[None, :],
+                other=0.0,
+            ).to(tl.float32)  # (BLOCK_C, BLOCK_K)
+
+            # U = T^-1 V - (T^-1 K) H
+            U = TinvV - tl.dot(TinvK, H, input_precision="ieee")  # (BLOCK_M, BLOCK_V)
+
+            # Block-causal masked readout. read_mask[t, m] = 1 iff the token
+            # owning micro-step m (m // nh) is <= t; padded rows/cols zeroed.
+            R = tl.dot(Qtile, tl.trans(Ktile), input_precision="ieee")  # (BLOCK_C, BLOCK_M)
+            tok_of_m = m // nh
+            read_mask = (
+                (tok_of_m[None, :] <= cc[:, None]) & row_valid[None, :] & tok_valid[:, None]
+            ).to(tl.float32)  # (BLOCK_C, BLOCK_M)
+            masked = R * beta_tile[None, :] * read_mask
+            y = tl.dot(Qtile, H, input_precision="ieee") + tl.dot(
+                masked, U, input_precision="ieee"
+            )  # (BLOCK_C, BLOCK_V)
+            tl.store(
+                y_ptr + y_base + cc[:, None] * d_v + vv[None, :],
+                y,
+                mask=tok_valid[:, None] & vcol[None, :],
+            )
+
+            # H += K^T (beta U)
+            bU = beta_tile[:, None] * U  # (BLOCK_M, BLOCK_V)
+            H = H + tl.dot(tl.trans(Ktile), bU, input_precision="ieee")  # (BLOCK_K, BLOCK_V)
+
+        tl.store(
+            HT_ptr + H0_base + kk[:, None] * d_v + vv[None, :],
+            H,
+            mask=kcol[:, None] & vcol[None, :],
+        )
+
+    def _delta_forward_launch(
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        beta: torch.Tensor,
+        H0: torch.Tensor,
+        chunk_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Raw two-kernel forward launch (no envelope validation).
+
+        Assumes the inputs are already in-envelope (the caller --
+        ``delta_scan_impl`` or the Task-2 ``autograd.Function`` -- validates
+        first via ``_delta_validate_envelope``). Factored apart from that
+        validation so the autograd Function can reuse the exact launch without
+        rewrite; it returns the boundary states the recompute backward needs
+        in addition to the public ``(y, H_T)`` pair.
+
+        Parameters mirror spec section 6: ``Q`` ``(B, n_heads, T, d_k)``;
+        ``K`` ``(B, n_heads, T, nh, d_k)``; ``V`` ``(B, n_heads, T, nh,
+        d_v)``; ``beta`` ``(B, n_heads, T, nh)``; ``H0`` ``(B, n_heads, d_k,
+        d_v)``.
+
+        Returns
+        -------
+        tuple of torch.Tensor
+            ``y`` ``(B, n_heads, T, d_v)``; ``H_T`` ``(B, n_heads, d_k,
+            d_v)``; ``Hbound`` ``(B, n_heads, num_chunks, d_k, d_v)`` -- the
+            start-of-chunk states (chunk 0's is ``H0``).
+        """
+        Q = Q.contiguous()
+        K = K.contiguous()
+        V = V.contiguous()
+        beta = beta.contiguous()
+        H0 = H0.contiguous()
+
+        B, n_heads, T, d_k = Q.shape
+        nh = K.shape[3]
+        d_v = V.shape[4]
+        bh = B * n_heads
+        num_chunks = triton.cdiv(T, chunk_size)
+        block_m, block_c, block_k, block_v = _delta_block_sizes(nh, chunk_size, d_k, d_v)
+
+        # Pre-pass: T^-1 V / T^-1 K, laid out exactly like V / K so the
+        # sequential pass reads each chunk at the same offset.
+        TinvV = torch.empty_like(V)
+        TinvK = torch.empty_like(K)
+        _delta_prepass_kernel[(bh, num_chunks)](
+            K,
+            V,
+            beta,
+            TinvV,
+            TinvK,
+            T,
+            nh,
+            chunk_size,
+            d_k,
+            d_v,
+            block_m,
+            block_k,
+            block_v,
+        )
+
+        y = torch.empty(B, n_heads, T, d_v, device=Q.device, dtype=torch.float32)
+        Hbound = torch.empty(B, n_heads, num_chunks, d_k, d_v, device=Q.device, dtype=torch.float32)
+        H_T = torch.empty(B, n_heads, d_k, d_v, device=Q.device, dtype=torch.float32)
+        _delta_sequential_kernel[(bh,)](
+            Q,
+            K,
+            beta,
+            TinvV,
+            TinvK,
+            H0,
+            y,
+            Hbound,
+            H_T,
+            T,
+            nh,
+            num_chunks,
+            chunk_size,
+            d_k,
+            d_v,
+            block_m,
+            block_c,
+            block_k,
+            block_v,
+        )
+        return y, H_T, Hbound
+
+    def delta_scan_impl(
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        beta: torch.Tensor,
+        H0: torch.Tensor,
+        *,
+        chunk_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Envelope-guarded entry point for the DeltaMinGRU chunked-WY kernel.
+
+        Mirrors ``angle_scan_impl``: validates the envelope (raising
+        ``ScanFallback`` with a distinct per-violation reason) and funnels any
+        launch/compile failure into ``ScanFallback`` too, so
+        ``min_gru``'s delta dispatch seam (Task 3) only ever catches that one
+        exception type. Not a ``SCAN_IMPLS`` entry (the delta path is a
+        module-forward fast path, not one of the four scan ops); discovered by
+        ``hasattr(triton_scans, "delta_scan_impl")``, exactly like
+        ``angle_scan_impl``.
+
+        Parameters (spec section 6): ``Q`` ``(B, n_heads, T, d_k)``; ``K``
+        ``(B, n_heads, T, nh, d_k)``; ``V`` ``(B, n_heads, T, nh, d_v)``;
+        ``beta`` ``(B, n_heads, T, nh)``; ``H0`` ``(B, n_heads, d_k, d_v)`` --
+        the eager ``_forward_chunked`` post-permute assemblies. ``chunk_size``
+        is keyword-only (self-documenting at the call site).
+
+        Returns
+        -------
+        tuple of torch.Tensor
+            ``y`` ``(B, n_heads, T, d_v)`` and ``H_T`` ``(B, n_heads, d_k,
+            d_v)``. The caller owns the final ``(B, T, n_heads, d_v)`` restore
+            and ``out_proj``.
+        """
+        _delta_validate_envelope(Q, K, V, beta, H0, chunk_size)
+        try:
+            y, H_T, _Hbound = _delta_forward_launch(Q, K, V, beta, H0, chunk_size)
+        except Exception as exc:  # kernel launch/compile failure -> loud fallback
+            raise ScanFallback(f"DeltaMinGRU Triton kernel failed: {exc}") from exc
+        return y, H_T
+
     def _linear_scan_impl(a: torch.Tensor, b: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """SCAN_IMPLS entry for ``linear_scan`` (k = v = 1, always in envelope).
 
@@ -1597,6 +2194,7 @@ __all__ = ["available", "ScanFallback", "SCAN_IMPLS"]
 if _HAS_TRITON:
     __all__ += [
         "angle_scan_impl",
+        "delta_scan_impl",
         "affine_scan_fwd",
         "linear_scan_fwd",
         "parallel_scan_log_fwd",
