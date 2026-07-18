@@ -47,7 +47,7 @@ nav = [
     { "Explanation" = [
         { "Overview"                    = "explanation/index.md" },
         { "Expressivity and the ladder" = "explanation/expressivity-ladder.md" },
-        { "GivensMinGRU deep dive"      = "explanation/givens-mingru.md" },
+        { "Givens & Delta deep dive"    = "explanation/givens-delta.md" },
         { "Triton scan kernels"         = "explanation/triton-scans.md" },
     ] },
 

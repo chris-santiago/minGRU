@@ -2,7 +2,7 @@
 
 Reproduces, as a committed artifact, the design-phase measurement that led to
 rejecting the division-based reversible backward for the rotation-family
-mixers (see docs/explanation/givens-mingru.md and the kernels design ledger):
+mixers (see docs/explanation/givens-delta.md and the kernels design ledger):
 reconstructing hidden states backward through a decayed recurrence by
 dividing out the per-step decay amplifies fp32 rounding error like
 sigma_min^(-chunklen), where sigma_min is the smallest decay factor crossed

@@ -6,17 +6,20 @@ layer whose gates depend only on the current input, so the whole sequence
 trains in one parallel scan instead of step-by-step backpropagation through
 time (BPTT). The library is the `mingru` package (pip name `mingru-scans`); pure PyTorch, no dependencies beyond `torch`.
 
-This repo ships the base minGRU plus three variants that each fix a specific
+This repo ships the base minGRU plus four variants that each fix a specific
 gap in it: **`SignedMinGRU`** (state can flip sign, not just decay toward
 zero), **`RotationMinGRU`** (state can track operations that don't
-commute, like composing permutations), and **`GivensMinGRU`** (richer
+commute, like composing permutations), **`GivensMinGRU`** (richer
 non-commuting state via rotations across 8-dimensional blocks instead of
-2D planes). All four share one `mixer=`
-interface on `MinGRUBlock`/`MinGRUStack`, and all four optionally accept
-a time-aware decay term for irregularly-spaced sequences — a real-world
-gap between events, not just a token count (see "Time-aware decay,"
-below). What each variant actually buys you, in measured accuracy, is
-below.
+2D planes), and **`DeltaMinGRU`** (a per-head matrix associative memory
+updated by the delta rule — the most reliably trainable composer measured,
+and the recommended default when per-token state is free to grow). All
+five share one `mixer=` interface on `MinGRUBlock`/`MinGRUStack`, and all
+but `DeltaMinGRU` optionally accept a time-aware decay term for
+irregularly-spaced sequences — a real-world gap between events, not just
+a token count (see "Time-aware decay," below; `DeltaMinGRU` rejects
+`decay` by contract). What each variant actually buys you, in measured
+accuracy, is below.
 
 ## Install
 
@@ -35,13 +38,13 @@ x = torch.randn(4, 10, 32)
 y, state = stack(x)   # (B, T, 32) -> (B, T, 256), per-block states
 ```
 
-The optional Triton scan backend is imported lazily on first use of a Triton-backed symbol, so `import mingru` works on CPU-only installs; the `MINGRU_SCAN` control and GPU path are documented on the docs site. On Linux the default PyPI torch bundles the matching Triton automatically; if your CUDA-capable torch came without it (`mingru.available()` reports this), `pip install "mingru-scans[triton]"` is an unpinned fallback. Full documentation, including the GivensGRU and Triton-scans deep dives, lives at <https://chris-santiago.github.io/minGRU/>.
+The optional Triton scan backend is imported lazily on first use of a Triton-backed symbol, so `import mingru` works on CPU-only installs; the `MINGRU_SCAN` control and GPU path are documented on the docs site. On Linux the default PyPI torch bundles the matching Triton automatically; if your CUDA-capable torch came without it (`mingru.available()` reports this), `pip install "mingru-scans[triton]"` is an unpinned fallback. Full documentation, including the Givens & Delta composer deep dive and the Triton-scans deep dive, lives at <https://chris-santiago.github.io/minGRU/>.
 
 ## GPU acceleration (fused Triton kernels)
 
 An optional Triton backend supplies fused forward+backward GPU kernels for all four scan primitives (`linear_scan`, `matrix_scan`, `matrix_affine_scan`, `parallel_scan_log`) plus an angle-fused rotation path for `GivensMinGRU`. It sits behind a zero-config dispatch seam set by `MINGRU_SCAN`: `auto` (default: use Triton when a CUDA GPU and a working Triton install are present, else the pure-PyTorch eager path), `eager`, or `triton` (force it). CPU-only installs never import Triton.
 
-The win is concentrated in the matrix/block ops. Measured on an NVIDIA L4 (torch 2.8.0+cu128, Triton 3.4.0), forward+backward the Triton kernels run 39x–168x faster than eager on `matrix_scan`/`matrix_affine_scan`, and the angle-fused `GivensMinGRU` backward cuts peak memory from 395 MB to 38 MB. The log-space `parallel_scan_log` is the exception. Its recompute-in-backward kernel is 0.70x–0.80x *slower* than eager forward+backward, so eager stays the right default for the baseline `MinGRU`/`SignedMinGRU` mixers. All 590 CPU-vs-GPU parity checks pass. Kernel design and the full benchmark tables are in the [Triton scan kernels explanation](https://chris-santiago.github.io/minGRU/explanation/triton-scans/) and `experiments/bench/` (`scan_bench.md`, `scan_memory.md`, `scan_parity.md`).
+The win is concentrated in the matrix/block ops. Measured on an NVIDIA L4 (torch 2.8.0+cu128, Triton 3.4.0), forward+backward the Triton kernels run 39x–168x faster than eager on `matrix_scan`/`matrix_affine_scan`, and the angle-fused `GivensMinGRU` backward cuts peak memory from 395 MB to 38 MB. The log-space `parallel_scan_log` is the exception. Its recompute-in-backward kernel is 0.70x–0.80x *slower* than eager forward+backward, so eager stays the right default for the baseline `MinGRU`/`SignedMinGRU` mixers. All 590 CPU-vs-GPU parity checks pass. `DeltaMinGRU`'s chunked-WY `forward` is not one of these scan ops and has no hand-written Triton kernel: a separate GPU probe found `torch.compile` already recovers 70–91% of its available fusion headroom, so `torch.compile` — not this Triton backend — is the recommended CUDA path for `mixer="delta"` (see "Givens variant," below). Kernel design and the full benchmark tables are in the [Triton scan kernels explanation](https://chris-santiago.github.io/minGRU/explanation/triton-scans/) and `experiments/bench/` (`scan_bench.md`, `scan_memory.md`, `scan_parity.md`).
 
 ## What this shows
 
@@ -95,11 +98,19 @@ though, like the other continuous composers here, it buys no attractor at
 length and still decays by T=1024. See "The hierarchical task: S3-hier,"
 below, for the task's construction and the full cross-mechanism evidence
 table, and "Givens variant" for the mechanism, the measured decay, and
-the design case for choosing it over the delta-rule composer
-(`DeltaMinGRU`, `mixer="delta"`): a case resting on fit reliability at
-matched state, not on speed or parallelism, since the delta composer's
-chunked-WY `forward` trains parallel over T at roughly 1/16 the eager
-Givens scan's CPU step cost (see "Measured CPU cost").
+the fuller two-axis picture against the delta-rule composer
+(`DeltaMinGRU`, `mixer="delta"`). That picture has since resolved into a
+recommendation conditioned on two axes rather than a single winner:
+**state free to grow → `mixer="delta"` at native state is the promoted
+default** (the most reliable trained composer measured, on both CPU and
+GPU, with cost and memory that stay flat as state grows — see "Measured
+CPU cost" under "Givens variant"), while **state that must stay small (a
+matched 64-element budget) → `GivensMinGRU` remains decisively more
+reliable**, and its small-state fit cohort also extrapolates further at
+extreme lengths than the full-state delta cohort does. Full evidence for
+both branches is in "Givens variant," below, and at the docs site's
+[Choose a mixer](https://chris-santiago.github.io/minGRU/how-to/choose-a-mixer/#the-two-axis-guidance)
+guide.
 
 Numbers below are multi-seed means (torch 2.5.1, CPU; seed counts stated
 per row). Protocol: seq2seq tagging (dense supervision), T_train=64,
@@ -1032,19 +1043,61 @@ runs) costs 0.0577s for the chunked-WY delta against 0.1617s for the
 sequential delta step-loop and 0.9493s for the parallel-scan givens8
 transition; the givens8 arm reproduces the recorded 0.961s within
 ~1.2%, so these rows sit on the recorded evidence scale. At `T = 1024`
-the figures are 1.4541s / 19.9742s / 24.9996s. Two consequences:
-sequentiality is not what makes a delta path cheap (the chunked
-parallel form beats the sequential loop 2.80x at T=64 and 13.74x at
-T=1024), and the case for `GivensMinGRU` is fit reliability and length
-generalization within the rotation family, not training-step speed and
-not keeping the composer parallel — the delta composer trains parallel
-over T too, at roughly 1/16 the step cost. Caveats: the delta/givens
-timing is same-environment context, not a like-for-like comparison
-(different mechanism, different math); the S3-hier fit rates above come
-from the lab's sequential implementation of the same function (no
-trainability run of the packaged chunked path is recorded); and no
+the figures are 1.4541s / 19.9742s / 24.9996s. Sequentiality is not what
+makes a delta path cheap (the chunked parallel form beats the sequential
+loop 2.80x at T=64 and 13.74x at T=1024) — the chunked-WY transform is
+what does. Delta's per-token state is also a capacity knob independent
+of `d_model`, and cost/memory stay nearly flat as that state grows: a
+mechanism × state scaling probe (`experiments/bench/scaling_frontier.md`,
+same pin) measures delta at 0.050s/419 MiB at state 64 rising only to
+0.077s/676 MiB at state 4096, while `GivensMinGRU` climbs from
+0.984s/887 MiB at state 64 to 70.6s/20.0 GiB at state 4096.
+
+**Packaged-mixer trainability: two rounds close the earlier open
+caveat.** An older note here read "no trainability run of the packaged
+chunked path is recorded"; two later rounds close that gap for the
+shipped `DeltaMinGRU`. A matched-state CPU round (`hetero-loop-20-pd64`,
+`hetero-loop-21-pd1024`, torch 2.5.1, 12 seeds/arm, `S3-hier`,
+best-val@128) trained the packaged mixer directly (bridge-verified
+`state_dict`-compatible with the lab's oracle, forward parity
+≤2.7e-6) and found: givens@64 8/12 fits, delta@64-matched 4/12, delta@1024
+12/12 — neither matched-state contrast reaches significance at n=12
+(Fisher p=0.22 and p=0.09), but delta@1024 fits every seed at 1/16 the
+per-step cost and 0.57x the memory of givens@64. A 36-seed GPU campaign
+(`hetero-gpu36-sg8`/`pd64`/`pd1024`; torch 2.8.0+cu128, NVIDIA L4, triton
+3.4.0 — a separate stratum, never comparable to the CPU rows above)
+resolves the matched-state tie at larger sample size: givens@64 25/36 vs
+delta@64 10/36 (Fisher p=0.00084), while delta@1024 reaches 35/36 (vs
+givens@64, p=0.0030). Per-seed GPU wall time is parity across all three
+arms (~15-18s) — Givens' Triton scan path erases the CPU-side 16x cost
+gap, so the GPU story is about reliability and state economics, not
+speed. Fit-only length generalization at 16x train length stays small-
+state-favoring on GPU too: givens 0.679, delta@64-matched 0.699, both
+ahead of delta@1024's 0.570.
+
+**The resulting recommendation is conditioned on two axes, not one
+winner.** State free to grow → `mixer="delta"` at native state: the most
+reliable composer measured on either stratum (12/12 CPU, 35/36 GPU), flat
+cost in state size. State that must stay small (a matched 64-element
+budget) → `GivensMinGRU`: decisively more reliable at that budget on the
+stratum with the power to show it, and its small-state fit cohort
+extrapolates further at extreme length than the full-state delta cohort.
+Do not read delta@64's low pooled accuracy as "delta is less accurate" —
+its trained models generalize like Givens' when they fit (matched-state
+fit-only 0.721 delta vs 0.733 givens at T=1024); the low pooled mean is a
+fit-rate artifact. Delta@1024 is in fact the most accurate arm at or near
+training length on both strata (CPU: 1.000@64/0.988@256; GPU:
+0.984@64/0.971@256) and only trails on the long-extrapolation tail. On
+GPU, delta's own path is `torch.compile`, not a hand-written kernel: a
+fusion-headroom probe (`experiments/bench/gpu_delta_probe.md`) found
+compile already recovers 70-91% of available headroom, so a Triton
+chunked-WY kernel was judged not worth building. Remaining caveat: no
 comparison against the incumbents' released tuned kernels has been
-measured.
+measured. Full mechanism, tables, and Fisher statistics for both
+composers are at the docs site's
+[Givens & Delta deep dive](https://chris-santiago.github.io/minGRU/explanation/givens-delta/)
+and in `experiments/EXPERIMENTS.md` (rounds `hetero-loop-20-pd64`,
+`hetero-loop-21-pd1024`, `hetero-gpu36-*`).
 
 Practical differences from the other mixers: 3 linear heads (theta, z, h)
 vs. `RotationMinGRU`'s 4 / `SignedMinGRU`'s 3 (mind parameter-matched

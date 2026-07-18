@@ -1,6 +1,6 @@
 # Two-layer stacks
 
-A single mixer tracks one kind of state. Hard sequence problems are often *hierarchical*: something has to be **extracted** from the raw input before the running quantity can be **composed**. `MinGRUStack` lets you assign a different mixer to each layer, so you can put an extractor underneath a composer. This tutorial builds the recommended stack for the repo's hierarchical probe — a `SignedMinGRU` extractor feeding a `GivensMinGRU` composer — and shows why that order, and that pairing, is the one to reach for.
+A single mixer tracks one kind of state. Hard sequence problems are often *hierarchical*: something has to be **extracted** from the raw input before the running quantity can be **composed**. `MinGRUStack` lets you assign a different mixer to each layer, so you can put an extractor underneath a composer. This tutorial builds a `SignedMinGRU` extractor feeding a `GivensMinGRU` composer, one of the two recommended composer choices for the repo's hierarchical probe (the small-state option — see [How-to: choose a mixer](../how-to/choose-a-mixer.md#the-two-axis-guidance) for when `DeltaMinGRU` is the better composer instead), and shows why extract-then-compose *order* is the one to reach for regardless of which composer you pick.
 
 By the end you will have constructed the ordered stack with the public API, configured each layer independently, seen the warning that flags a fragile ordering, and read the measured evidence that fixes the order for this class of task.
 
@@ -59,7 +59,7 @@ print("configured forward:", tuple(model(x)[0].shape))
 configured forward: (4, 128, 64)
 ```
 
-`rounds` = how many staggered layers of paired-plane rotations compose per token; see the [brick-wall Givens parameterization](../explanation/givens-mingru.md#the-brick-wall-givens-parameterization) for why that specific mesh.
+`rounds` = how many staggered layers of paired-plane rotations compose per token; see the [brick-wall Givens parameterization](../explanation/givens-delta.md#the-brick-wall-givens-parameterization) for why that specific mesh.
 
 A flat `mixer_kwargs` dict alongside a list `mixer` (or a type-keyed dict alongside a single-string `mixer`) raises `ValueError` naming both schemas, so the two forms cannot be mixed up silently.
 
@@ -121,10 +121,10 @@ The `signed → givens` numbers above are reproducible from a repo checkout. The
 
 ## What you built
 
-You constructed the recommended hierarchical stack — a `SignedMinGRU` extractor feeding a `GivensMinGRU` composer — configured each layer through the type-keyed `mixer_kwargs` schema, saw the warning that flags a fragile stacked-rotation ordering, and grounded the ordering choice in the measured `S3-hier` and `S3` evidence.
+You constructed a hierarchical stack — a `SignedMinGRU` extractor feeding a `GivensMinGRU` composer, the small-state option for extract-then-compose problems — configured each layer through the type-keyed `mixer_kwargs` schema, saw the warning that flags a fragile stacked-rotation ordering, and grounded the ordering choice in the measured `S3-hier` and `S3` evidence. Swap the composer for `mixer=["signed", "delta"]` with `mixer_kwargs={"delta": {...}}` if your per-token state is free to grow — see [How-to: choose a mixer](../how-to/choose-a-mixer.md#the-two-axis-guidance) for when to make that swap.
 
 ## Next steps
 
 - [Choose a mixer](../how-to/choose-a-mixer.md) — the per-mixer decision table.
 - [Reproduce the evidence](../how-to/reproduce-the-evidence.md) — run the ordering experiment yourself.
-- [GivensMinGRU deep dive](../explanation/givens-mingru.md) — the brick-wall Givens parameterization and why it composes.
+- [Givens & Delta deep dive](../explanation/givens-delta.md) — the brick-wall Givens parameterization, the chunked-WY delta-rule composer, and the evidence that separates them.

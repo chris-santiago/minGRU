@@ -6,6 +6,8 @@ The four scan operations that back the minGRU mixers — [`linear_scan`, `matrix
 
 The backend is entirely optional and off by default on CPU. For how to turn it on and control which path runs, see [How-to: control scan dispatch](../how-to/control-scan-dispatch.md) and [Tutorials: Triton on GPU](../tutorials/triton-on-gpu.md). For the registered symbols, see [Reference: Triton kernels](../reference/triton-scans.md). To reproduce the numbers below, see [How-to: run the benchmarks](../how-to/run-the-benchmarks.md).
 
+`DeltaMinGRU`'s chunked-WY `forward` is not one of the four scan ops and gains no hand-written Triton kernel here: a CUDA fusion-headroom probe found `torch.compile` already recovers 70–91% of the available fusion headroom on that path, so a bespoke kernel was judged not worth building. See the [Givens & Delta deep dive](givens-delta.md#costs-and-the-two-axis-recommendation) for that measurement and the GPU cost comparison between the two composers.
+
 ## One associative-scan family
 
 Every mixer's recurrence is a first-order affine map $h_t = A_t\, h_{t-1} + B_t$. What differs between mixers is only the shape of $A_t$: a positive scalar in $(0,1)$ for the base log-space `MinGRU`, a signed scalar for `SignedMinGRU`, a $2 \times 2$ matrix for `RotationMinGRU`, a $k \times k$ matrix for `GivensMinGRU`. An affine map like this composes associatively. Composing "apply $(A_1, B_1)$ then $(A_2, B_2)$" gives
@@ -36,7 +38,7 @@ The kernels are registered with `torch.library.triton_op`, so `torch.compile` se
 
 The backward design mirrors the forward's zero-extra-memory discipline. For the generic affine core, the adjoint is a *single reverse-direction scan* that reads only the forward's inputs and outputs: it reverse-scans the incoming output gradients with $A_{t+1}^\top$, then forms $\partial L / \partial A_t$ from the forward outputs $\bar{A}_{t-1}$, $\bar{B}_{t-1}$ (seeded with $I$/$0$ at $t = 1$) and $\partial L / \partial B_t$ directly. No intermediate activations are saved beyond what the forward already returned. `parallel_scan_log`'s backward takes a different but equally frugal route: autograd-through-recomputation, saving only its two forward inputs (`log_coeffs`, `log_values`) and re-deriving the gradient through the eager log-space math — exact-to-eager, with no hand-derived log-space adjoint kernel to get subtly wrong on a device the developer cannot see locally.
 
-The angle-fused Kernel 4 that serves `GivensMinGRU` and `RotationMinGRU` is a separate module-level fast path, not one of the four scan ops. Its backward is an **exact $C = 1$ stored-state recompute** rather than a reversal by division — a decision with its own measured justification (reversal error grows as $\sigma_{\min}^{-\text{chunklen}}$, reaching $9.3 \times 10^{19}$ at strong decay), covered in full in the [GivensMinGRU deep dive](givens-mingru.md#the-backward-pass-why-division-based-reversal-was-rejected). The consequence for this article is its memory footprint, below.
+The angle-fused Kernel 4 that serves `GivensMinGRU` and `RotationMinGRU` is a separate module-level fast path, not one of the four scan ops. Its backward is an **exact $C = 1$ stored-state recompute** rather than a reversal by division — a decision with its own measured justification (reversal error grows as $\sigma_{\min}^{-\text{chunklen}}$, reaching $9.3 \times 10^{19}$ at strong decay), covered in full in the [Givens & Delta deep dive](givens-delta.md#the-backward-pass-why-division-based-reversal-was-rejected). The consequence for this article is its memory footprint, below.
 
 ## The dispatch seam
 
@@ -81,4 +83,4 @@ Correctness is gated by a parity harness that compares every Triton output again
 - [How-to: control scan dispatch](../how-to/control-scan-dispatch.md) — setting `MINGRU_SCAN` and reading the fallback warning.
 - [How-to: run the benchmarks](../how-to/run-the-benchmarks.md) — reproducing the speedup, memory, and parity tables.
 - [Tutorials: Triton on GPU](../tutorials/triton-on-gpu.md) — enabling the backend end to end.
-- [GivensMinGRU deep dive](givens-mingru.md) — the angle-fused kernel's backward decision and the rotation-family mixers it serves.
+- [Givens & Delta deep dive](givens-delta.md) — the angle-fused kernel's backward decision and the rotation-family mixers it serves.
