@@ -1977,6 +1977,22 @@ if _HAS_TRITON:
         y = torch.empty(B, n_heads, T, d_v, device=Q.device, dtype=torch.float32)
         Hbound = torch.empty(B, n_heads, num_chunks, d_k, d_v, device=Q.device, dtype=torch.float32)
         H_T = torch.empty(B, n_heads, d_k, d_v, device=Q.device, dtype=torch.float32)
+        # num_stages=1 (single-buffer, pipelining OFF) on the sequential pass.
+        # This kernel's in-kernel `for c in range(num_chunks)` loop carries the
+        # state H across iterations: iteration c's readout/update read H written
+        # by iteration c-1, a strict serial dependency the software pipeliner
+        # cannot overlap. Left at the default (num_stages=3 on sm_89), Triton
+        # still multi-buffers the loop's per-chunk tile LOADS (Ktile, TinvK,
+        # TinvV, Qtile) across 3 stages, tripling their shared-memory footprint
+        # and pushing every multi-chunk x wide-tile envelope shape past the L4's
+        # 101376 B SMEM limit -- while the single-chunk cases of the SAME shapes
+        # fit, because Triton's `equal_to_1` specialization compiles num_chunks==1
+        # as a constant, sees a single trip, and allocates ONE buffer. Forcing
+        # num_stages=1 makes the multi-chunk launch reuse that identical, already-
+        # accepted single-buffer footprint. The prefetch it forgoes buys nothing
+        # here (the dependent H-chain, not load latency, bounds the loop), so
+        # already-passing cases keep their measured performance; the kernel math
+        # is byte-for-byte unchanged.
         _delta_sequential_kernel[(bh,)](
             Q,
             K,
@@ -1997,6 +2013,7 @@ if _HAS_TRITON:
             block_c,
             block_k,
             block_v,
+            num_stages=1,
         )
         return y, H_T, Hbound
 
