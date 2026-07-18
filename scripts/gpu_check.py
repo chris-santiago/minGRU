@@ -48,6 +48,34 @@ Job modes (``--job``, default ``check``, existing invocations unaffected):
   locally -- the job's container filesystem dies with the job, so stdout
   is the only transport. A missing/malformed result line is a clear error
   exit; no partial artifact is ever written.
+
+``hetero36`` (GPU 36-seed round, Task 3)
+  Runs ``scripts/gpu_hetero_campaign.py`` instead: the 3-arm x 36-seed
+  S3-hier round (packaged givens on the Triton scan path vs. the two
+  packaged delta configs under ``torch.compile`` -- see
+  ``.claude/output/specs/2026-07-18-gpu36-round-design.md`` sections 4
+  and 6). Same clone/checkout/triton-install steps and foreground-only,
+  no-keepalive command chain as ``delta-probe`` (see
+  ``build_delta_probe_command``'s docstring for why). After the job
+  completes, this script fetches its logs, extracts EVERY
+  ``MINGRU_LAB_ROW`` line (one per completed seed, guarded parse --
+  malformed lines skipped, never crash). A row that parses as JSON but is
+  the wrong SHAPE (not an object, an unrecognized ``round``, or a
+  non-``int``/``bool`` ``seed``) is shape-invalid: it's warned about on
+  stderr and counted (``rows_skipped_invalid`` in the sidecar), never
+  appended and never a crash. Within the surviving batch, a duplicate
+  ``(round, seed)`` resolves last-N-wins (spec §6), counted separately as
+  ``rows_deduped_in_batch``. The remaining rows are dedup-checked by
+  ``(round, seed)`` against the local ``experiments/lab_results.jsonl``
+  for the three hetero36 round names, and only the new rows are appended
+  (preserving log order -- a retried job's already-appended rows dedup
+  out, making retries idempotent). Writes
+  ``experiments/bench/gpu36_env.json`` (the job's single
+  ``MINGRU_LAB_ENV`` line plus extraction/dedup counts and per-seed wall
+  seconds, reconciling ``rows_extracted == rows_appended +
+  rows_skipped_duplicate + rows_skipped_invalid + rows_deduped_in_batch``).
+  Rows or the env line missing/malformed entirely is a clear error exit;
+  nothing is appended or written in that case.
 """
 
 from __future__ import annotations
@@ -58,7 +86,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 DEFAULT_IMAGE = "pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel"
 DEFAULT_MACHINE = "L4"
@@ -73,9 +101,39 @@ _DELTA_PROBE_OUT_DIR = _REPO_ROOT / "experiments" / "bench"
 _DELTA_PROBE_JSON = _DELTA_PROBE_OUT_DIR / "gpu_delta_probe.json"
 _DELTA_PROBE_MD = _DELTA_PROBE_OUT_DIR / "gpu_delta_probe.md"
 
+# --- hetero36 job mode (Task 3) -----------------------------------------
+
+_HETERO36_JOB_NAME = "mingru-gpu-hetero36"
+_HETERO36_ROW_PREFIX = "MINGRU_LAB_ROW "
+_HETERO36_ENV_PREFIX = "MINGRU_LAB_ENV "
+# Spec §6 arm matrix: the only round names the submitting/dedup path
+# recognizes as this round's rows.
+_HETERO36_ROUNDS = ("hetero-gpu36-sg8", "hetero-gpu36-pd64", "hetero-gpu36-pd1024")
+_LEDGER_PATH = _REPO_ROOT / "experiments" / "lab_results.jsonl"
+_HETERO36_SIDECAR = _DELTA_PROBE_OUT_DIR / "gpu36_env.json"
+
 
 def _sh(cmd: list[str]) -> str:
     return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout.strip()
+
+
+def _fetch_job_logs(job: Any) -> tuple[str | None, Exception | None]:
+    """Best-effort ``job.logs`` fetch: ``(logs, None)`` or ``(None, exc)``.
+
+    Log retrieval can fail independently of the job's own run status (SDK
+    transient errors, etc.); every call site treats that as a soft
+    failure to report rather than a crash. Rule-of-three hoist: this
+    try/except was identically duplicated across ``_finish_delta_probe``,
+    ``_finish_hetero36``, and ``main()``'s check-mode failure path.
+    Returns the exception instead of swallowing it so each call site can
+    keep its own (slightly different) existing message text -- callers
+    check ``exc is not None`` first, which also guarantees ``logs`` is a
+    ``str`` on the success path.
+    """
+    try:
+        return job.logs, None
+    except Exception as exc:  # log retrieval is best-effort
+        return None, exc
 
 
 def build_command(repo: str, ref: str, bench: bool) -> str:
@@ -127,6 +185,40 @@ def build_delta_probe_command(repo: str, ref: str) -> str:
     return " && ".join(steps)
 
 
+def build_hetero36_command(repo: str, ref: str) -> str:
+    """Job-shell command for ``--job hetero36``: clone + 36-seed campaign run.
+
+    Same clone/checkout/triton-install steps as ``build_delta_probe_command``
+    (``torch.compile``'s Inductor needs triton on GPU here too), running
+    ``scripts/gpu_hetero_campaign.py`` instead -- no extra args, the
+    campaign script's own CLI covers the full 3x36 arm matrix (spec §5/§6:
+    ``cd /tmp/minGRU && python scripts/gpu_hetero_campaign.py``).
+    Deliberately NO keepalive heartbeat, foreground-only command chain --
+    see ``build_delta_probe_command``'s docstring for why a backgrounded
+    loop outlives a studio-mode job's command chain and keeps it billing.
+
+    DUPLICATION-PENDING: this is now the third near-identical copy of the
+    clone/checkout/triton-install preamble in this file (``build_command``,
+    ``build_delta_probe_command``, this function). Not hoisted here to keep
+    this task's diff additive-only against ``build_command`` and
+    ``build_delta_probe_command`` (their dry-run output must stay
+    byte-identical pre/post this change) -- flagged for the orchestrator to
+    hoist into a shared preamble helper.
+    """
+    steps = [
+        "set -eux",  # job shell is dash: -o pipefail unsupported (no pipes used)
+        (
+            "python -c 'import torch; assert torch.cuda.is_available(), "
+            '"no CUDA device"; print(torch.__version__)\''
+        ),
+        "(python -c 'import triton' || pip install --no-cache-dir triton)",
+        f"git clone --filter=blob:none {repo} /tmp/minGRU",
+        f"cd /tmp/minGRU && git checkout --detach {ref}",
+        "cd /tmp/minGRU && python scripts/gpu_hetero_campaign.py",
+    ]
+    return " && ".join(steps)
+
+
 def _extract_last(prefix: str, text: str) -> dict[str, Any] | None:
     """Parse the JSON payload of the last well-formed ``prefix``-prefixed line.
 
@@ -155,6 +247,35 @@ def _extract_last(prefix: str, text: str) -> dict[str, Any] | None:
         except (json.JSONDecodeError, ValueError):
             continue
     return parsed
+
+
+def _extract_all(prefix: str, text: str) -> list[Any]:
+    """Parse the JSON payload of every well-formed ``prefix``-prefixed line.
+
+    Sibling to ``_extract_last`` for job modes -- like ``hetero36`` --
+    that transport MANY marked rows per job rather than a single terminal
+    result: each completed seed prints its own ``MINGRU_LAB_ROW <json>``
+    line, and all of them must survive extraction, not just the last.
+    Same guarded-parse contract as ``_extract_last``: a malformed (not
+    valid JSON) matching line is skipped, never raised, and the returned
+    list preserves the order payloads appeared in the log (later
+    dedup/append logic relies on this to make retries idempotent without
+    reordering rows). Return type is deliberately ``list[Any]``, not
+    ``list[dict]``: this function only guards PARSEABILITY, not SHAPE --
+    a line's payload can be well-formed JSON that isn't a row at all
+    (``MINGRU_LAB_ROW [1, 2, 3]`` parses to a ``list``, not a ``dict``).
+    Callers that need row shape (a dict with the hetero36 round/seed
+    keys) apply that guard themselves -- see ``_valid_hetero36_key``.
+    """
+    payloads: list[Any] = []
+    for line in text.splitlines():
+        if not line.startswith(prefix):
+            continue
+        try:
+            payloads.append(json.loads(line[len(prefix) :]))
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return payloads
 
 
 def _fmt_probe_cell(value: Any, spec: str = ".4f") -> str:
@@ -221,17 +342,16 @@ def _write_delta_probe_artifact(result: dict[str, Any]) -> None:
 def _finish_delta_probe(job: Any, ok: bool) -> int:
     """Post-``job.wait()`` handling for ``--job delta-probe``.
 
-    Fetches the job's logs (best-effort, mirroring the existing
-    ``check``-mode log fetch), extracts the last
-    ``MINGRU_GPU_PROBE_RESULT`` line, and writes the local artifact.
-    A missing/malformed result line is a clear error exit -- never a
-    partial artifact write, per the task brief.
+    Fetches the job's logs (best-effort -- see ``_fetch_job_logs``),
+    extracts the last ``MINGRU_GPU_PROBE_RESULT`` line, and writes the
+    local artifact. A missing/malformed result line is a clear error
+    exit -- never a partial artifact write, per the task brief.
     """
-    try:
-        logs = job.logs
-    except Exception as exc:  # log retrieval is best-effort, mirrors check mode
+    logs, exc = _fetch_job_logs(job)
+    if exc is not None:
         print(f"error: could not fetch logs: {exc}", file=sys.stderr)
         return 1
+    assert logs is not None  # guaranteed by _fetch_job_logs's exc is None contract
     result = _extract_last(_DELTA_PROBE_RESULT_PREFIX, logs)
     if result is None:
         print(
@@ -243,6 +363,242 @@ def _finish_delta_probe(job: Any, ok: bool) -> int:
         return 1
     _write_delta_probe_artifact(result)
     print(f"wrote {_DELTA_PROBE_JSON} and {_DELTA_PROBE_MD}")
+    return 0 if ok else 1
+
+
+def _valid_hetero36_key(row: Any, rounds: tuple[str, ...]) -> tuple[str, int] | None:
+    """Return ``row``'s ``(round, seed)`` key if shape-valid, else ``None``.
+
+    Guards the shape every dedup/append/ledger-read path below depends on.
+    A decoded JSON payload can be well-formed JSON and still be the wrong
+    SHAPE -- ``MINGRU_LAB_ROW [1, 2, 3]`` parses fine but isn't a row at
+    all, and a dict missing ``round``/``seed`` would otherwise be appended
+    to the ledger under a garbage ``(None, None)`` key that then crashes
+    every later read of that ledger. This function is the single choke
+    point that prevents both: ``row`` must be a ``dict``, its ``round``
+    must be one of ``rounds`` (the three hetero36 round names -- an
+    unrecognized round is never this round's data), and its ``seed`` must
+    be an ``int`` (``bool`` is excluded despite being an ``int`` subclass
+    in Python, since a JSON ``true``/``false`` is never a valid seed).
+    """
+    if not isinstance(row, dict):
+        return None
+    round_name = row.get("round")
+    seed = row.get("seed")
+    if round_name not in rounds:
+        return None
+    if not isinstance(seed, int) or isinstance(seed, bool):
+        return None
+    return round_name, seed
+
+
+def _existing_round_seed_pairs(ledger_path: Path, rounds: tuple[str, ...]) -> set[tuple[str, int]]:
+    """(round, seed) pairs already present in the local ledger for ``rounds``.
+
+    Guarded per-line parse (a malformed ledger line is skipped, never
+    raised) mirrors the extraction contract this module already applies to
+    job logs; shape-invalid lines (non-dict JSON, or a dict that fails
+    ``_valid_hetero36_key``) are skipped the same way -- a garbage line
+    already in the ledger must never crash every future run that reads it
+    back. A ledger that doesn't exist yet (fresh checkout, or a
+    ``tmp_path`` fixture in tests) is treated as "no existing rows".
+    """
+    pairs: set[tuple[str, int]] = set()
+    if not ledger_path.exists():
+        return pairs
+    for line in ledger_path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        key = _valid_hetero36_key(row, rounds)
+        if key is not None:
+            pairs.add(key)
+    return pairs
+
+
+def _dedup_batch_last_wins(
+    rows: list[Any], rounds: tuple[str, ...]
+) -> tuple[list[dict[str, Any]], int, int]:
+    """Resolve one extracted batch to last-N-wins per ``(round, seed)``.
+
+    Spec §6: "extraction is last-N-wins per (round, seed)". Returns
+    ``(deduped_rows, rows_skipped_invalid, rows_deduped_in_batch)``: a
+    shape-invalid row (see ``_valid_hetero36_key``) never participates --
+    it's dropped and counted rather than crashing or silently entering
+    the ledger under a garbage key. Valid rows are folded into a dict
+    keyed by ``(round, seed)`` IN LOG ORDER: a plain ``dict``'s iteration
+    order is the position of a key's FIRST occurrence, but assigning to
+    an already-present key still overwrites its value -- so
+    ``dict.values()`` afterward yields exactly one row per key, in
+    first-occurrence order, holding each key's LAST-seen row.
+    ``rows_deduped_in_batch`` counts every row that LOST that
+    overwrite (one less than the number of rows sharing a key) -- without
+    it, a losing row would vanish from the sidecar's accounting: the
+    caller's ``len(rows) == appended + skipped_duplicate + skipped_invalid
+    + deduped_in_batch`` reconciliation depends on this count existing.
+    """
+    by_key: dict[tuple[str, int], dict[str, Any]] = {}
+    skipped_invalid = 0
+    deduped_in_batch = 0
+    for row in rows:
+        key = _valid_hetero36_key(row, rounds)
+        if key is None:
+            skipped_invalid += 1
+            continue
+        if key in by_key:
+            deduped_in_batch += 1
+        by_key[key] = row
+    return list(by_key.values()), skipped_invalid, deduped_in_batch
+
+
+class _AppendResult(NamedTuple):
+    appended: int
+    skipped_duplicate: int
+    skipped_invalid: int
+    deduped_in_batch: int
+
+
+def _append_new_rows(ledger_path: Path, rows: list[Any], rounds: tuple[str, ...]) -> _AppendResult:
+    """Append ``rows`` whose ``(round, seed)`` isn't already in the ledger.
+
+    Shape-invalid rows (see ``_valid_hetero36_key``) are dropped and
+    counted rather than appended or crashing the batch. The surviving
+    batch is first resolved last-N-wins per ``(round, seed)`` (spec §6,
+    see ``_dedup_batch_last_wins``); only then is each remaining row
+    checked against the ledger's existing keys for ``rounds`` -- a key
+    already present in the ledger still skips unconditionally, keeping
+    retries idempotent. Log order (of the deduped batch) is preserved in
+    both the returned counts and the appended lines. The four returned
+    counts reconcile exactly against ``len(rows)``: every input row is
+    either appended, skipped as an existing-ledger duplicate, skipped as
+    shape-invalid, or deduped away by a later same-batch occurrence.
+    """
+    batch, skipped_invalid, deduped_in_batch = _dedup_batch_last_wins(rows, rounds)
+    existing = _existing_round_seed_pairs(ledger_path, rounds)
+    appended_lines: list[str] = []
+    appended = 0
+    skipped_duplicate = 0
+    for row in batch:
+        key = (row["round"], row["seed"])
+        if key in existing:
+            skipped_duplicate += 1
+            continue
+        appended_lines.append(json.dumps(row))
+        existing.add(key)
+        appended += 1
+    if appended_lines:
+        with ledger_path.open("a") as f:
+            for line in appended_lines:
+                f.write(line + "\n")
+    return _AppendResult(appended, skipped_duplicate, skipped_invalid, deduped_in_batch)
+
+
+def _build_hetero36_sidecar(
+    env: dict[str, Any],
+    rows: list[Any],
+    result: _AppendResult,
+    rounds: tuple[str, ...],
+) -> dict[str, Any]:
+    """Assemble the ``gpu36_env.json`` sidecar payload (spec §6).
+
+    ``per_seed_wall_secs`` is keyed ``{round: {seed: secs}}`` from every
+    shape-valid extracted row's own ``secs`` field -- over ALL extracted
+    rows, not just the newly-appended ones, so a retried job's sidecar
+    still reports the full observed wall-cost picture even though
+    duplicate rows themselves aren't re-appended to the ledger (a losing
+    intra-batch duplicate's ``secs`` is naturally overwritten here too,
+    by the same last-N-wins rule as the ledger append). A shape-invalid
+    row (see ``_valid_hetero36_key``) or one missing ``secs`` is skipped
+    from this map rather than raising.
+
+    The four ``rows_*`` counts reconcile exactly: ``rows_extracted ==
+    rows_appended + rows_skipped_duplicate + rows_skipped_invalid +
+    rows_deduped_in_batch`` -- no extracted row is ever silently
+    unaccounted for.
+    """
+    per_seed_wall_secs: dict[str, dict[str, float]] = {}
+    for row in rows:
+        key = _valid_hetero36_key(row, rounds)
+        secs = row.get("secs") if isinstance(row, dict) else None
+        if key is None or secs is None:
+            continue
+        round_name, seed = key
+        per_seed_wall_secs.setdefault(round_name, {})[str(seed)] = secs
+    return {
+        "env": env,
+        "rows_extracted": len(rows),
+        "rows_appended": result.appended,
+        "rows_skipped_duplicate": result.skipped_duplicate,
+        "rows_skipped_invalid": result.skipped_invalid,
+        "rows_deduped_in_batch": result.deduped_in_batch,
+        "per_seed_wall_secs": per_seed_wall_secs,
+    }
+
+
+def _finish_hetero36(job: Any, ok: bool) -> int:
+    """Post-``job.wait()`` handling for ``--job hetero36``.
+
+    Fetches the job's logs (best-effort -- see ``_fetch_job_logs``),
+    extracts every ``MINGRU_LAB_ROW`` line (guarded, malformed lines
+    skipped -- see ``_extract_all``) and the single ``MINGRU_LAB_ENV``
+    line (guarded, last-wins -- see ``_extract_last``). Either rows
+    entirely absent or the env line missing/malformed is a clear error
+    exit with NOTHING appended or written -- both checks run before any
+    ledger mutation or sidecar write, so a bad log never produces a
+    partial ledger append. On success, resolves the batch last-N-wins
+    per ``(round, seed)`` (counted as ``rows_deduped_in_batch``), drops
+    shape-invalid rows with a stderr warning (counted as
+    ``rows_skipped_invalid``, never appended, never a crash -- see
+    ``_valid_hetero36_key``), dedups the rest against
+    ``experiments/lab_results.jsonl`` for the three hetero36 round names,
+    appends only the new ones (preserving log order), and writes the env
+    sidecar. The sidecar's counts reconcile exactly against the raw
+    extracted count -- see ``_build_hetero36_sidecar``.
+    """
+    logs, exc = _fetch_job_logs(job)
+    if exc is not None:
+        print(f"error: could not fetch logs: {exc}", file=sys.stderr)
+        return 1
+    assert logs is not None  # guaranteed by _fetch_job_logs's exc is None contract
+
+    rows = _extract_all(_HETERO36_ROW_PREFIX, logs)
+    if not rows:
+        print(
+            "error: no well-formed MINGRU_LAB_ROW lines found in job logs -- "
+            "not appending or writing a sidecar. Log tail:\n" + "\n".join(logs.splitlines()[-40:]),
+            file=sys.stderr,
+        )
+        return 1
+
+    env = _extract_last(_HETERO36_ENV_PREFIX, logs)
+    if env is None:
+        print(
+            "error: no well-formed MINGRU_LAB_ENV line found in job logs -- "
+            "not appending or writing a sidecar. Log tail:\n" + "\n".join(logs.splitlines()[-40:]),
+            file=sys.stderr,
+        )
+        return 1
+
+    result = _append_new_rows(_LEDGER_PATH, rows, _HETERO36_ROUNDS)
+    if result.skipped_invalid:
+        print(
+            f"warning: skipped {result.skipped_invalid} shape-invalid "
+            "MINGRU_LAB_ROW row(s) (non-dict payload, unrecognized round, "
+            "or non-int seed) -- not appended to the ledger",
+            file=sys.stderr,
+        )
+    sidecar = _build_hetero36_sidecar(env, rows, result, _HETERO36_ROUNDS)
+    _DELTA_PROBE_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    _HETERO36_SIDECAR.write_text(json.dumps(sidecar, indent=2) + "\n")
+    print(
+        f"appended {result.appended} new row(s), skipped {result.skipped_duplicate} "
+        f"duplicate(s), {result.skipped_invalid} invalid, and "
+        f"{result.deduped_in_batch} intra-batch duplicate(s); wrote {_HETERO36_SIDECAR}"
+    )
     return 0 if ok else 1
 
 
@@ -266,11 +622,12 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument(
         "--job",
-        choices=["check", "delta-probe"],
+        choices=["check", "delta-probe", "hetero36"],
         default="check",
-        help="job mode: 'check' (default, existing behavior unchanged) or "
-        "'delta-probe' (Task 6 CUDA fusion-headroom probe -- see the module "
-        "docstring's 'Job modes' section)",
+        help="job mode: 'check' (default, existing behavior unchanged), "
+        "'delta-probe' (Task 6 CUDA fusion-headroom probe), or 'hetero36' "
+        "(Task 3 GPU 36-seed round campaign) -- see the module docstring's "
+        "'Job modes' section",
     )
     args = ap.parse_args()
 
@@ -279,6 +636,9 @@ def main() -> int:
     if args.job == "delta-probe":
         command = build_delta_probe_command(repo, ref)
         job_name_prefix = _DELTA_PROBE_JOB_NAME
+    elif args.job == "hetero36":
+        command = build_hetero36_command(repo, ref)
+        job_name_prefix = _HETERO36_JOB_NAME
     else:
         command = build_command(repo, ref, args.bench)
         job_name_prefix = JOB_NAME
@@ -373,11 +733,14 @@ def main() -> int:
     ok = "completed" in status.lower() or "succe" in status.lower()
     if args.job == "delta-probe":
         return _finish_delta_probe(job, ok)
+    if args.job == "hetero36":
+        return _finish_hetero36(job, ok)
     if not ok:
-        try:
-            print(job.logs)
-        except Exception as exc:  # log retrieval is best-effort
+        logs, exc = _fetch_job_logs(job)
+        if exc is not None:
             print(f"(could not fetch logs: {exc})", file=sys.stderr)
+        else:
+            print(logs)
     return 0 if ok else 1
 
 

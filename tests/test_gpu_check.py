@@ -1,19 +1,20 @@
-"""Regression tests for ``scripts/gpu_check.py``'s ``_extract_last`` (Task 6).
+"""Regression tests for ``scripts/gpu_check.py``'s extraction/dedup path.
 
 ``scripts/`` is not an importable package (no ``__init__.py`` -- see
 ``tests/test_scaling_probe.py``'s identical note), so this module is
 loaded directly by file path via ``importlib``.
 
-These tests exercise ``_extract_last`` in complete isolation: crafted
-strings only, no subprocess, no ``lightning_sdk``, no torch. They pin the
-specific regression a live-job smoke test cannot reproduce on demand: a
-truncated or malformed ``MINGRU_GPU_PROBE_RESULT`` line in a job's fetched
-logs (interleaved with keepalive heartbeats and clone/checkout noise) must
-degrade to "no match", never raise ``json.JSONDecodeError`` -- an uncaught
-raise here would propagate out of ``_finish_delta_probe`` and crash the
-CLI instead of reporting the clear "no result line found" error the task
-brief requires (and, worse, could leave a half-written artifact on disk if
-it happened mid-write instead of before any write is attempted).
+The ``_extract_last`` tests (Task 6) exercise it in complete isolation:
+crafted strings only, no subprocess, no ``lightning_sdk``, no torch. They
+pin the specific regression a live-job smoke test cannot reproduce on
+demand: a truncated or malformed ``MINGRU_GPU_PROBE_RESULT`` line in a
+job's fetched logs (interleaved with keepalive heartbeats and
+clone/checkout noise) must degrade to "no match", never raise
+``json.JSONDecodeError`` -- an uncaught raise here would propagate out of
+``_finish_delta_probe`` and crash the CLI instead of reporting the clear
+"no result line found" error the task brief requires (and, worse, could
+leave a half-written artifact on disk if it happened mid-write instead of
+before any write is attempted).
 
 Mirrors ``tests/test_scaling_probe.py``'s test structure for
 ``scaling_probe.py``'s own ``_extract_last`` (same line-marker
@@ -22,11 +23,24 @@ extraction/malformed-line-tolerance pattern, duplicated per
 ``DUPLICATION-PENDING`` note) -- kept as a parallel, independent test file
 rather than merged, since the two scripts are independent job-runner entry
 points.
+
+The ``hetero36`` tests (Task 3, plus two quality-review fix cycles) cover
+the GPU 36-seed round's submitter path: ``_extract_all`` (the ALL-rows
+sibling of ``_extract_last``), ``_existing_round_seed_pairs``/
+``_append_new_rows`` (shape-guarded dedup + idempotent append against a
+ledger, including intra-batch last-N-wins resolution with full
+appended/skipped_duplicate/skipped_invalid/deduped_in_batch count
+reconciliation), and ``_finish_hetero36`` end-to-end. All ledger and
+sidecar I/O in these tests targets ``tmp_path`` fixtures via
+``monkeypatch`` on the module's ``_LEDGER_PATH``/``_HETERO36_SIDECAR``
+constants -- the real ``experiments/lab_results.jsonl`` and
+``experiments/bench/gpu36_env.json`` are never touched.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -39,6 +53,10 @@ _spec.loader.exec_module(gpu_check)
 
 _extract_last = gpu_check._extract_last
 _RESULT_PREFIX = gpu_check._DELTA_PROBE_RESULT_PREFIX
+_extract_all = gpu_check._extract_all
+_ROW_PREFIX = gpu_check._HETERO36_ROW_PREFIX
+_ENV_PREFIX = gpu_check._HETERO36_ENV_PREFIX
+_ROUNDS = gpu_check._HETERO36_ROUNDS
 
 
 def test_no_matching_line_returns_none():
@@ -98,3 +116,410 @@ def test_prefix_must_match_exactly_not_substring():
     # noise that happens to embed the marker text.
     text = f'noise before {_RESULT_PREFIX}{{"env": {{}}, "shapes": []}}\n'
     assert _extract_last(_RESULT_PREFIX, text) is None
+
+
+# --- _extract_all (Task 3: hetero36 job mode) -------------------------------
+
+
+def _row(round_name: str, seed: int, secs: float = 10.0) -> dict:
+    return {
+        "round": round_name,
+        "task": "S3-hier",
+        "variant": "hetero-pg8",
+        "layers": 2,
+        "seed": seed,
+        "steps": 1600,
+        "acc": {"64": 1.0},
+        "secs": secs,
+        "max_steps": 1600,
+        "ckpt": {"step": 1600, "val128": 1.0},
+        "config": {"device": "cuda", "torch": "2.8.0", "scan": "triton"},
+    }
+
+
+def test_extract_all_no_matching_lines_returns_empty_list():
+    text = "[keepalive] Fri Jul 18 00:00:00 UTC 2026\nCloning into '/tmp/minGRU'...\n"
+    assert _extract_all(_ROW_PREFIX, text) == []
+
+
+def test_extract_all_empty_text_returns_empty_list():
+    assert _extract_all(_ROW_PREFIX, "") == []
+
+
+def test_extract_all_well_formed_multi_row_preserves_log_order():
+    rows = [_row(_ROUNDS[0], 0), _row(_ROUNDS[0], 1), _row(_ROUNDS[1], 0)]
+    text = "".join(f"{_ROW_PREFIX}{json.dumps(r)}\n" for r in rows)
+    assert _extract_all(_ROW_PREFIX, text) == rows
+
+
+def test_extract_all_skips_malformed_lines_interleaved_with_well_formed():
+    # A malformed row (truncated mid-print, same failure mode as the
+    # delta-probe's single-line extraction) sits between two well-formed
+    # rows and interleaved with campaign progress noise. The malformed
+    # line is skipped -- never raises -- and both well-formed rows survive
+    # in their original order.
+    good_first = _row(_ROUNDS[0], 0)
+    good_second = _row(_ROUNDS[0], 1)
+    text = (
+        f"{_ROW_PREFIX}{json.dumps(good_first)}\n"
+        "  running hetero-gpu36-sg8 seed=1 (12.3s)...\n"
+        f'{_ROW_PREFIX}{{"round": "{_ROUNDS[0]}", "seed": 1, "sec\n'
+        f"{_ROW_PREFIX}{json.dumps(good_second)}\n"
+    )
+    assert _extract_all(_ROW_PREFIX, text) == [good_first, good_second]
+
+
+def test_extract_all_prefix_must_match_exactly_not_substring():
+    text = f"noise before {_ROW_PREFIX}{json.dumps(_row(_ROUNDS[0], 0))}\n"
+    assert _extract_all(_ROW_PREFIX, text) == []
+
+
+def test_extract_all_returns_non_dict_payloads_verbatim_shape_unfiltered():
+    # _extract_all only guards PARSEABILITY, not SHAPE (see its docstring)
+    # -- a well-formed-JSON, wrong-shape payload like ``[1, 2, 3]`` still
+    # comes back verbatim; shape validation is the row-consuming path's
+    # job (``_valid_hetero36_key``), not this generic extractor's.
+    text = f"{_ROW_PREFIX}[1, 2, 3]\n"
+    assert _extract_all(_ROW_PREFIX, text) == [[1, 2, 3]]
+
+
+# --- dedup / append against the local ledger --------------------------------
+
+
+def test_existing_round_seed_pairs_empty_when_ledger_absent(tmp_path):
+    ledger = tmp_path / "lab_results.jsonl"
+    assert gpu_check._existing_round_seed_pairs(ledger, _ROUNDS) == set()
+
+
+def test_existing_round_seed_pairs_filters_to_named_rounds_and_skips_malformed(
+    tmp_path,
+):
+    ledger = tmp_path / "lab_results.jsonl"
+    ledger.write_text(
+        json.dumps(_row(_ROUNDS[0], 0))
+        + "\n"
+        + json.dumps(_row("hetero-loop-21-pd1024", 0))  # a different round, not ours
+        + "\n"
+        + "not json at all\n"
+        + json.dumps(_row(_ROUNDS[1], 3))
+        + "\n"
+    )
+    assert gpu_check._existing_round_seed_pairs(ledger, _ROUNDS) == {
+        (_ROUNDS[0], 0),
+        (_ROUNDS[1], 3),
+    }
+
+
+def test_existing_round_seed_pairs_skips_non_dict_ledger_line_without_crash(tmp_path):
+    # A shape-invalid line already sitting in the ledger (e.g. from a bug
+    # in an older version of the append path) must never crash every
+    # future run that reads the ledger back -- it's skipped like any
+    # other malformed/shape-invalid line.
+    ledger = tmp_path / "lab_results.jsonl"
+    ledger.write_text(
+        json.dumps([1, 2, 3])  # valid JSON, not a row
+        + "\n"
+        + json.dumps(_row(_ROUNDS[0], 0))
+        + "\n"
+    )
+    assert gpu_check._existing_round_seed_pairs(ledger, _ROUNDS) == {(_ROUNDS[0], 0)}
+
+
+def _assert_counts_reconcile(rows_count: int, result) -> None:
+    # Fix-cycle-2 REQUIRED FIX 1: every extracted row is accounted for by
+    # exactly one of the four counts -- appended, skipped as an
+    # already-in-ledger duplicate, skipped as shape-invalid, or deduped
+    # away by a later same-batch occurrence of the same (round, seed).
+    assert rows_count == (
+        result.appended
+        + result.skipped_duplicate
+        + result.skipped_invalid
+        + result.deduped_in_batch
+    )
+
+
+def test_append_new_rows_appends_all_when_ledger_empty(tmp_path):
+    ledger = tmp_path / "lab_results.jsonl"
+    rows = [_row(_ROUNDS[0], 0), _row(_ROUNDS[0], 1)]
+    result = gpu_check._append_new_rows(ledger, rows, _ROUNDS)
+    assert (result.appended, result.skipped_duplicate, result.skipped_invalid) == (2, 0, 0)
+    assert result.deduped_in_batch == 0
+    _assert_counts_reconcile(len(rows), result)
+    assert [json.loads(line) for line in ledger.read_text().splitlines()] == rows
+
+
+def test_append_new_rows_dedups_against_existing_ledger_rows(tmp_path):
+    ledger = tmp_path / "lab_results.jsonl"
+    ledger.write_text(json.dumps(_row(_ROUNDS[0], 0)) + "\n")
+    rows = [_row(_ROUNDS[0], 0), _row(_ROUNDS[0], 1)]  # seed 0 already in ledger
+    result = gpu_check._append_new_rows(ledger, rows, _ROUNDS)
+    assert (result.appended, result.skipped_duplicate, result.skipped_invalid) == (1, 1, 0)
+    _assert_counts_reconcile(len(rows), result)
+    lines = ledger.read_text().splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[-1])["seed"] == 1
+
+
+def test_append_new_rows_preserves_log_order_across_rounds(tmp_path):
+    ledger = tmp_path / "lab_results.jsonl"
+    rows = [_row(_ROUNDS[2], 5), _row(_ROUNDS[0], 2), _row(_ROUNDS[1], 9)]
+    gpu_check._append_new_rows(ledger, rows, _ROUNDS)
+    written = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert written == rows
+
+
+def test_append_new_rows_retry_is_idempotent(tmp_path):
+    # Simulates a retried job: the same rows are appended twice (e.g. the
+    # submitter reran after a transient log-fetch failure). The second
+    # pass must skip every row as a duplicate and leave the ledger
+    # unchanged.
+    ledger = tmp_path / "lab_results.jsonl"
+    rows = [_row(_ROUNDS[0], s) for s in range(3)]
+    first = gpu_check._append_new_rows(ledger, rows, _ROUNDS)
+    assert (first.appended, first.skipped_duplicate, first.skipped_invalid) == (3, 0, 0)
+    _assert_counts_reconcile(len(rows), first)
+    second = gpu_check._append_new_rows(ledger, rows, _ROUNDS)
+    assert (second.appended, second.skipped_duplicate, second.skipped_invalid) == (0, 3, 0)
+    _assert_counts_reconcile(len(rows), second)
+    assert len(ledger.read_text().splitlines()) == 3
+
+
+def test_append_new_rows_non_dict_payload_is_skipped_invalid_not_a_crash(tmp_path):
+    # REQUIRED FIX 1(a): a well-formed-JSON, wrong-shape payload
+    # (``MINGRU_LAB_ROW [1, 2, 3]``) must not raise AttributeError and
+    # must not abort the rest of the batch.
+    ledger = tmp_path / "lab_results.jsonl"
+    good = _row(_ROUNDS[0], 0)
+    rows: list = [[1, 2, 3], good]
+    result = gpu_check._append_new_rows(ledger, rows, _ROUNDS)
+    assert (result.appended, result.skipped_duplicate, result.skipped_invalid) == (1, 0, 1)
+    _assert_counts_reconcile(len(rows), result)
+    assert [json.loads(line) for line in ledger.read_text().splitlines()] == [good]
+
+
+def test_append_new_rows_dict_missing_keys_is_skipped_invalid_not_appended(tmp_path):
+    # REQUIRED FIX 1(b): a dict missing round/seed must never be appended
+    # under a garbage (None, None) key.
+    ledger = tmp_path / "lab_results.jsonl"
+    incomplete = {"task": "S3-hier", "secs": 1.0}  # no round, no seed
+    good = _row(_ROUNDS[0], 0)
+    rows = [incomplete, good]
+    result = gpu_check._append_new_rows(ledger, rows, _ROUNDS)
+    assert (result.appended, result.skipped_duplicate, result.skipped_invalid) == (1, 0, 1)
+    _assert_counts_reconcile(len(rows), result)
+    written = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert written == [good]
+    assert (None, None) not in gpu_check._existing_round_seed_pairs(ledger, _ROUNDS)
+
+
+def test_append_new_rows_wrong_round_name_is_skipped_invalid(tmp_path):
+    ledger = tmp_path / "lab_results.jsonl"
+    wrong_round = _row("hetero-loop-21-pd1024", 0)  # not one of _HETERO36_ROUNDS
+    good = _row(_ROUNDS[0], 0)
+    rows = [wrong_round, good]
+    result = gpu_check._append_new_rows(ledger, rows, _ROUNDS)
+    assert (result.appended, result.skipped_duplicate, result.skipped_invalid) == (1, 0, 1)
+    _assert_counts_reconcile(len(rows), result)
+    written = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert written == [good]
+
+
+def test_append_new_rows_bool_seed_is_skipped_invalid_not_seed_one(tmp_path):
+    # REQUIRED FIX 2 (fix-cycle 2): a JSON ``true``/``false`` seed must
+    # never be silently accepted as the int seed 1/0 -- ``bool`` is an
+    # ``int`` subclass in Python, so a naive ``isinstance(seed, int)``
+    # check alone would wrongly accept it.
+    ledger = tmp_path / "lab_results.jsonl"
+    bool_seed = _row(_ROUNDS[0], 0)
+    bool_seed["seed"] = True
+    rows = [bool_seed]
+    result = gpu_check._append_new_rows(ledger, rows, _ROUNDS)
+    assert (result.appended, result.skipped_duplicate, result.skipped_invalid) == (0, 0, 1)
+    _assert_counts_reconcile(len(rows), result)
+    assert not ledger.exists()
+    assert gpu_check._valid_hetero36_key(bool_seed, _ROUNDS) is None
+
+
+def test_append_new_rows_intra_batch_duplicate_keeps_last_secs(tmp_path):
+    # REQUIRED FIX 2 (fix-cycle 1) / spec §6: "extraction is last-N-wins
+    # per (round, seed)". Two rows in the SAME batch share (round, seed)
+    # but differ in secs -- the ledger must end up with the LAST
+    # occurrence's value, and the loser is counted as deduped_in_batch
+    # (REQUIRED FIX 1, fix-cycle 2), not silently dropped from the
+    # accounting.
+    ledger = tmp_path / "lab_results.jsonl"
+    first_seen = _row(_ROUNDS[0], 0, secs=11.0)
+    last_seen = _row(_ROUNDS[0], 0, secs=99.0)
+    rows = [first_seen, last_seen]
+    result = gpu_check._append_new_rows(ledger, rows, _ROUNDS)
+    assert (result.appended, result.skipped_duplicate, result.skipped_invalid) == (1, 0, 0)
+    assert result.deduped_in_batch == 1
+    _assert_counts_reconcile(len(rows), result)
+    written = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert written == [last_seen]
+    assert written[0]["secs"] == 99.0
+
+
+# --- _finish_hetero36 end-to-end (ledger/sidecar paths monkeypatched to
+# tmp_path -- never the real experiments/ files) ----------------------------
+
+
+class _FakeJob:
+    def __init__(self, logs: str) -> None:
+        self.logs = logs
+
+
+def _patch_hetero36_paths(monkeypatch, tmp_path):
+    ledger = tmp_path / "lab_results.jsonl"
+    sidecar = tmp_path / "gpu36_env.json"
+    monkeypatch.setattr(gpu_check, "_LEDGER_PATH", ledger)
+    monkeypatch.setattr(gpu_check, "_HETERO36_SIDECAR", sidecar)
+    return ledger, sidecar
+
+
+def test_finish_hetero36_absent_rows_is_clear_error_and_writes_nothing(tmp_path, monkeypatch):
+    ledger, sidecar = _patch_hetero36_paths(monkeypatch, tmp_path)
+    job = _FakeJob(logs="no marked lines in this log at all\n")
+    rc = gpu_check._finish_hetero36(job, ok=True)
+    assert rc == 1
+    assert not ledger.exists()
+    assert not sidecar.exists()
+
+
+def test_finish_hetero36_absent_env_line_is_clear_error_and_writes_nothing(tmp_path, monkeypatch):
+    ledger, sidecar = _patch_hetero36_paths(monkeypatch, tmp_path)
+    row = _row(_ROUNDS[0], 0)
+    logs = f"{_ROW_PREFIX}{json.dumps(row)}\n"  # rows present, no MINGRU_LAB_ENV line
+    job = _FakeJob(logs=logs)
+    rc = gpu_check._finish_hetero36(job, ok=True)
+    assert rc == 1
+    assert not ledger.exists()
+    assert not sidecar.exists()
+
+
+def test_finish_hetero36_appends_rows_and_writes_sidecar(tmp_path, monkeypatch):
+    ledger, sidecar = _patch_hetero36_paths(monkeypatch, tmp_path)
+    rows = [_row(_ROUNDS[0], 0), _row(_ROUNDS[1], 0, secs=20.0)]
+    env = {"torch": "2.8.0", "cuda_device_name": "NVIDIA L4"}
+    logs = "".join(f"{_ROW_PREFIX}{json.dumps(r)}\n" for r in rows)
+    logs += f"{_ENV_PREFIX}{json.dumps(env)}\n"
+    job = _FakeJob(logs=logs)
+
+    rc = gpu_check._finish_hetero36(job, ok=True)
+
+    assert rc == 0
+    assert [json.loads(line) for line in ledger.read_text().splitlines()] == rows
+    sidecar_data = json.loads(sidecar.read_text())
+    assert sidecar_data["env"] == env
+    assert sidecar_data["rows_extracted"] == 2
+    assert sidecar_data["rows_appended"] == 2
+    assert sidecar_data["rows_skipped_duplicate"] == 0
+    assert sidecar_data["rows_skipped_invalid"] == 0
+    assert sidecar_data["rows_deduped_in_batch"] == 0
+    assert sidecar_data["per_seed_wall_secs"][_ROUNDS[0]]["0"] == rows[0]["secs"]
+    assert sidecar_data["per_seed_wall_secs"][_ROUNDS[1]]["0"] == 20.0
+
+
+def test_finish_hetero36_shape_invalid_row_is_skipped_with_warning_not_crash(
+    tmp_path, monkeypatch, capsys
+):
+    # REQUIRED FIX 1 end-to-end: a non-dict payload line sits alongside a
+    # well-formed row. The batch must not crash; the invalid row is
+    # skipped, counted in the sidecar, warned about on stderr, and the
+    # well-formed row still gets appended.
+    ledger, sidecar = _patch_hetero36_paths(monkeypatch, tmp_path)
+    good = _row(_ROUNDS[0], 0)
+    logs = (
+        f"{_ROW_PREFIX}[1, 2, 3]\n"
+        f"{_ROW_PREFIX}{json.dumps(good)}\n"
+        f"{_ENV_PREFIX}{json.dumps({'torch': '2.8.0'})}\n"
+    )
+    job = _FakeJob(logs=logs)
+
+    rc = gpu_check._finish_hetero36(job, ok=True)
+
+    assert rc == 0
+    written = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert written == [good]
+    sidecar_data = json.loads(sidecar.read_text())
+    assert sidecar_data["rows_extracted"] == 2
+    assert sidecar_data["rows_appended"] == 1
+    assert sidecar_data["rows_skipped_invalid"] == 1
+    assert sidecar_data["rows_skipped_duplicate"] == 0
+    assert sidecar_data["rows_deduped_in_batch"] == 0
+    assert "shape-invalid" in capsys.readouterr().err
+
+
+def test_finish_hetero36_intra_batch_duplicate_reconciles_and_ledger_keeps_last(
+    tmp_path, monkeypatch
+):
+    # REQUIRED FIX 1 (fix-cycle 2) end-to-end: an intra-batch duplicate
+    # (round, seed) with a losing row must not vanish from the sidecar's
+    # accounting, and the ledger must keep the LAST occurrence.
+    ledger, sidecar = _patch_hetero36_paths(monkeypatch, tmp_path)
+    first_seen = _row(_ROUNDS[0], 0, secs=11.0)
+    last_seen = _row(_ROUNDS[0], 0, secs=99.0)
+    other = _row(_ROUNDS[1], 0)
+    rows = [first_seen, last_seen, other]
+    env = {"torch": "2.8.0"}
+    logs = "".join(f"{_ROW_PREFIX}{json.dumps(r)}\n" for r in rows)
+    logs += f"{_ENV_PREFIX}{json.dumps(env)}\n"
+    job = _FakeJob(logs=logs)
+
+    rc = gpu_check._finish_hetero36(job, ok=True)
+
+    assert rc == 0
+    written = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert written == [last_seen, other]
+    sidecar_data = json.loads(sidecar.read_text())
+    assert sidecar_data["rows_extracted"] == 3
+    assert sidecar_data["rows_appended"] == 2
+    assert sidecar_data["rows_skipped_duplicate"] == 0
+    assert sidecar_data["rows_skipped_invalid"] == 0
+    assert sidecar_data["rows_deduped_in_batch"] == 1
+    # Full reconciliation: extracted == appended + skipped_duplicate +
+    # skipped_invalid + deduped_in_batch.
+    assert sidecar_data["rows_extracted"] == (
+        sidecar_data["rows_appended"]
+        + sidecar_data["rows_skipped_duplicate"]
+        + sidecar_data["rows_skipped_invalid"]
+        + sidecar_data["rows_deduped_in_batch"]
+    )
+    assert sidecar_data["per_seed_wall_secs"][_ROUNDS[0]]["0"] == 99.0
+
+
+def test_finish_hetero36_nonzero_exit_when_job_not_ok_despite_valid_rows(tmp_path, monkeypatch):
+    # A job that failed overall (e.g. timed out mid-matrix) can still have
+    # produced well-formed rows/env for the seeds that did complete; those
+    # are still extracted, deduped, and appended, but the exit code
+    # reflects the job's own failure.
+    ledger, sidecar = _patch_hetero36_paths(monkeypatch, tmp_path)
+    row = _row(_ROUNDS[0], 0)
+    logs = f"{_ROW_PREFIX}{json.dumps(row)}\n{_ENV_PREFIX}{json.dumps({'torch': '2.8.0'})}\n"
+    job = _FakeJob(logs=logs)
+
+    rc = gpu_check._finish_hetero36(job, ok=False)
+
+    assert rc == 1
+    assert ledger.exists()
+
+
+def test_finish_hetero36_retry_is_idempotent_end_to_end(tmp_path, monkeypatch):
+    ledger, sidecar = _patch_hetero36_paths(monkeypatch, tmp_path)
+    rows = [_row(_ROUNDS[0], 0), _row(_ROUNDS[0], 1)]
+    env = {"torch": "2.8.0"}
+    logs = "".join(f"{_ROW_PREFIX}{json.dumps(r)}\n" for r in rows)
+    logs += f"{_ENV_PREFIX}{json.dumps(env)}\n"
+    job = _FakeJob(logs=logs)
+
+    first_rc = gpu_check._finish_hetero36(job, ok=True)
+    second_rc = gpu_check._finish_hetero36(job, ok=True)
+
+    assert (first_rc, second_rc) == (0, 0)
+    assert len(ledger.read_text().splitlines()) == 2
+    sidecar_data = json.loads(sidecar.read_text())
+    assert sidecar_data["rows_appended"] == 0
+    assert sidecar_data["rows_skipped_duplicate"] == 2
+    assert sidecar_data["rows_skipped_invalid"] == 0
+    assert sidecar_data["rows_deduped_in_batch"] == 0
+    assert sidecar_data["rows_extracted"] == 2
