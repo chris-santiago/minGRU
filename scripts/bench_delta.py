@@ -122,7 +122,13 @@ the import resolves from the source tree either way.
 
 from __future__ import annotations
 
+import json
+import platform
 import sys
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 # See the module docstring's "Import-path note": insert `src/` onto
@@ -141,17 +147,10 @@ _SRC_DIR = _REPO_ROOT / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
-import json
-import platform
-import subprocess
-import time
-from collections.abc import Callable
-from dataclasses import dataclass
-from datetime import datetime, timezone
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from _bench_env import cpu_info, git_commit_sha
 
 from mingru import DeltaMinGRU, GivensMinGRU
 from mingru.min_gru import matrix_affine_scan
@@ -416,35 +415,6 @@ def _verify_arms_agree() -> bool:
 # --- reporting ----------------------------------------------------------------
 
 
-def _cpu_info() -> str:
-    """Best-effort CPU model string; falls back to ``platform.processor()``.
-
-    ``platform.processor()`` alone is often uninformative (empty string,
-    or a bare architecture tag like ``arm``) -- ``sysctl``/``/proc/cpuinfo``
-    give the actual model name where available. Never raises: this is
-    metadata for the artifact, not something the bench should depend on.
-    """
-    system = platform.system()
-    try:
-        if system == "Darwin":
-            out = subprocess.run(
-                ["sysctl", "-n", "machdep.cpu.brand_string"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=True,
-            )
-            return out.stdout.strip()
-        if system == "Linux":
-            with open("/proc/cpuinfo") as f:
-                for line in f:
-                    if line.lower().startswith("model name"):
-                        return line.split(":", 1)[1].strip()
-    except Exception:
-        pass
-    return platform.processor() or platform.machine()
-
-
 def _render_markdown(rows: list[dict], meta: dict) -> str:
     lines = [
         "# DeltaMinGRU forward-path bench (chunked-WY vs naive affine-scan vs sequential)",
@@ -528,21 +498,6 @@ def _render_markdown(rows: list[dict], meta: dict) -> str:
         f"{'PASS' if ratio_t64 > 1 and ratio_t1024 > 1 else 'FAIL'}.",
     ]
     return "\n".join(lines) + "\n"
-
-
-def _git_commit_sha() -> str | None:
-    try:
-        out = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            cwd=_REPO_ROOT,
-            timeout=10,
-            check=True,
-        )
-        return out.stdout.strip()
-    except Exception:
-        return None
 
 
 def run() -> int:
@@ -630,10 +585,10 @@ def run() -> int:
         "warmup": _WARMUP,
         "reps": _REPS,
         "torch_version": torch.__version__,
-        "cpu_info": _cpu_info(),
+        "cpu_info": cpu_info(),
         "num_threads": torch.get_num_threads(),
         "platform": platform.platform(),
-        "git_commit": _git_commit_sha(),
+        "git_commit": git_commit_sha(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 

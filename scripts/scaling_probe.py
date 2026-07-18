@@ -143,6 +143,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+# Insert scripts/ onto sys.path to import _bench_env before any other imports
+# (similar rationale to bench_delta.py's sys.path bootstrap).
+_scripts_dir = Path(__file__).resolve().parent
+if str(_scripts_dir) not in sys.path:
+    sys.path.insert(0, str(_scripts_dir))
+
+from _bench_env import cpu_info, git_commit_sha  # noqa: E402
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _OUT_DIR = _REPO_ROOT / "experiments" / "bench"
 
@@ -610,50 +618,6 @@ def _run_one_config(
 # --- reporting -------------------------------------------------------------
 
 
-def _git_commit_sha() -> str | None:
-    try:
-        out = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            cwd=_REPO_ROOT,
-            timeout=10,
-            check=True,
-        )
-        return out.stdout.strip()
-    except Exception:
-        return None
-
-
-def _cpu_info() -> str:
-    """Best-effort CPU model string; falls back to ``platform.processor()``.
-
-    Mirrors ``scripts/bench_delta.py``'s ``_cpu_info`` (see that file's
-    docstring for the same rationale); duplicated here rather than
-    imported since ``scripts/bench_delta.py`` is outside this task's
-    footprint -- flagged as DUPLICATION-PENDING for the orchestrator.
-    """
-    system = platform.system()
-    try:
-        if system == "Darwin":
-            out = subprocess.run(
-                ["sysctl", "-n", "machdep.cpu.brand_string"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=True,
-            )
-            return out.stdout.strip()
-        if system == "Linux":
-            with open("/proc/cpuinfo") as f:
-                for line in f:
-                    if line.lower().startswith("model name"):
-                        return line.split(":", 1)[1].strip()
-    except Exception:
-        pass
-    return platform.processor() or platform.machine()
-
-
 def _oom_detail_cell(row: dict[str, Any]) -> str:
     """The 'oom detail' table cell: empty unless ``status == "oom"``.
 
@@ -838,7 +802,7 @@ def run(argv: list[str]) -> int:
     env = {
         "torch_version": torch_version,
         "machine": platform.node(),
-        "cpu_info": _cpu_info(),
+        "cpu_info": cpu_info(),
         "num_threads": num_threads,
         "platform": platform.platform(),
         "batch_size": args.batch_size,
@@ -846,7 +810,7 @@ def run(argv: list[str]) -> int:
         "warmup": args.warmup,
         "steps": args.steps,
         "timeout_secs": args.timeout,
-        "git_commit": _git_commit_sha(),
+        "git_commit": git_commit_sha(),
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
