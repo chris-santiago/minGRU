@@ -53,6 +53,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from min_gru import RotationMinGRU
+from min_gru import DeltaMinGRU as _PromotedDeltaMinGRU
 from min_gru import GivensMinGRU as _PromotedGivensMinGRU
 from min_gru import matrix_affine_scan as _promoted_matrix_affine_scan
 from probes import (
@@ -222,6 +223,13 @@ HETERO_FACTORY_MODELS = {
     # cause of the hetero-sg8 (rounds=3) fit-rate jump over 2D rotation.
     "hetero-sg8r1": ("signed-tanh", "givens8r1"),
     "hetero-sg8r2": ("signed-tanh", "givens8r2"),
+    # matched-state round (2026-07-18-matched-state-round-design.md §6):
+    # packaged chunked-WY DeltaMinGRU in place of the lab's sequential
+    # DeltaNetMixer, at the 64-element matched state (pdelta64, mirrors
+    # deltamini) and the delta mechanism's native 1024-element state
+    # (pdelta1024, mirrors deltaproduct2/hetero-sd2).
+    "hetero-pd64": ("signed-tanh", "pdelta64"),
+    "hetero-pd1024": ("signed-tanh", "pdelta1024"),
 }
 
 class GivensMinGRU(nn.Module):
@@ -373,6 +381,70 @@ def _selftest_bridge():
     )
 
 
+def _selftest_delta_bridge():
+    """Delta bridge: packaged min_gru.DeltaMinGRU must be state_dict-
+    compatible with the lab's DeltaScanMixer (DeltaNetMixer's parallel-
+    scan subclass -- same parameters, same state_dict) at both
+    matched-state round arm configs, in both load directions, and
+    forward-agree with it within the repo's atol=1e-5 tolerance on
+    random input at T=64 and a ragged T. This is the provenance seam
+    (spec acceptance criterion 1 / intent ledger stmt 1+6) that makes
+    the new hetero-pd64/hetero-pd1024 arms' evidence comparable to the
+    recorded sequential-delta rows: because DeltaMinGRU's docstring
+    states it mirrors DeltaNetMixer's parameter layout AND RNG-draw
+    order, a passing bridge proves the packaged mixer trains the same
+    function the lab mixer trained at the same seed (modulo disclosed
+    chunked-WY float reassociation).
+    """
+    configs = [
+        dict(nh=2, n_heads=1, d_k=8, d_v=8),  # pdelta64 (64-elem state)
+        dict(nh=2, n_heads=4, d_k=16, d_v=16),  # pdelta1024 (1024-elem state)
+    ]
+    d = D_MODEL
+    B = 4
+    for cfg in configs:
+        for T in (64, 13):  # 64 = arm training shape; 13 = ragged, non-power-of-two
+            seed = 31
+            torch.manual_seed(seed)
+            lab = DeltaScanMixer(d, d, **cfg)
+            torch.manual_seed(seed + 1)
+            x = torch.randn(B, T, d)
+
+            # direction 1: packaged loads the lab state_dict (key-compatible
+            # by construction if load_state_dict does not raise).
+            packaged = _PromotedDeltaMinGRU(d, d, **cfg)
+            packaged.load_state_dict(lab.state_dict())
+            err_fwd = (lab(x) - packaged(x)).abs().max().item()
+            print(
+                f"delta bridge {cfg} T={T} lab->packaged max abs diff: {err_fwd:.3e}"
+            )
+            assert err_fwd < 1e-5, (
+                f"delta bridge forward mismatch (lab weights) at {cfg}, T={T}: "
+                f"{err_fwd:.3e}"
+            )
+
+            # direction 2: lab loads the packaged state_dict (independently
+            # initialized, so this also proves the reverse key-compatibility
+            # is not an artifact of direction 1's shared weights).
+            torch.manual_seed(seed + 2)
+            packaged2 = _PromotedDeltaMinGRU(d, d, **cfg)
+            lab2 = DeltaScanMixer(d, d, **cfg)
+            lab2.load_state_dict(packaged2.state_dict())
+            err_rev = (packaged2(x) - lab2(x)).abs().max().item()
+            print(
+                f"delta bridge {cfg} T={T} packaged->lab max abs diff: {err_rev:.3e}"
+            )
+            assert err_rev < 1e-5, (
+                f"delta bridge forward mismatch (packaged weights) at {cfg}, "
+                f"T={T}: {err_rev:.3e}"
+            )
+    print(
+        "delta bridge: packaged min_gru.DeltaMinGRU state_dict/forward-"
+        "compatible with lab DeltaScanMixer at both arm configs (both load "
+        "directions, T=64 and ragged T) ok"
+    )
+
+
 # variants.py factories plus this lab's parallel-scan mixers
 LOCAL_FACTORIES = {
     **VARIANTS,
@@ -384,6 +456,14 @@ LOCAL_FACTORIES = {
     # mixers' 64-element state; parallel scan is cheap at d_k=8)
     "deltamini": lambda d_in, d_h: DeltaScanMixer(
         d_in, d_h, nh=2, n_heads=1, d_k=8, d_v=8
+    ),
+    # matched-state round (2026-07-18-matched-state-round-design.md §6):
+    # packaged chunked-WY DeltaMinGRU, arm configs exact per spec.
+    "pdelta64": lambda d_in, d_h: _PromotedDeltaMinGRU(
+        d_in, d_h, nh=2, n_heads=1, d_k=8, d_v=8
+    ),
+    "pdelta1024": lambda d_in, d_h: _PromotedDeltaMinGRU(
+        d_in, d_h, nh=2, n_heads=4, d_k=16, d_v=16
     ),
 }
 
@@ -514,6 +594,14 @@ def _hard_mode_eval(model, rot, make, T, seed, n_batches):
 
 
 def run_arm(args):
+    if args.require_torch is not None and torch.__version__ != args.require_torch:
+        raise SystemExit(
+            f"--require-torch {args.require_torch!r} requested but found "
+            f"torch=={torch.__version__}; refusing to run (no row written, "
+            "no training performed). Re-run under the pinned environment, "
+            "e.g. `uv run --no-project --with torch==2.5.1 python "
+            "experiments/hetero_lab.py ...`."
+        )
     args.curriculum_p, args.curriculum_max = _parse_curriculum(args.curriculum)
     if args.ckpt_t in GEN_LENGTHS or args.ckpt_t <= 0:
         raise SystemExit(
@@ -701,11 +789,19 @@ def main():
         "cannot discriminate (e.g. 384 for gen-consolidation arms).",
     )
     p.add_argument("--dry-run", action="store_true", help="print row, skip ledger append")
+    p.add_argument(
+        "--require-torch", default=None,
+        help="exact torch.__version__ string this run must match (e.g. "
+        "2.5.1, the repo's evidence pin); mismatch exits nonzero before "
+        "any training work and writes no row. Omit to preserve current "
+        "behavior (no version check).",
+    )
     args = p.parse_args()
     if args.selftest:
         _selftest_delta_scan()
         _selftest_givens()
         _selftest_bridge()
+        _selftest_delta_bridge()
         return
     if not args.round:
         p.error("--round is required (unless --selftest)")
