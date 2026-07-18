@@ -143,8 +143,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-# Insert scripts/ onto sys.path to import _bench_env before any other imports
-# (similar rationale to bench_delta.py's sys.path bootstrap).
+# Insert scripts/ onto sys.path so `from _bench_env import ...` resolves even
+# when this module is loaded by file path (importlib in tests), where the
+# script directory is not implicitly on sys.path.
 _scripts_dir = Path(__file__).resolve().parent
 if str(_scripts_dir) not in sys.path:
     sys.path.insert(0, str(_scripts_dir))
@@ -226,39 +227,32 @@ def _delta_sweep_config(d: int) -> _ProbeConfig:
     )
 
 
+def _delta_training_arm_config(label: str, n_heads: int, d: int) -> _ProbeConfig:
+    build_kwargs = {
+        "input_size": 64,
+        "hidden_size": 64,
+        "n_heads": n_heads,
+        "nh": 2,
+        "d_k": d,
+        "d_v": d,
+        "chunk_size": _DELTA_CHUNK_SIZE,
+    }
+    return _ProbeConfig(
+        label=label,
+        mechanism="delta",
+        build_kwargs=build_kwargs,
+        # Same derivation as _delta_sweep_config: state_elements comes from
+        # the build_kwargs it must agree with, never a separate literal.
+        state_elements=build_kwargs["n_heads"] * build_kwargs["d_k"] * build_kwargs["d_v"],
+        training_arm=True,
+    )
+
+
 def _delta_configs() -> tuple[_ProbeConfig, ...]:
     sweep = tuple(_delta_sweep_config(d) for d in (4, 8, 16, 32))
     training_arms = (
-        _ProbeConfig(
-            label="delta_train_pd64",
-            mechanism="delta",
-            build_kwargs={
-                "input_size": 64,
-                "hidden_size": 64,
-                "n_heads": 1,
-                "nh": 2,
-                "d_k": 8,
-                "d_v": 8,
-                "chunk_size": _DELTA_CHUNK_SIZE,
-            },
-            state_elements=1 * 8 * 8,
-            training_arm=True,
-        ),
-        _ProbeConfig(
-            label="delta_train_pd1024",
-            mechanism="delta",
-            build_kwargs={
-                "input_size": 64,
-                "hidden_size": 64,
-                "n_heads": 4,
-                "nh": 2,
-                "d_k": 16,
-                "d_v": 16,
-                "chunk_size": _DELTA_CHUNK_SIZE,
-            },
-            state_elements=4 * 16 * 16,
-            training_arm=True,
-        ),
+        _delta_training_arm_config("delta_train_pd64", n_heads=1, d=8),
+        _delta_training_arm_config("delta_train_pd1024", n_heads=4, d=16),
     )
     return sweep + training_arms
 
