@@ -37,6 +37,7 @@ from mingru import (
     MinGRUStack,
     RotationMinGRU,
     SignedMinGRU,
+    matrix_affine_scan,
 )
 
 SEED = 42
@@ -580,6 +581,132 @@ class TestDeltaMinGRU:
 
         assert ImportedDeltaMinGRU is DeltaMinGRU
 
+    # -- Task 3: chunked-WY forward ---------------------------------------
+    # `forward` now runs the chunked-WY UT-transform parallel form
+    # (`_forward_chunked`) instead of the token loop; `step` (and the
+    # hand-rolled oracles below) stay the correctness anchors. Spec section
+    # 7 invariants: sequential/parallel equivalence at T=128 and T=1024,
+    # chunk_size invariance (including ragged final chunks), no per-token
+    # d_k x d_k transition ever materialized (verified structurally by the
+    # affine-scan oracle needing to build that matrix by hand -- the layer
+    # under test never does).
+
+    @pytest.mark.parametrize(
+        "T_chunk,chunk_size",
+        [
+            # T=13: C in {1, 3, 64 (>T), 13 (=T), 50 (>T)}; 3 doesn't
+            # divide 13 evenly (chunks 3,3,3,3,1) -- ragged final chunk.
+            (13, 1),
+            (13, 3),
+            (13, 64),
+            (13, 13),
+            (13, 50),
+            # T=128: C in {1, 3, 64 (<T, doesn't divide evenly), 128 (=T),
+            # 165 (>T)}.
+            (128, 1),
+            (128, 3),
+            (128, 64),
+            (128, 128),
+            (128, 165),
+        ],
+    )
+    def test_chunk_size_invariant_vs_step_oracle(self, T_chunk, chunk_size):
+        """``chunk_size`` is performance-only (spec section 7): every value
+        must reproduce the token-by-token ``step`` recurrence exactly
+        (within tolerance), not just agree with other chunk sizes.
+        """
+        torch.manual_seed(SEED)
+        layer = DeltaMinGRU(D_IN, D_H, n_heads=2, nh=2, chunk_size=chunk_size)
+        x = torch.randn(B, T_chunk, D_IN)
+        assert torch.allclose(layer(x), _delta_step_sequence(layer, x), atol=1e-5)
+
+    @pytest.mark.parametrize("T_large", [128, 1024])
+    def test_forward_matches_sequential_oracle_large_T(self, T_large):
+        """Spec section 7's forward<->sequential-recurrence parity at
+        T=128 and T=1024 (Task 2 only asserted this at small T). Uses
+        ``_ref_delta_forward`` rather than ``step`` -- ``step`` is
+        ``@torch.no_grad()`` by design (matches the family's other
+        mixers), so it cannot anchor the gradient half of this
+        invariant; ``_ref_delta_forward`` is the same recurrence,
+        differentiable.
+        """
+        torch.manual_seed(SEED)
+        layer = DeltaMinGRU(D_IN, D_H, n_heads=2, nh=2)
+        x = torch.randn(2, T_large, D_IN, requires_grad=True)
+        y = layer(x)
+        ref = _ref_delta_forward(layer, x)
+        assert torch.allclose(y, ref, atol=1e-5)
+        grad_y = torch.autograd.grad(y.sum(), x, retain_graph=True)[0]
+        grad_ref = torch.autograd.grad(ref.sum(), x, retain_graph=True)[0]
+        assert torch.allclose(grad_y, grad_ref, atol=1e-3)
+
+    @pytest.mark.parametrize(
+        "nh_affine,n_heads_affine,T_affine",
+        [
+            (1, 1, 1),
+            (1, 4, 13),
+            (2, 1, 128),
+            (2, 4, 1),
+            (3, 1, 13),
+            (3, 4, 128),
+            (1, 1, 1024),
+            (3, 4, 1024),
+        ],
+    )
+    def test_forward_matches_affine_scan_oracle(self, nh_affine, n_heads_affine, T_affine):
+        """Second, independent oracle (spec section 10 dual-oracle strategy):
+        ``_ref_affine_delta_forward`` composes each token's micro-steps
+        into a per-token affine map and reduces with the frozen
+        ``matrix_affine_scan`` -- the "measured-slow" reference path
+        the chunked-WY form must not take, but exactly correct. An error
+        in the chunked-WY composition cannot agree with both this and
+        the sequential oracle (previous test) simultaneously. Covers
+        nh in {1, 2, 3}, n_heads in {1, 4}, T in {1, 13, 128, 1024}
+        (spec/acceptance-criteria parameter space) via a curated subset
+        rather than the full 3*2*4 cross product, each value exercised
+        at least once, output and gradients both checked.
+        """
+        torch.manual_seed(SEED)
+        d_k = 3
+        layer = DeltaMinGRU(D_IN, D_H, n_heads=n_heads_affine, nh=nh_affine, d_k=d_k, d_v=d_k)
+        x = torch.randn(2, T_affine, D_IN, requires_grad=True)
+        y = layer(x)
+        ref = _ref_affine_delta_forward(layer, x)
+        assert torch.allclose(y, ref, atol=1e-5)
+        grad_y = torch.autograd.grad(y.sum(), x, retain_graph=True)[0]
+        grad_ref = torch.autograd.grad(ref.sum(), x, retain_graph=True)[0]
+        assert torch.allclose(grad_y, grad_ref, atol=1e-3)
+
+    def test_chaining_contract_misaligned_chunk_boundaries(self):
+        """Chaining (spec section 6) with an explicit small ``chunk_size``:
+        the second ``forward`` call (``h_0=state``) restarts chunk
+        indexing from 0, so its chunk boundaries fall at different
+        sequence offsets than the equivalent span computed inside the
+        single full-sequence call -- this must not matter.
+        """
+        torch.manual_seed(SEED)
+        layer = DeltaMinGRU(D_IN, D_H, n_heads=2, nh=2, chunk_size=4)
+        x = torch.randn(B, 13, D_IN, requires_grad=True)
+        x1, x2 = x[:, :5], x[:, 5:]
+
+        y_full = layer(x)
+        y1, state = layer(x1, return_state=True)
+        y2 = layer(x2, h_0=state)
+        y_chained = torch.cat([y1, y2], dim=1)
+        assert torch.allclose(y_full, y_chained, atol=1e-5)
+
+        grad_full = torch.autograd.grad(y_full.sum(), x, retain_graph=True)[0]
+        grad_chained = torch.autograd.grad(y_chained.sum(), x, retain_graph=True)[0]
+        assert torch.allclose(grad_full, grad_chained, atol=1e-3)
+
+    def test_gradcheck_double_precision(self):
+        """``gradcheck`` on a tiny float64 instance (spec section 9/10)."""
+        torch.manual_seed(SEED)
+        layer = DeltaMinGRU(4, 4, n_heads=1, nh=2, d_k=2, d_v=2, chunk_size=2).double()
+        x = torch.randn(2, 5, 4, dtype=torch.float64, requires_grad=True)
+
+        assert torch.autograd.gradcheck(layer, (x,), atol=1e-6, eps=1e-6)
+
 
 # ===========================================================================
 # 7. MinGRUBlock / MinGRUStack
@@ -817,6 +944,51 @@ def _ref_delta_forward(layer: DeltaMinGRU, x: torch.Tensor) -> torch.Tensor:
             H = H + beta_ * torch.einsum("bhk,bhv->bhkv", k, v)
         ys.append(torch.einsum("bhk,bhkv->bhv", q[:, t], H))
     y = torch.stack(ys, dim=1).reshape(B_, T_, n_heads * d_v)
+    return layer.out_proj(y)
+
+
+def _ref_affine_delta_forward(layer: DeltaMinGRU, x: torch.Tensor) -> torch.Tensor:
+    """Second, independent DeltaMinGRU oracle: per-token affine maps through
+    the FROZEN ``matrix_affine_scan`` (Task 3's dual-oracle strategy, spec
+    section 10).
+
+    Composes each token's ``nh`` ordered micro-steps into a single per-token
+    affine map ``H_t = A_t @ H_{t-1} + B_t`` (materializing a ``d_k x d_k``
+    matrix per token -- explicitly the slow path the chunked-WY ``forward``
+    under test must avoid, per its own docstring) by induction on the
+    micro-step recurrence from ``DeltaMinGRU``'s class docstring:
+    ``A^(0) = I``, ``B^(0) = 0``,
+    ``A^(j) = (I - beta_j k_j k_j^T) A^(j-1)``,
+    ``B^(j) = (I - beta_j k_j k_j^T) B^(j-1) + beta_j k_j v_j^T``, giving
+    ``A_t = A^(nh)``, ``B_t = B^(nh)``. The resulting per-token maps are
+    reduced by ``matrix_affine_scan`` (imported, not reimplemented) rather
+    than a hand-rolled scan, so the composition math above is the only new
+    logic this oracle introduces; readout is ``y_t = q_t^T H_t`` using
+    ``matrix_affine_scan``'s ``Bbar`` directly (``H_0 = 0`` always, since
+    these tests never pass ``h_0``). Shares no code with ``_coeffs``/
+    ``_micro_step``/``_contract_state``/``forward``/``_forward_chunked``.
+    """
+    B_, T_, _ = x.shape
+    n_heads, d_k, d_v, nh = layer.n_heads, layer.d_k, layer.d_v, layer.nh
+    q = layer.linear_q(x).view(B_, T_, n_heads, d_k)
+    ks = [F.normalize(lin(x).view(B_, T_, n_heads, d_k), dim=-1) for lin in layer.linear_k]
+    vs = [lin(x).view(B_, T_, n_heads, d_v) for lin in layer.linear_v]
+    betas = [2 * torch.sigmoid(lin(x)) for lin in layer.linear_beta]
+
+    eye = torch.eye(d_k, dtype=x.dtype).expand(B_, T_, n_heads, d_k, d_k)
+    A = eye
+    Bm = x.new_zeros(B_, T_, n_heads, d_k, d_v)
+    for j in range(nh):
+        k, v, beta = ks[j], vs[j], betas[j]
+        beta_ = beta[..., None, None]
+        kkT = torch.einsum("ntha,nthb->nthab", k, k)
+        A_j = eye - beta_ * kkT
+        B_j = beta_ * torch.einsum("ntha,nthv->nthav", k, v)
+        A = torch.einsum("nthab,nthbc->nthac", A_j, A)
+        Bm = torch.einsum("nthab,nthbv->nthav", A_j, Bm) + B_j
+
+    _, Bbar = matrix_affine_scan(A, Bm)
+    y = torch.einsum("ntha,nthav->nthv", q, Bbar).reshape(B_, T_, n_heads * d_v)
     return layer.out_proj(y)
 
 

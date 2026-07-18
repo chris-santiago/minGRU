@@ -2554,16 +2554,30 @@ class DeltaMinGRU(nn.Module):
     natural origin, not a degenerate point the way it is for a group
     action.
 
-    This class implements only the sequential per-token recurrence
-    above (correct, ``O(T * nh)`` per-sequence cost); it never
-    materializes a per-token ``d_k x d_k`` transition matrix (each
-    micro-step is a rank-1 correction applied directly to ``H``, never
-    composed into an explicit matrix). A future chunked-WY parallel
-    forward (the standard efficient algorithm for this recurrence --
-    Yang et al. 2024, arXiv:2406.06484) is planned as a
-    semantics-preserving, performance-only swap of ``forward``'s
-    internals; this sequential form (and ``step``) is that future
-    form's correctness oracle.
+    ``step`` implements the sequential per-token recurrence above
+    directly (correct, ``O(T * nh)`` per-sequence cost) and is
+    ``forward``'s correctness oracle. ``forward`` instead runs the
+    chunked-WY parallel form (the standard efficient algorithm for this
+    recurrence -- Yang et al. 2024, arXiv:2406.06484): the ``nh * T``
+    ordered rank-1 updates are processed ``chunk_size`` tokens at a
+    time, each chunk's cumulative transition carried via one
+    unit-lower-triangular solve (the UT transform) instead of a
+    per-token loop. Both forms are exactly the same function
+    (semantically identical within floating-point tolerance,
+    ``chunk_size`` has no effect on the result) and neither ever
+    materializes a per-token (or per-chunk) ``d_k x d_k`` transition
+    matrix: each micro-step is a rank-1 correction, and the chunked
+    form's UT transform operates on ``nh * chunk_size``-sized matrices
+    built from ``k``/``v``/``beta``, never on an explicit ``d_k x d_k``
+    matrix. The fp32 agreement is chunk-size-bounded at large ``T``,
+    though: at ``T = 1024`` with the default ``chunk_size = 64`` the
+    sequential/chunked deviation is ~3e-6, but a single-chunk run
+    (``chunk_size >= T``) at the same ``T`` accumulates to ~1.2e-5
+    through the one ``(nh * C)``-deep forward substitution the UT
+    transform solves in a single shot rather than ``T`` separate
+    ``nh``-deep ones -- still inside the repo's ``atol=1e-5`` forward
+    tolerance, but close enough to it that the default (not an
+    oversized) chunk size is recommended for long sequences.
 
     Time decay is not supported: the constructor rejects any ``decay is
     not None`` (``decay``/``decay_rate``/``log1p_delta`` are accepted
@@ -2594,11 +2608,11 @@ class DeltaMinGRU(nn.Module):
     d_v : int, optional
         Per-head value dimension. Defaults to ``d_k``.
     chunk_size : int, default=64
-        Reserved for the future chunked-WY parallel forward; this
-        sequential ``forward`` ignores it (performance-only knob, no
-        semantic effect once the parallel form lands). Validated at
-        construction (must be positive) so the constructor contract is
-        already stable for that swap.
+        Number of tokens processed per UT-transform chunk in the
+        chunked-WY ``forward`` (performance-only knob: outputs and
+        gradients are invariant to ``chunk_size``, including ``C=1``
+        and ``C >= T`` and ragged final chunks). Validated at
+        construction (must be positive).
     decay : {"fixed", "learnable", None}, default=None
         Must be ``None`` -- time decay is not implemented for the
         delta-rule transition. Accepted for signature uniformity with
@@ -2801,6 +2815,111 @@ class DeltaMinGRU(nn.Module):
         H = H + beta * torch.einsum("...hk,...hv->...hkv", k, v)
         return H
 
+    def _forward_chunked(
+        self, x: torch.Tensor, H: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Chunked-WY parallel form of the sequential recurrence (``step``'s math).
+
+        Processes the ``nh * T`` ordered rank-1 updates ``chunk_size``
+        tokens (``nh * chunk_size`` micro-steps) at a time. Within a
+        chunk, per head, write the recurrence
+        ``H_i = H_{i-1} + beta_i k_i (v_i - H_{i-1}^T k_i)^T`` for
+        micro-steps ``i = 1..M`` (``M = nh * C``) as
+        ``H_i = H_0 + sum_{l<=i} beta_l k_l u_l^T`` with the "pseudo
+        value" ``u_i = v_i - H_{i-1}^T k_i``. Substituting the sum back
+        into ``u_i`` gives a triangular linear system in the ``u``'s:
+
+            ``T @ U = V - K @ H_0``
+
+        where ``K``/``V`` stack the chunk's ``k_i``/``v_i`` as rows (in
+        micro-step order), and ``T`` is unit-lower-triangular with
+        ``T[i, i] = 1`` and ``T[i, l] = beta_l * (k_l . k_i)`` for
+        ``l < i`` (the UT transform). Solving ``T`` by
+        ``torch.linalg.solve_triangular(..., unitriangular=True)``
+        (dividing only by the implicit unit diagonal -- the repo's
+        permitted division) gives ``U``, and the chunk-end state is
+        ``H_M = H_0 + K^T @ (beta * U)``.
+
+        Per-token readouts are read at micro-step boundaries only
+        (after a token's *last* micro-step): token ``t``'s query sees
+        ``u_l`` for every micro-step ``l`` up to and including its own
+        ``nh``-th, so the readout mask is block-causal at token
+        granularity -- inclusive of a token's own micro-steps, exclusive
+        of later tokens' -- not the strictly-lower-triangular mask the
+        ``T`` matrix above uses (which is at micro-step, not token,
+        granularity, and always strict since ``u_i`` cannot depend on
+        itself).
+
+        Every matrix built here has shape ``(..., M, M)``,
+        ``(..., M, d_k)``, ``(..., M, d_v)``, or ``(..., d_k, d_v)``
+        (the state ``H`` itself, not a transition) -- no ``d_k x d_k``
+        transition matrix (per-token or per-chunk) is ever materialized,
+        matching ``step``'s per-micro-step rank-1 form. Deliberately
+        does not route through ``_micro_step``/``_contract_state``: those
+        encode the one-micro-step-at-a-time update this chunked form
+        replaces with batched linear algebra over ``nh * chunk_size``
+        micro-steps at once; ``_coeffs`` (the projection math) is still
+        the single source for ``q``/``k``/``v``/``beta``, shared with
+        ``step``.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input sequence, shape ``(B, T, input_size)``.
+        H : torch.Tensor
+            Initial per-head state, shape ``(B, n_heads, d_k, d_v)``.
+
+        Returns
+        -------
+        tuple of torch.Tensor
+            ``(y, H_T)``: ``y`` shape ``(B, T, n_heads, d_v)`` (not yet
+            flattened/``out_proj``-ed -- the caller does that); ``H_T``
+            shape ``(B, n_heads, d_k, d_v)``, the final state.
+        """
+        B, T, _ = x.shape
+        nh, n_heads, d_k, d_v = self.nh, self.n_heads, self.d_k, self.d_v
+        q, ks, vs, betas = self._coeffs(x)
+        # Stack the nh micro-step projections and move n_heads in front of
+        # the token axis so each chunk's slice-then-reshape below merges
+        # (chunk_tokens, nh) into one micro-step axis M in token-major,
+        # micro-step-minor order -- (t=0,j=0), (t=0,j=1), ..., (t=1,j=0), ...
+        # -- matching the ordered-update convention `step` applies in.
+        K_all = torch.stack(ks, dim=2).permute(0, 3, 1, 2, 4)  # (B, n_heads, T, nh, d_k)
+        V_all = torch.stack(vs, dim=2).permute(0, 3, 1, 2, 4)  # (B, n_heads, T, nh, d_v)
+        beta_all = torch.stack(betas, dim=2).permute(0, 3, 1, 2)  # (B, n_heads, T, nh)
+        Q_all = q.permute(0, 2, 1, 3)  # (B, n_heads, T, d_k)
+
+        chunk_size = self.chunk_size
+        y_chunks = []
+        for start in range(0, T, chunk_size):
+            end = min(start + chunk_size, T)
+            C = end - start
+            M = nh * C
+            K = K_all[:, :, start:end].reshape(B, n_heads, M, d_k)
+            V = V_all[:, :, start:end].reshape(B, n_heads, M, d_v)
+            beta = beta_all[:, :, start:end].reshape(B, n_heads, M)
+            Q = Q_all[:, :, start:end]  # (B, n_heads, C, d_k)
+
+            KK = K @ K.transpose(-1, -2)  # (B, n_heads, M, M); k_i . k_l
+            strict_lower = torch.tril(K.new_ones(M, M), diagonal=-1)
+            eye_M = torch.eye(M, dtype=K.dtype, device=K.device)
+            T_mat = eye_M + KK * beta.unsqueeze(-2) * strict_lower  # unit lower-triangular
+            rhs = V - K @ H  # (B, n_heads, M, d_v)
+            U = torch.linalg.solve_triangular(T_mat, rhs, upper=False, unitriangular=True)
+
+            R = Q @ K.transpose(-1, -2)  # (B, n_heads, C, M); q_t . k_l
+            # Token-granularity block-causal mask: token t (row) sees every
+            # micro-step of tokens 0..t, i.e. columns 0..(t+1)*nh - 1
+            # inclusive -- the C x C causal triangle repeated nh times
+            # along columns, not the strictly-lower M x M mask above.
+            read_mask = torch.tril(Q.new_ones(C, C)).repeat_interleave(nh, dim=1)  # (C, M)
+            y_chunk = Q @ H + (R * beta.unsqueeze(-2) * read_mask) @ U
+            H = H + K.transpose(-1, -2) @ (beta.unsqueeze(-1) * U)
+            y_chunks.append(y_chunk)
+
+        y = torch.cat(y_chunks, dim=2).permute(0, 2, 1, 3)  # (B, T, n_heads, d_v)
+        return y, H
+
     def forward(
         self,
         x: torch.Tensor,
@@ -2808,13 +2927,12 @@ class DeltaMinGRU(nn.Module):
         delta_t: torch.Tensor | None = None,
         return_state: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Sequential forward over a full sequence (correctness oracle).
+        """Chunked-WY forward over a full sequence.
 
-        Runs the token-by-token recurrence from the class docstring
-        directly (``O(T * nh)`` per-head rank-1 updates); a future
-        chunked-WY parallel form is a performance-only swap of this
-        method's internals, semantically identical within floating-
-        point tolerance.
+        Computes exactly the function ``step`` computes token-by-token
+        (``chunk_size`` is a performance-only knob -- see
+        ``_forward_chunked``), via the chunked-WY UT transform instead
+        of a per-token Python loop.
 
         Parameters
         ----------
@@ -2856,13 +2974,8 @@ class DeltaMinGRU(nn.Module):
             if tuple(h_0.shape) != expected:
                 raise ValueError(f"h_0 must have shape {expected} (got {tuple(h_0.shape)})")
             H = h_0.reshape(B, self.n_heads, self.d_k, self.d_v)
-        q, ks, vs, betas = self._coeffs(x)
-        outs = []
-        for t in range(T):
-            for j in range(self.nh):
-                H = self._micro_step(H, ks[j][:, t], vs[j][:, t], betas[j][:, t])
-            outs.append(self._contract_state(q[:, t], H))
-        y = torch.stack(outs, dim=1).reshape(B, T, self.n_heads * self.d_v)
+        y, H = self._forward_chunked(x, H)
+        y = y.reshape(B, T, self.n_heads * self.d_v)
         y = self.out_proj(y)
         if return_state:
             return y, H.reshape(*expected)
@@ -2877,9 +2990,16 @@ class DeltaMinGRU(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Single recurrent step; same real-state convention as forward().
 
-        Computed from the same ``_coeffs``/``_micro_step`` helpers
-        ``forward()`` uses (applied once instead of over the full
-        sequence), so the two paths cannot drift apart.
+        Computed from the same ``_coeffs`` helper ``forward()`` uses
+        (applied once instead of over the full sequence). Unlike the
+        other mixers, ``forward()`` does not also reuse this method's
+        per-micro-step update (``_micro_step``) -- it runs the
+        chunked-WY UT transform instead (``_forward_chunked``), a
+        different but algebraically equivalent computation -- so
+        forward/step parity here is guaranteed by the WY-transform
+        derivation, not by shared code, and is pinned by the dual
+        sequential/affine-scan oracle tests (``TestDeltaMinGRU``,
+        ``TestMixerOracles``).
 
         Parameters
         ----------
