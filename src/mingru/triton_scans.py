@@ -81,8 +81,9 @@ U)`; it writes `y`, the per-chunk boundary states (`Hbound`, the start-of-
 chunk `H`), and the final `H_T`. Unlike the four scan ops and the angle-
 fused path, this pair is plain `@triton.jit` launched directly via
 `_delta_forward_launch` (not `triton_op`/`register_autograd`): the delta
-path's backward is a hand-derived `torch.autograd.Function` (a later task)
-built on `Hbound`, and its target user is eager-only, so the
+path's backward is a hand-derived `torch.autograd.Function` (`_DeltaScanFn`,
+which `delta_scan_impl` routes through) whose recompute-based reverse-chunk
+loop is seeded from `Hbound`, and its target user is eager-only, so the
 compile-tracing machinery the four scan ops use is deliberately not in this
 path. Every tile is padded to `max(16, next_pow2(...))`
 (`_delta_block_sizes`) so all `tl.dot`s route through
@@ -1997,6 +1998,167 @@ if _HAS_TRITON:
         )
         return y, H_T, Hbound
 
+    class _DeltaScanFn(torch.autograd.Function):
+        """Autograd wrapper making the two-kernel delta forward differentiable.
+
+        The forward is the raw Triton launch (``_delta_forward_launch``); the
+        backward is a hand-derived reverse-chunk recurrence (no autograd
+        through the kernels -- they are plain ``@triton.jit`` launches, opaque
+        to autograd). This is the seam that lets the eager-only target user
+        ("compiling isn't always an option") get a full training-step speedup:
+        a forward-only kernel would capture only the forward share, so the
+        round's fwd+bwd speed bar is met here.
+
+        Differentiates w.r.t. the five assembled sequence inputs ``Q``, ``K``,
+        ``V``, ``beta`` and the initial state ``H0`` (all ``needs_input_grad``
+        combinations, including the ``H0`` grad state-carrying callers need);
+        ``chunk_size`` is a non-tensor and gets a ``None`` grad. Parameter
+        grads (``_coeffs``/``out_proj``) flow through these five in ordinary
+        autograd outside the Function, exactly as on the eager path.
+
+        Recompute-based, per spec section 5: forward saves only the assembled
+        inputs plus the per-chunk boundary states ``Hbound`` (cheap:
+        ``num_chunks * d_k * d_v`` per batch-head); the intra-chunk
+        intermediates (``T``, ``U``, the masks) are recomputed in the
+        backward, so kernel-path peak training memory stays at or below the
+        eager path's. The backward is pure cuBLAS-shaped torch (batched GEMMs
+        + two triangular solves) -- spec section 5 permits torch ops where
+        cuBLAS-shaped and does not require a single-kernel backward; the speed
+        bar is what governs. ``@once_differentiable`` runs the backward under
+        ``no_grad`` so a second ``.backward()`` raises rather than silently
+        mis-differentiating (double-backward is unsupported, the standard
+        custom-Function limitation).
+        """
+
+        @staticmethod
+        def forward(ctx, Q, K, V, beta, H0, chunk_size):
+            """Run the two-kernel launch; save inputs + boundary states for backward.
+
+            Returns the public ``(y, H_T)`` pair; the boundary states
+            ``Hbound`` are stashed on the tape (not returned) so the reverse
+            chunk loop can seed each chunk's start-of-chunk state without
+            re-running the sequential pass.
+            """
+            y, H_T, Hbound = _delta_forward_launch(Q, K, V, beta, H0, chunk_size)
+            ctx.save_for_backward(Q, K, V, beta, H0, Hbound)
+            ctx.chunk_size = chunk_size
+            return y, H_T
+
+        @staticmethod
+        @torch.autograd.function.once_differentiable
+        def backward(ctx, dy, dH_T):
+            """Reverse-chunk backward carrying ``dH``; recompute intra-chunk state.
+
+            Walks chunks last-to-first, carrying ``dH`` = gradient w.r.t. the
+            chunk's output state (seeded from ``dH_T``). Per chunk it rebuilds
+            ``T``, ``U`` and the masks from the saved inputs and the saved
+            start-of-chunk state ``Hbound[c]`` (matching the eager
+            ``_forward_chunked`` math exactly), then applies the transpose
+            triangular solve for the backward through ``U = T^-1 (V - K H)``.
+            Returns grads positionally for ``(Q, K, V, beta, H0, chunk_size)``;
+            ``chunk_size`` (non-tensor) gets ``None``, and any input whose
+            ``needs_input_grad`` is ``False`` also gets ``None``.
+            """
+            Q, K, V, beta, H0, Hbound = ctx.saved_tensors
+            chunk_size = ctx.chunk_size
+            need_Q, need_K, need_V, need_beta, need_H0, _ = ctx.needs_input_grad
+
+            B, n_heads, T, d_k = Q.shape
+            nh = K.shape[3]
+            d_v = V.shape[4]
+
+            def mT(x):
+                return x.transpose(-1, -2)
+
+            # dy / dH_T always arrive as materialized (possibly all-zero)
+            # tensors here, never None: forward never calls
+            # `ctx.set_materialize_grads(False)`, so an unused output still
+            # gets a concrete zero grad -- see the `register_autograd`
+            # None-grad-handling note above (~line 1277) for the same
+            # verified-against-torch-2.8 behavior on the sibling backwards.
+            dH = dH_T
+
+            dQ = torch.zeros_like(Q)
+            dK = torch.zeros_like(K)
+            dV = torch.zeros_like(V)
+            dbeta = torch.zeros_like(beta)
+
+            num_chunks = Hbound.shape[2]
+            for c in range(num_chunks - 1, -1, -1):
+                start = c * chunk_size
+                end = min(start + chunk_size, T)
+                C = end - start
+                M = nh * C
+
+                Kc = K[:, :, start:end].reshape(B, n_heads, M, d_k)
+                Vc = V[:, :, start:end].reshape(B, n_heads, M, d_v)
+                betac = beta[:, :, start:end].reshape(B, n_heads, M)
+                Qc = Q[:, :, start:end]  # (B, n_heads, C, d_k)
+                Hc = Hbound[:, :, c]  # (B, n_heads, d_k, d_v) -- start-of-chunk state
+                dyc = dy[:, :, start:end]  # (B, n_heads, C, d_v)
+
+                # --- recompute intra-chunk intermediates (eager math) --------
+                KK = Kc @ mT(Kc)  # (B, n_heads, M, M)
+                strict = torch.tril(Kc.new_ones(M, M), diagonal=-1)
+                eye_M = torch.eye(M, dtype=Kc.dtype, device=Kc.device)
+                betac_col = betac.unsqueeze(-2)  # (B, n_heads, 1, M)
+                T_mat = eye_M + KK * betac_col * strict  # unit lower-triangular
+                U = torch.linalg.solve_triangular(
+                    T_mat, Vc - Kc @ Hc, upper=False, unitriangular=True
+                )  # (B, n_heads, M, d_v)
+                S = Qc @ mT(Kc)  # (B, n_heads, C, M)
+                read_mask = torch.tril(Qc.new_ones(C, C)).repeat_interleave(nh, dim=1)  # (C, M)
+                P = S * betac_col * read_mask  # (B, n_heads, C, M)
+
+                # --- backward through y = Q H + P U --------------------------
+                dQc = dyc @ mT(Hc)  # (B, n_heads, C, d_k)
+                dHc = mT(Qc) @ dyc  # (B, n_heads, d_k, d_v)
+                dP = dyc @ mT(U)  # (B, n_heads, C, M)
+                dU = mT(P) @ dyc  # (B, n_heads, M, d_v)
+
+                # --- backward through H_out = H + K^T (beta * U) -------------
+                dK_local = (betac.unsqueeze(-1) * U) @ mT(dH)  # from K^T (beta U)
+                dbU = Kc @ dH  # (B, n_heads, M, d_v)
+                dU = dU + betac.unsqueeze(-1) * dbU
+                dbeta_local = (U * dbU).sum(-1)  # (B, n_heads, M)
+                dHc = dHc + dH  # identity term of H_out = H + ...
+
+                # --- backward through P = (Q K^T) * beta * read_mask ---------
+                dS = dP * betac_col * read_mask  # (B, n_heads, C, M)
+                dbeta_local = dbeta_local + (dP * S * read_mask).sum(-2)
+                dQc = dQc + dS @ Kc
+                dK_local = dK_local + mT(dS) @ Qc
+
+                # --- backward through U = T^-1 (V - K H): transpose solve ----
+                G = torch.linalg.solve_triangular(
+                    mT(T_mat), dU, upper=True, unitriangular=True
+                )  # T^-T dU, (B, n_heads, M, d_v)
+                dT = -(G @ mT(U))  # (B, n_heads, M, M)
+                dV_local = G
+                dK_local = dK_local - G @ mT(Hc)
+                dHc = dHc - mT(Kc) @ G
+
+                # --- backward through T = I + (K K^T) * beta * strict --------
+                dKK = dT * betac_col * strict  # (B, n_heads, M, M)
+                dbeta_local = dbeta_local + (dT * KK * strict).sum(-2)
+                dK_local = dK_local + dKK @ Kc + mT(dKK) @ Kc
+
+                # --- scatter chunk grads; carry dH to the previous chunk -----
+                dQ[:, :, start:end] = dQc
+                dK[:, :, start:end] = dK_local.reshape(B, n_heads, C, nh, d_k)
+                dV[:, :, start:end] = dV_local.reshape(B, n_heads, C, nh, d_v)
+                dbeta[:, :, start:end] = dbeta_local.reshape(B, n_heads, C, nh)
+                dH = dHc
+
+            return (
+                dQ if need_Q else None,
+                dK if need_K else None,
+                dV if need_V else None,
+                dbeta if need_beta else None,
+                dH if need_H0 else None,
+                None,  # chunk_size (non-tensor)
+            )
+
     def delta_scan_impl(
         Q: torch.Tensor,
         K: torch.Tensor,
@@ -2032,7 +2194,13 @@ if _HAS_TRITON:
         """
         _delta_validate_envelope(Q, K, V, beta, H0, chunk_size)
         try:
-            y, H_T, _Hbound = _delta_forward_launch(Q, K, V, beta, H0, chunk_size)
+            # Route through the autograd Function (not the raw launch) so the
+            # registered entry point is differentiable: `.backward()` through
+            # it yields grads for Q/K/V/beta/H0, and parameter grads flow via
+            # `_coeffs`/`out_proj` exactly as on the eager path. The Function
+            # runs `_delta_forward_launch` internally and stashes the boundary
+            # states its recompute backward needs.
+            y, H_T = _DeltaScanFn.apply(Q, K, V, beta, H0, chunk_size)
         except Exception as exc:  # kernel launch/compile failure -> loud fallback
             raise ScanFallback(f"DeltaMinGRU Triton kernel failed: {exc}") from exc
         return y, H_T
