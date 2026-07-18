@@ -1,0 +1,178 @@
+{
+  "env": {
+    "torch": "2.5.1",
+    "num_threads": 1,
+    "pool_size": 6,
+    "platform": "macOS-15.7.5-arm64-arm-64bit-Mach-O"
+  },
+  "runs": [
+    {
+      "round": "hetero-loop-20-pd64",
+      "seed": 0,
+      "wall_secs_contended": 299.031,
+      "peak_rss_bytes": 1735917568,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-20-pd64",
+      "seed": 1,
+      "wall_secs_contended": 299.438,
+      "peak_rss_bytes": 1665843200,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-20-pd64",
+      "seed": 2,
+      "wall_secs_contended": 315.833,
+      "peak_rss_bytes": 2061729792,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-20-pd64",
+      "seed": 3,
+      "wall_secs_contended": 300.57,
+      "peak_rss_bytes": 1546059776,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-20-pd64",
+      "seed": 4,
+      "wall_secs_contended": 299.567,
+      "peak_rss_bytes": 1676509184,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-20-pd64",
+      "seed": 5,
+      "wall_secs_contended": 300.548,
+      "peak_rss_bytes": 1535967232,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-20-pd64",
+      "seed": 6,
+      "wall_secs_contended": 302.501,
+      "peak_rss_bytes": 1633484800,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-20-pd64",
+      "seed": 7,
+      "wall_secs_contended": 301.238,
+      "peak_rss_bytes": 1925431296,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-20-pd64",
+      "seed": 8,
+      "wall_secs_contended": 301.574,
+      "peak_rss_bytes": 1764704256,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-20-pd64",
+      "seed": 9,
+      "wall_secs_contended": 300.321,
+      "peak_rss_bytes": 1777647616,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-20-pd64",
+      "seed": 10,
+      "wall_secs_contended": 300.099,
+      "peak_rss_bytes": 1801224192,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-20-pd64",
+      "seed": 11,
+      "wall_secs_contended": 301.274,
+      "peak_rss_bytes": 2029568000,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-21-pd1024",
+      "seed": 0,
+      "wall_secs_contended": 502.326,
+      "peak_rss_bytes": 1605369856,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-21-pd1024",
+      "seed": 1,
+      "wall_secs_contended": 500.147,
+      "peak_rss_bytes": 1630240768,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-21-pd1024",
+      "seed": 2,
+      "wall_secs_contended": 502.984,
+      "peak_rss_bytes": 1609580544,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-21-pd1024",
+      "seed": 3,
+      "wall_secs_contended": 495.819,
+      "peak_rss_bytes": 1821556736,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-21-pd1024",
+      "seed": 4,
+      "wall_secs_contended": 502.773,
+      "peak_rss_bytes": 1770848256,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-21-pd1024",
+      "seed": 5,
+      "wall_secs_contended": 499.932,
+      "peak_rss_bytes": 1889845248,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-21-pd1024",
+      "seed": 6,
+      "wall_secs_contended": 503.285,
+      "peak_rss_bytes": 1525678080,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-21-pd1024",
+      "seed": 7,
+      "wall_secs_contended": 498.999,
+      "peak_rss_bytes": 1581301760,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-21-pd1024",
+      "seed": 8,
+      "wall_secs_contended": 501.066,
+      "peak_rss_bytes": 1758347264,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-21-pd1024",
+      "seed": 9,
+      "wall_secs_contended": 497.274,
+      "peak_rss_bytes": 1585971200,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-21-pd1024",
+      "seed": 10,
+      "wall_secs_contended": 497.759,
+      "peak_rss_bytes": 1711800320,
+      "exit_code": 0
+    },
+    {
+      "round": "hetero-loop-21-pd1024",
+      "seed": 11,
+      "wall_secs_contended": 495.514,
+      "peak_rss_bytes": 2104246272,
+      "exit_code": 0
+    }
+  ]
+}

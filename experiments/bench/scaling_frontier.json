@@ -1,0 +1,296 @@
+{
+  "env": {
+    "torch_version": "2.5.1",
+    "machine": "257-M2Pro.local",
+    "cpu_info": "Apple M2 Pro",
+    "num_threads": 6,
+    "platform": "macOS-15.7.5-arm64-arm-64bit",
+    "batch_size": 128,
+    "seq_len": 64,
+    "warmup": 1,
+    "steps": 5,
+    "timeout_secs": 600.0,
+    "git_commit": "4499af8e0b3bf63aa855017ae8a2fb0b55361551",
+    "timestamp": "2026-07-18T06:56:23.847061+00:00"
+  },
+  "configs": [
+    {
+      "label": "delta_nh4_dk4",
+      "mechanism": "delta",
+      "config": {
+        "input_size": 64,
+        "hidden_size": 64,
+        "n_heads": 4,
+        "nh": 2,
+        "d_k": 4,
+        "d_v": 4,
+        "chunk_size": 64
+      },
+      "training_arm": false,
+      "state_elements": 64,
+      "params": 6808,
+      "num_threads": 6,
+      "step_secs_median": 0.049626708030700684,
+      "step_secs_all": [
+        0.04911791696213186,
+        0.05153716588392854,
+        0.04886933299712837,
+        0.052478374913334846,
+        0.049626708030700684
+      ],
+      "peak_rss_bytes": 439779328,
+      "status": "ok",
+      "oom_message_recognized": null,
+      "detail": null
+    },
+    {
+      "label": "delta_nh4_dk8",
+      "mechanism": "delta",
+      "config": {
+        "input_size": 64,
+        "hidden_size": 64,
+        "n_heads": 4,
+        "nh": 2,
+        "d_k": 8,
+        "d_v": 8,
+        "chunk_size": 64
+      },
+      "training_arm": false,
+      "state_elements": 256,
+      "params": 13032,
+      "num_threads": 6,
+      "step_secs_median": 0.053282665787264705,
+      "step_secs_all": [
+        0.05438583414070308,
+        0.05293875001370907,
+        0.055114915827289224,
+        0.05194637505337596,
+        0.053282665787264705
+      ],
+      "peak_rss_bytes": 466485248,
+      "status": "ok",
+      "oom_message_recognized": null,
+      "detail": null
+    },
+    {
+      "label": "delta_nh4_dk16",
+      "mechanism": "delta",
+      "config": {
+        "input_size": 64,
+        "hidden_size": 64,
+        "n_heads": 4,
+        "nh": 2,
+        "d_k": 16,
+        "d_v": 16,
+        "chunk_size": 64
+      },
+      "training_arm": false,
+      "state_elements": 1024,
+      "params": 25480,
+      "num_threads": 6,
+      "step_secs_median": 0.05883720796555281,
+      "step_secs_all": [
+        0.06047283299267292,
+        0.05883720796555281,
+        0.05758195789530873,
+        0.059710167115554214,
+        0.05691675003618002
+      ],
+      "peak_rss_bytes": 548175872,
+      "status": "ok",
+      "oom_message_recognized": null,
+      "detail": null
+    },
+    {
+      "label": "delta_nh4_dk32",
+      "mechanism": "delta",
+      "config": {
+        "input_size": 64,
+        "hidden_size": 64,
+        "n_heads": 4,
+        "nh": 2,
+        "d_k": 32,
+        "d_v": 32,
+        "chunk_size": 64
+      },
+      "training_arm": false,
+      "state_elements": 4096,
+      "params": 50376,
+      "num_threads": 6,
+      "step_secs_median": 0.0770640829578042,
+      "step_secs_all": [
+        0.07836866611614823,
+        0.0770640829578042,
+        0.07790137501433492,
+        0.07613104186020792,
+        0.07456816686317325
+      ],
+      "peak_rss_bytes": 708902912,
+      "status": "ok",
+      "oom_message_recognized": null,
+      "detail": null
+    },
+    {
+      "label": "delta_train_pd64",
+      "mechanism": "delta",
+      "config": {
+        "input_size": 64,
+        "hidden_size": 64,
+        "n_heads": 1,
+        "nh": 2,
+        "d_k": 8,
+        "d_v": 8,
+        "chunk_size": 64
+      },
+      "training_arm": true,
+      "state_elements": 64,
+      "params": 3306,
+      "num_threads": 6,
+      "step_secs_median": 0.02147741592489183,
+      "step_secs_all": [
+        0.021831082878634334,
+        0.02253983309492469,
+        0.018901707837358117,
+        0.019662374863401055,
+        0.02147741592489183
+      ],
+      "peak_rss_bytes": 340049920,
+      "status": "ok",
+      "oom_message_recognized": null,
+      "detail": null
+    },
+    {
+      "label": "delta_train_pd1024",
+      "mechanism": "delta",
+      "config": {
+        "input_size": 64,
+        "hidden_size": 64,
+        "n_heads": 4,
+        "nh": 2,
+        "d_k": 16,
+        "d_v": 16,
+        "chunk_size": 64
+      },
+      "training_arm": true,
+      "state_elements": 1024,
+      "params": 25480,
+      "num_threads": 6,
+      "step_secs_median": 0.05963962501846254,
+      "step_secs_all": [
+        0.05963962501846254,
+        0.06022370792925358,
+        0.057775374967604876,
+        0.0575234170537442,
+        0.061409000074490905
+      ],
+      "peak_rss_bytes": 532332544,
+      "status": "ok",
+      "oom_message_recognized": null,
+      "detail": null
+    },
+    {
+      "label": "givens_dh64",
+      "mechanism": "givens",
+      "config": {
+        "input_size": 64,
+        "hidden_size": 64,
+        "block_size": 8,
+        "rounds": 3
+      },
+      "training_arm": false,
+      "state_elements": 64,
+      "params": 14624,
+      "num_threads": 6,
+      "step_secs_median": 0.983638540841639,
+      "step_secs_all": [
+        0.9737938330508769,
+        0.9870401669759303,
+        0.983638540841639,
+        0.9716340838931501,
+        0.9838930419646204
+      ],
+      "peak_rss_bytes": 930430976,
+      "status": "ok",
+      "oom_message_recognized": null,
+      "detail": null
+    },
+    {
+      "label": "givens_dh256",
+      "mechanism": "givens",
+      "config": {
+        "input_size": 64,
+        "hidden_size": 256,
+        "block_size": 8,
+        "rounds": 3
+      },
+      "training_arm": false,
+      "state_elements": 256,
+      "params": 58496,
+      "num_threads": 6,
+      "step_secs_median": 3.7341062498744577,
+      "step_secs_all": [
+        3.814268874935806,
+        3.743594874860719,
+        3.7263879999518394,
+        3.7341062498744577,
+        3.72802137513645
+      ],
+      "peak_rss_bytes": 2274836480,
+      "status": "ok",
+      "oom_message_recognized": null,
+      "detail": null
+    },
+    {
+      "label": "givens_dh1024",
+      "mechanism": "givens",
+      "config": {
+        "input_size": 64,
+        "hidden_size": 1024,
+        "block_size": 8,
+        "rounds": 3
+      },
+      "training_arm": false,
+      "state_elements": 1024,
+      "params": 233984,
+      "num_threads": 6,
+      "step_secs_median": 14.564082374796271,
+      "step_secs_all": [
+        14.519553249934688,
+        14.564082374796271,
+        15.874266457976773,
+        14.696165916975588,
+        14.528616250026971
+      ],
+      "peak_rss_bytes": 7322730496,
+      "status": "ok",
+      "oom_message_recognized": null,
+      "detail": null
+    },
+    {
+      "label": "givens_dh4096",
+      "mechanism": "givens",
+      "config": {
+        "input_size": 64,
+        "hidden_size": 4096,
+        "block_size": 8,
+        "rounds": 3
+      },
+      "training_arm": false,
+      "state_elements": 4096,
+      "params": 935936,
+      "num_threads": 6,
+      "step_secs_median": 70.59734966582619,
+      "step_secs_all": [
+        76.86584987514652,
+        67.83621383295394,
+        71.3675353329163,
+        70.59734966582619,
+        70.56913079088554
+      ],
+      "peak_rss_bytes": 21467217920,
+      "status": "ok",
+      "oom_message_recognized": null,
+      "detail": null
+    }
+  ]
+}
