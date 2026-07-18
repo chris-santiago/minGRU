@@ -39,10 +39,10 @@ Job modes (``--job``, default ``check``, existing invocations unaffected):
   probe for ``DeltaMinGRU``'s chunked-WY forward (profiles eager vs. its
   matmul-FLOP floor vs. ``torch.compile``, the speedup-worth-it judgment
   for building a Triton chunked-WY kernel -- see that script's module
-  docstring and ``.git/sdd/task-6-brief.md``). The job command is
-  additionally prefixed with a dash-compatible keepalive heartbeat (the
-  probe's five shapes x three arms can run past the Lightning tier's
-  10-minute idle auto-shutdown without one). After the job completes,
+  docstring and ``.git/sdd/task-6-brief.md``). No keepalive heartbeat:
+  the Lightning idle auto-shutdown applies to interactive studios, not
+  jobs, and a backgrounded loop outlives a studio-mode job's command
+  chain (see ``build_delta_probe_command``). After the job completes,
   this script fetches its logs, extracts the last ``MINGRU_GPU_PROBE_RESULT``
   line, and writes ``experiments/bench/gpu_delta_probe.json``/``.md``
   locally -- the job's container filesystem dies with the job, so stdout
@@ -96,22 +96,25 @@ def build_command(repo: str, ref: str, bench: bool) -> str:
 
 
 def build_delta_probe_command(repo: str, ref: str) -> str:
-    """Job-shell command for ``--job delta-probe``: keepalive + clone + probe run.
+    """Job-shell command for ``--job delta-probe``: clone + probe run.
 
     Same clone/checkout/triton-install steps as ``build_command`` (Task 6
     brief: ``torch.compile``'s Inductor needs triton on GPU, same as the
-    parity suite), plus a dash-compatible keepalive heartbeat prefixed at
-    the front -- the user's Lightning tier auto-shuts an idle job down
-    after 10 minutes of inactivity; the probe's five shapes x three arms
-    (each doing several seconds of CUDA-event-timed warmup/timed steps)
-    can run long enough between log-visible progress lines for that to
-    fire without one, so the heartbeat prints every ~5 minutes -- and runs
-    ``scripts/gpu_delta_probe.py`` instead of the parity suite.
+    parity suite), running ``scripts/gpu_delta_probe.py`` instead of the
+    parity suite.
+
+    Deliberately NO keepalive heartbeat: the Lightning tier's 10-minute
+    idle shutdown applies to interactive studio sessions, not to jobs --
+    a job runs its command to completion regardless of log quietness
+    (user clarification, 2026-07-18). The first delta-probe run carried a
+    detached ``while true ... &`` heartbeat anyway, and on a studio-mode
+    job that backgrounded loop OUTLIVED the finished command chain, kept
+    the job "running" so ``job.wait()`` never returned, and kept the
+    machine billing until stopped via the SDK. Jobs must keep their
+    command chain foreground-only.
     """
-    keepalive = '( while true; do echo "[keepalive] $(date -u)"; sleep 300; done & )'
     steps = [
         "set -eux",  # job shell is dash: -o pipefail unsupported (no pipes used)
-        keepalive,
         (
             "python -c 'import torch; assert torch.cuda.is_available(), "
             '"no CUDA device"; print(torch.__version__)\''
@@ -127,8 +130,8 @@ def build_delta_probe_command(repo: str, ref: str) -> str:
 def _extract_last(prefix: str, text: str) -> dict[str, Any] | None:
     """Parse the JSON payload of the last well-formed ``prefix``-prefixed line.
 
-    ``text`` is the job's fetched logs, which may interleave the
-    keepalive heartbeat, clone/checkout output, and the probe's own
+    ``text`` is the job's fetched logs, which may interleave
+    clone/checkout output and the probe's own
     progress lines around the single ``MINGRU_GPU_PROBE_RESULT`` line
     this looks for. A malformed matching line (or none at all) degrades
     to ``None`` -- this function never raises -- so a caller can treat

@@ -1,0 +1,2910 @@
+{
+  "env": {
+    "torch_version": "2.8.0+cu128",
+    "cuda_version": "12.8",
+    "cuda_device_name": "NVIDIA L4",
+    "device_capability": [
+      8,
+      9
+    ],
+    "platform": "Linux-6.8.0-1058-gcp-x86_64-with-glibc2.39",
+    "batch_size": 128,
+    "warmup_steps": 3,
+    "timed_steps": 10,
+    "cuda_matmul_allow_tf32": false,
+    "cudnn_allow_tf32": true,
+    "float32_matmul_precision": "highest",
+    "timestamp": "2026-07-18T09:57:13.187222+00:00",
+    "triton_version": "3.4.0"
+  },
+  "shapes": [
+    {
+      "label": "pd1024_T64",
+      "config_name": "pd1024",
+      "config": {
+        "input_size": 64,
+        "hidden_size": 64,
+        "n_heads": 4,
+        "nh": 2,
+        "d_k": 16,
+        "d_v": 16
+      },
+      "live_config": {
+        "n_heads": 4,
+        "nh": 2,
+        "d_k": 16,
+        "d_v": 16,
+        "chunk_size": 64,
+        "state_elements": 1024
+      },
+      "B": 128,
+      "T": 64,
+      "eager_step_secs_median": 0.007378463983535767,
+      "eager_step_secs_all": [
+        0.006391808032989502,
+        0.006466559886932373,
+        0.006402048110961914,
+        0.007621632099151611,
+        0.007580671787261963,
+        0.007266304016113281,
+        0.0070184640884399414,
+        0.0075345921516418455,
+        0.007623680114746094,
+        0.007490623950958252
+      ],
+      "eager_peak_mem_bytes": 186914816,
+      "floor_step_secs": 0.0028339199423789976,
+      "floor_forward_only_secs_all": [
+        0.0009635840058326721,
+        0.0009482240080833435,
+        0.0009308159947395325,
+        0.0009441279768943787,
+        0.0009349120259284973,
+        0.0009379839897155762,
+        0.0009379839897155762,
+        0.0009635840058326721,
+        0.0009492480158805847,
+        0.0009451519846916199
+      ],
+      "floor_method": "Standalone batched GEMM/triangular-solve ops replicating DeltaMinGRU._forward_chunked's dominant per-chunk contractions (KK=K@K^T, KH=K@H, the unit-lower-triangular UT-transform solve, R=Q@K^T, QH=Q@H, RU=(R*mask)@U, KU=K^T@U) at the shape's actual per-chunk tensor sizes, forward-only CUDA-event timing (warmup=3, median of 10), scaled by 3x for the standard fwd+bwd convention (fwd:bwd:total ~ 1:2:3). Approximate and explicitly disclosed: omits the elementwise beta/mask scaling, the q/k/v/beta linear projections, and concat/reshape overhead the real forward also pays; the 3x rule is a convention, not a measured backward. The blanket 3x convention is a rougher approximation for the solve component than for the six GEMM components specifically: solve_triangular's backward is NOT a simple 2-matmul the way a plain matmul's backward is -- it is a second triangular solve (with the transposed system) plus one outer-product matmul against the forward solution, a different GPU-parallelism profile (sequential forward-substitution dependency chain vs. the six ops' fully data-parallel GEMMs) than the 1:2 fwd:bwd FLOP ratio the 3x rule assumes. The 3x convention is still applied uniformly across all seven ops (this probe does not attempt a per-op-family bwd estimate), so treat floor_step_secs as a looser bound wherever the solve dominates a shape's per-chunk cost. Never presented as an exact floor -- see the module docstring.",
+      "floor_op_inventory": [
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                16,
+                16
+              ]
+            }
+          ]
+        }
+      ],
+      "floor_suspect": false,
+      "compile_step_secs_median": 0.004123136043548584,
+      "compile_step_secs_all": [
+        0.004115456104278564,
+        0.004127744197845459,
+        0.004118527889251709,
+        0.004108191967010498,
+        0.004245503902435303,
+        0.004248576164245605,
+        0.004115456104278564,
+        0.00416870403289795,
+        0.004215807914733887,
+        0.003579904079437256
+      ],
+      "compile_status": "ok",
+      "compile_error": null,
+      "headroom_eager_over_floor": 2.6036247083754067,
+      "compile_recovered_fraction": 0.7163156326588421
+    },
+    {
+      "label": "pd1024_T256",
+      "config_name": "pd1024",
+      "config": {
+        "input_size": 64,
+        "hidden_size": 64,
+        "n_heads": 4,
+        "nh": 2,
+        "d_k": 16,
+        "d_v": 16
+      },
+      "live_config": {
+        "n_heads": 4,
+        "nh": 2,
+        "d_k": 16,
+        "d_v": 16,
+        "chunk_size": 64,
+        "state_elements": 1024
+      },
+      "B": 128,
+      "T": 256,
+      "eager_step_secs_median": 0.02762700843811035,
+      "eager_step_secs_all": [
+        0.02730905532836914,
+        0.02774323272705078,
+        0.028045312881469726,
+        0.027059200286865235,
+        0.027510784149169923,
+        0.02776371192932129,
+        0.02795417594909668,
+        0.027255807876586914,
+        0.027475967407226562,
+        0.028014591217041016
+      ],
+      "eager_peak_mem_bytes": 677681152,
+      "floor_step_secs": 0.012690432071685792,
+      "floor_forward_only_secs_all": [
+        0.004085760116577148,
+        0.004076543807983398,
+        0.004100096225738525,
+        0.004219903945922852,
+        0.004223999977111817,
+        0.004245503902435303,
+        0.004236288070678711,
+        0.004270080089569092,
+        0.004297728061676025,
+        0.004284416198730469
+      ],
+      "floor_method": "Standalone batched GEMM/triangular-solve ops replicating DeltaMinGRU._forward_chunked's dominant per-chunk contractions (KK=K@K^T, KH=K@H, the unit-lower-triangular UT-transform solve, R=Q@K^T, QH=Q@H, RU=(R*mask)@U, KU=K^T@U) at the shape's actual per-chunk tensor sizes, forward-only CUDA-event timing (warmup=3, median of 10), scaled by 3x for the standard fwd+bwd convention (fwd:bwd:total ~ 1:2:3). Approximate and explicitly disclosed: omits the elementwise beta/mask scaling, the q/k/v/beta linear projections, and concat/reshape overhead the real forward also pays; the 3x rule is a convention, not a measured backward. The blanket 3x convention is a rougher approximation for the solve component than for the six GEMM components specifically: solve_triangular's backward is NOT a simple 2-matmul the way a plain matmul's backward is -- it is a second triangular solve (with the transposed system) plus one outer-product matmul against the forward solution, a different GPU-parallelism profile (sequential forward-substitution dependency chain vs. the six ops' fully data-parallel GEMMs) than the 1:2 fwd:bwd FLOP ratio the 3x rule assumes. The 3x convention is still applied uniformly across all seven ops (this probe does not attempt a per-op-family bwd estimate), so treat floor_step_secs as a looser bound wherever the solve dominates a shape's per-chunk cost. Never presented as an exact floor -- see the module docstring.",
+      "floor_op_inventory": [
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                16,
+                16
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                16,
+                16
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                16,
+                16
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                16,
+                16
+              ]
+            }
+          ]
+        }
+      ],
+      "floor_suspect": false,
+      "compile_step_secs_median": 0.015418879985809326,
+      "compile_step_secs_all": [
+        0.014217215538024902,
+        0.014869503974914551,
+        0.015271936416625977,
+        0.01557705593109131,
+        0.015442943572998047,
+        0.015436800003051757,
+        0.015507455825805663,
+        0.015466496467590332,
+        0.015400959968566894,
+        0.015323136329650879
+      ],
+      "compile_status": "ok",
+      "compile_error": null,
+      "headroom_eager_over_floor": 2.176995100092001,
+      "compile_recovered_fraction": 0.8173311040502746
+    },
+    {
+      "label": "pd1024_T1024",
+      "config_name": "pd1024",
+      "config": {
+        "input_size": 64,
+        "hidden_size": 64,
+        "n_heads": 4,
+        "nh": 2,
+        "d_k": 16,
+        "d_v": 16
+      },
+      "live_config": {
+        "n_heads": 4,
+        "nh": 2,
+        "d_k": 16,
+        "d_v": 16,
+        "chunk_size": 64,
+        "state_elements": 1024
+      },
+      "B": 128,
+      "T": 1024,
+      "eager_step_secs_median": 0.20977511596679688,
+      "eager_step_secs_all": [
+        0.21080982971191406,
+        0.20932095336914064,
+        0.20954521179199218,
+        0.20968550109863282,
+        0.20986473083496093,
+        0.21044837951660156,
+        0.209544189453125,
+        0.20989030456542968,
+        0.20952064514160157,
+        0.21041049194335937
+      ],
+      "eager_peak_mem_bytes": 2663815168,
+      "floor_step_secs": 0.05386905670166015,
+      "floor_forward_only_secs_all": [
+        0.016737279891967775,
+        0.016769023895263673,
+        0.017928192138671875,
+        0.018164735794067383,
+        0.018159616470336915,
+        0.018148351669311523,
+        0.01805414390563965,
+        0.017957887649536132,
+        0.017943552017211914,
+        0.017954816818237306
+      ],
+      "floor_method": "Standalone batched GEMM/triangular-solve ops replicating DeltaMinGRU._forward_chunked's dominant per-chunk contractions (KK=K@K^T, KH=K@H, the unit-lower-triangular UT-transform solve, R=Q@K^T, QH=Q@H, RU=(R*mask)@U, KU=K^T@U) at the shape's actual per-chunk tensor sizes, forward-only CUDA-event timing (warmup=3, median of 10), scaled by 3x for the standard fwd+bwd convention (fwd:bwd:total ~ 1:2:3). Approximate and explicitly disclosed: omits the elementwise beta/mask scaling, the q/k/v/beta linear projections, and concat/reshape overhead the real forward also pays; the 3x rule is a convention, not a measured backward. The blanket 3x convention is a rougher approximation for the solve component than for the six GEMM components specifically: solve_triangular's backward is NOT a simple 2-matmul the way a plain matmul's backward is -- it is a second triangular solve (with the transposed system) plus one outer-product matmul against the forward solution, a different GPU-parallelism profile (sequential forward-substitution dependency chain vs. the six ops' fully data-parallel GEMMs) than the 1:2 fwd:bwd FLOP ratio the 3x rule assumes. The 3x convention is still applied uniformly across all seven ops (this probe does not attempt a per-op-family bwd estimate), so treat floor_step_secs as a looser bound wherever the solve dominates a shape's per-chunk cost. Never presented as an exact floor -- see the module docstring.",
+      "floor_op_inventory": [
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                16,
+                16
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                16,
+                16
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                16,
+                16
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                16,
+                16
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                16,
+                16
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                16,
+                16
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                16,
+                16
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                16,
+                16
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                16,
+                16
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                16,
+                16
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                16,
+                16
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                16,
+                16
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                16,
+                16
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                16,
+                16
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                16,
+                16
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                16
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                16
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                16,
+                16
+              ]
+            }
+          ]
+        }
+      ],
+      "floor_suspect": false,
+      "compile_step_secs_median": 0.06797056198120117,
+      "compile_step_secs_all": [
+        0.06777958679199218,
+        0.06622412872314454,
+        0.06768742370605468,
+        0.06764236450195313,
+        0.06795878601074219,
+        0.07010610961914063,
+        0.06922752380371094,
+        0.06991974639892579,
+        0.06798233795166016,
+        0.06947942352294922
+      ],
+      "compile_status": "ok",
+      "compile_error": null,
+      "headroom_eager_over_floor": 3.8941672420325113,
+      "compile_recovered_fraction": 0.9095512685907882
+    },
+    {
+      "label": "stepup_T256",
+      "config_name": "stepup",
+      "config": {
+        "input_size": 256,
+        "hidden_size": 256,
+        "n_heads": 4,
+        "nh": 2
+      },
+      "live_config": {
+        "n_heads": 4,
+        "nh": 2,
+        "d_k": 64,
+        "d_v": 64,
+        "chunk_size": 64,
+        "state_elements": 16384
+      },
+      "B": 128,
+      "T": 256,
+      "eager_step_secs_median": 0.08460646438598632,
+      "eager_step_secs_all": [
+        0.08456703948974609,
+        0.08464076995849609,
+        0.08445951843261719,
+        0.08457215881347656,
+        0.08477184295654297,
+        0.08484249877929688,
+        0.08446361541748047,
+        0.08445030212402344,
+        0.08474214172363281,
+        0.08502374267578125
+      ],
+      "eager_peak_mem_bytes": 1467169792,
+      "floor_step_secs": 0.025889279365539548,
+      "floor_forward_only_secs_all": [
+        0.00830668830871582,
+        0.008284159660339355,
+        0.008525823593139649,
+        0.008559616088867187,
+        0.008621055603027344,
+        0.008677375793457032,
+        0.008660991668701172,
+        0.008647680282592773,
+        0.008638463973999023,
+        0.008668160438537598
+      ],
+      "floor_method": "Standalone batched GEMM/triangular-solve ops replicating DeltaMinGRU._forward_chunked's dominant per-chunk contractions (KK=K@K^T, KH=K@H, the unit-lower-triangular UT-transform solve, R=Q@K^T, QH=Q@H, RU=(R*mask)@U, KU=K^T@U) at the shape's actual per-chunk tensor sizes, forward-only CUDA-event timing (warmup=3, median of 10), scaled by 3x for the standard fwd+bwd convention (fwd:bwd:total ~ 1:2:3). Approximate and explicitly disclosed: omits the elementwise beta/mask scaling, the q/k/v/beta linear projections, and concat/reshape overhead the real forward also pays; the 3x rule is a convention, not a measured backward. The blanket 3x convention is a rougher approximation for the solve component than for the six GEMM components specifically: solve_triangular's backward is NOT a simple 2-matmul the way a plain matmul's backward is -- it is a second triangular solve (with the transposed system) plus one outer-product matmul against the forward solution, a different GPU-parallelism profile (sequential forward-substitution dependency chain vs. the six ops' fully data-parallel GEMMs) than the 1:2 fwd:bwd FLOP ratio the 3x rule assumes. The 3x convention is still applied uniformly across all seven ops (this probe does not attempt a per-op-family bwd estimate), so treat floor_step_secs as a looser bound wherever the solve dominates a shape's per-chunk cost. Never presented as an exact floor -- see the module docstring.",
+      "floor_op_inventory": [
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            }
+          ]
+        }
+      ],
+      "floor_suspect": false,
+      "compile_step_secs_median": 0.04355737686157227,
+      "compile_step_secs_all": [
+        0.04410367965698242,
+        0.043496448516845705,
+        0.043686912536621096,
+        0.04407910537719727,
+        0.04375244903564453,
+        0.043338752746582034,
+        0.04284415817260742,
+        0.04257177734375,
+        0.04284620666503906,
+        0.04361830520629883
+      ],
+      "compile_status": "ok",
+      "compile_error": null,
+      "headroom_eager_over_floor": 3.268011565381904,
+      "compile_recovered_fraction": 0.6990983561306583
+    },
+    {
+      "label": "stepup_T1024",
+      "config_name": "stepup",
+      "config": {
+        "input_size": 256,
+        "hidden_size": 256,
+        "n_heads": 4,
+        "nh": 2
+      },
+      "live_config": {
+        "n_heads": 4,
+        "nh": 2,
+        "d_k": 64,
+        "d_v": 64,
+        "chunk_size": 64,
+        "state_elements": 16384
+      },
+      "B": 128,
+      "T": 1024,
+      "eager_step_secs_median": 0.6992399291992188,
+      "eager_step_secs_all": [
+        0.6943426513671875,
+        0.6961807250976563,
+        0.6990366821289062,
+        0.70148095703125,
+        0.6992609252929688,
+        0.6992189331054688,
+        0.7016273803710937,
+        0.6968524780273437,
+        0.7001784057617187,
+        0.6997033081054688
+      ],
+      "eager_peak_mem_bytes": 5812599808,
+      "floor_step_secs": 0.10504550743103029,
+      "floor_forward_only_secs_all": [
+        0.035020801544189455,
+        0.03480575942993164,
+        0.034582527160644534,
+        0.034293758392333985,
+        0.03437055969238281,
+        0.035009536743164066,
+        0.03572633743286133,
+        0.035727359771728515,
+        0.03570175933837891,
+        0.03567923355102539
+      ],
+      "floor_method": "Standalone batched GEMM/triangular-solve ops replicating DeltaMinGRU._forward_chunked's dominant per-chunk contractions (KK=K@K^T, KH=K@H, the unit-lower-triangular UT-transform solve, R=Q@K^T, QH=Q@H, RU=(R*mask)@U, KU=K^T@U) at the shape's actual per-chunk tensor sizes, forward-only CUDA-event timing (warmup=3, median of 10), scaled by 3x for the standard fwd+bwd convention (fwd:bwd:total ~ 1:2:3). Approximate and explicitly disclosed: omits the elementwise beta/mask scaling, the q/k/v/beta linear projections, and concat/reshape overhead the real forward also pays; the 3x rule is a convention, not a measured backward. The blanket 3x convention is a rougher approximation for the solve component than for the six GEMM components specifically: solve_triangular's backward is NOT a simple 2-matmul the way a plain matmul's backward is -- it is a second triangular solve (with the transposed system) plus one outer-product matmul against the forward solution, a different GPU-parallelism profile (sequential forward-substitution dependency chain vs. the six ops' fully data-parallel GEMMs) than the 1:2 fwd:bwd FLOP ratio the 3x rule assumes. The 3x convention is still applied uniformly across all seven ops (this probe does not attempt a per-op-family bwd estimate), so treat floor_step_secs as a looser bound wherever the solve dominates a shape's per-chunk cost. Never presented as an exact floor -- see the module docstring.",
+      "floor_op_inventory": [
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            }
+          ]
+        },
+        {
+          "chunk_C": 64,
+          "M": 128,
+          "ops": [
+            {
+              "name": "KK = K @ K^T",
+              "out_shape": [
+                512,
+                128,
+                128
+              ]
+            },
+            {
+              "name": "KH = K @ H (rhs term)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "U = solve_triangular(T_mat, V - KH, unitriangular=True)",
+              "out_shape": [
+                512,
+                128,
+                64
+              ]
+            },
+            {
+              "name": "R = Q @ K^T",
+              "out_shape": [
+                512,
+                64,
+                128
+              ]
+            },
+            {
+              "name": "QH = Q @ H",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "RU = (R * read_mask) @ U",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            },
+            {
+              "name": "KU = K^T @ U (state update)",
+              "out_shape": [
+                512,
+                64,
+                64
+              ]
+            }
+          ]
+        }
+      ],
+      "floor_suspect": false,
+      "compile_step_secs_median": 0.18941286468505858,
+      "compile_step_secs_all": [
+        0.20078080749511718,
+        0.18982707214355468,
+        0.1889986572265625,
+        0.18834226989746095,
+        0.1851207733154297,
+        0.19449037170410155,
+        0.1921802215576172,
+        0.18782925415039062,
+        0.19102310180664062,
+        0.18832179260253906
+      ],
+      "compile_status": "ok",
+      "compile_error": null,
+      "headroom_eager_over_floor": 6.656542924106666,
+      "compile_recovered_fraction": 0.8580138854165441
+    }
+  ]
+}
