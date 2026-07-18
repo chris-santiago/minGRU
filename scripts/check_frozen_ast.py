@@ -8,12 +8,27 @@ selftest block relocated verbatim into its repo-root evidence driver.
 syntax tree with docstrings stripped (comments are already absent from the
 AST). Three checks, each a hard stop (nonzero exit) on violation:
 
-(a) **Library freeze.** ``src/mingru/min_gru.py`` must be executable-identical
-    to `the frozen baseline (`FROZEN_BASELINE:min_gru.py`)` with its ``__main__`` block removed, the
-    single permitted delta being the dispatch-import retarget
-    (``import triton_scans`` -> ``from mingru import triton_scans``). This
-    whole-file equality subsumes -- and is strictly stronger than -- "the
-    four scan functions, ``_coeffs``, and the mixer forward paths are frozen".
+(a) **Library freeze (narrowed to the certified evidence surface).**
+    ``src/mingru/min_gru.py`` is no longer frozen whole-file -- the delta-mixer
+    design (spec section 6, "Frozen-AST gate contract") unfreezes the file for
+    growth, since the whole-file check was always a stronger-than-necessary
+    proxy for what the replication evidence actually certifies. Instead, each
+    definition named in ``FROZEN_DEFINITIONS`` (the four scan ops, the four
+    pre-existing mixer classes, ``DecayMixin``, the Triton-dispatch helpers,
+    and the five free functions the certified mixer forward paths call at
+    runtime -- ``g``, ``log_g``, ``_normalize_delta_t``,
+    ``_validate_delta_t_pairing``, ``_warn_once_invalid_delta_t``) and each
+    module-level assignment named in ``_FROZEN_MODULE_CONSTANTS`` (constants
+    and shared warn-once flags the frozen definitions read --
+    ``_DELTA_T_POSINF_CAP``, ``_VALID_SCAN_MODES``, ``_warned_scan_fallback``,
+    ``_warned_angle_fallback``, ``Decay``) must be executable-identical, *by
+    name*, to its counterpart in `the frozen baseline
+    (`FROZEN_BASELINE:min_gru.py`)`, the single permitted delta being the
+    dispatch-import retarget (``import triton_scans`` -> ``from mingru import
+    triton_scans``). Definitions and module constants outside that surface --
+    including new top-level definitions -- may change or be added freely;
+    unfreezing the file this way does not invalidate the evidence the frozen
+    surface certifies.
 
 (b) **min_gru selftest relocation.** The ``__main__`` block of the root
     ``min_gru.py`` driver must be executable-identical to the ``__main__``
@@ -62,6 +77,58 @@ RETARGET_TO = "triton_scans"  # `import triton_scans`
 RELOCATED_MODULE_NAME = "mingru.triton_scans"
 ORIGINAL_MODULE_NAME = "triton_scans"
 
+# The certified evidence surface (design spec section 6, "Frozen-AST gate
+# contract"): only these top-level definitions in src/mingru/min_gru.py are
+# held AST-identical to the pinned baseline. Everything else in the file --
+# MinGRUBlock, MinGRUStack, and any new top-level definitions -- is free to
+# change; the replication evidence was only ever certified for this surface,
+# so narrowing the check to it doesn't invalidate what came before.
+_FROZEN_SCAN_OPS = ("parallel_scan_log", "linear_scan", "matrix_scan", "matrix_affine_scan")
+_FROZEN_MIXER_CLASSES = ("MinGRU", "SignedMinGRU", "RotationMinGRU", "GivensMinGRU")
+_FROZEN_DECAY_MIXIN = ("DecayMixin",)
+# The Triton-dispatch internals (module docstring's "dispatch internals"
+# grouping): resolving which backend to use and dispatching to it.
+_FROZEN_DISPATCH_HELPERS = (
+    "_resolve_scan_mode",
+    "_resolve_triton_dispatch",
+    "_dispatch_scan",
+    "_angle_scan_should_try",
+    "_dispatch_angle_scan",
+    "_cached_plane_meta_per_device",
+)
+# Free functions the certified mixer forward paths call at runtime: leaving
+# these out would let their bodies change silently under an AST-identical
+# mixer class, which is exactly the gap the whole-file freeze existed to
+# close. Part of the certified surface even though they aren't scan ops,
+# mixer classes, DecayMixin, or dispatch internals themselves.
+_FROZEN_EVIDENCE_HELPERS = (
+    "g",
+    "log_g",
+    "_normalize_delta_t",
+    "_validate_delta_t_pairing",
+    "_warn_once_invalid_delta_t",
+)
+FROZEN_DEFINITIONS = (
+    _FROZEN_SCAN_OPS
+    + _FROZEN_MIXER_CLASSES
+    + _FROZEN_DECAY_MIXIN
+    + _FROZEN_DISPATCH_HELPERS
+    + _FROZEN_EVIDENCE_HELPERS
+)
+
+# Module-level assignments the frozen definitions above read (constants and
+# the shared warn-once flags): identical gap to the evidence helpers above --
+# an AST-identical frozen function/class can still change behavior if a
+# constant it references is free to drift. Compared as whole assignment
+# statements (Assign/AnnAssign), not just their values.
+_FROZEN_MODULE_CONSTANTS = (
+    "_DELTA_T_POSINF_CAP",
+    "_VALID_SCAN_MODES",
+    "_warned_scan_fallback",
+    "_warned_angle_fallback",
+    "Decay",
+)
+
 
 def _git_show(ref_path: str) -> str:
     return subprocess.run(
@@ -98,11 +165,6 @@ def _find_main_block(tree: ast.Module) -> ast.If:
         ):
             return node
     raise SystemExit('FAIL: no `if __name__ == "__main__"` block found')
-
-
-def _without_main_block(tree: ast.Module) -> ast.Module:
-    body = [n for n in tree.body if not _is_main_block(n)]
-    return ast.Module(body=body, type_ignores=[])
 
 
 def _is_main_block(node: ast.AST) -> bool:
@@ -159,6 +221,35 @@ def _strip_header(stmts: list[ast.stmt], count: int) -> list[ast.stmt]:
     return body
 
 
+def _top_level_definitions(tree: ast.Module) -> dict[str, ast.stmt]:
+    """Map top-level function/class names to their nodes."""
+    return {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+
+
+def _top_level_module_constants(tree: ast.Module) -> dict[str, ast.stmt]:
+    """Map module-level single-target assignment names to their statement nodes.
+
+    Covers ``Assign`` (``NAME = value``) and ``AnnAssign`` (``NAME: T =
+    value``); only single-target assigns are indexed, since none of the
+    frozen constants use tuple/starred targets.
+    """
+    constants: dict[str, ast.stmt] = {}
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            constants[node.targets[0].id] = node
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            constants[node.target.id] = node
+    return constants
+
+
 def _dump(stmts: list[ast.stmt]) -> str:
     module = ast.Module(body=stmts, type_ignores=[])
     _strip_docstrings(module)
@@ -178,14 +269,58 @@ def _first_divergence(a: str, b: str) -> str:
     return "  (dumps differ but no line-level divergence located)"
 
 
+def _check_frozen_names(
+    names: tuple[str, ...],
+    main_index: dict[str, ast.stmt],
+    pkg_index: dict[str, ast.stmt],
+    *,
+    kind: str,
+) -> list[str]:
+    """Compare each certified name's AST dump between baseline and packaged indices.
+
+    Shared by both halves of check (a): certified definitions
+    (``FROZEN_DEFINITIONS`` against ``_top_level_definitions``) and certified
+    module constants (``_FROZEN_MODULE_CONSTANTS`` against
+    ``_top_level_module_constants``) -- same missing/diverging-name error
+    shape either way, just a different ``kind`` label and node index.
+    """
+    errors: list[str] = []
+    for name in names:
+        if name not in main_index:
+            errors.append(
+                f"library freeze: internal error -- certified {kind} {name!r} "
+                "not found in the frozen baseline itself; the frozen-surface "
+                "list is out of sync with `FROZEN_BASELINE:min_gru.py`"
+            )
+            continue
+        if name not in pkg_index:
+            errors.append(
+                f"library freeze: certified {kind} {name!r} is missing from src/mingru/min_gru.py"
+            )
+            continue
+        main_dump = _dump([main_index[name]])
+        pkg_dump = _dump([pkg_index[name]])
+        if main_dump != pkg_dump:
+            errors.append(
+                f"library freeze: {kind} {name!r} in src/mingru/min_gru.py "
+                "diverges from the frozen baseline (`FROZEN_BASELINE:min_gru.py`) "
+                "beyond the permitted dispatch retarget.\n" + _first_divergence(main_dump, pkg_dump)
+            )
+    return errors
+
+
 def check_library_freeze() -> list[str]:
-    """(a) packaged library == main minus __main__, modulo the retarget."""
+    """(a) each certified definition/constant == its baseline counterpart, modulo the retarget.
+
+    Narrowed from whole-file equality (spec section 6): only the definitions
+    named in ``FROZEN_DEFINITIONS`` and the module-level assignments named in
+    ``_FROZEN_MODULE_CONSTANTS`` are compared. New top-level definitions
+    (e.g. a new mixer class) and edits to non-surface definitions/constants
+    (e.g. ``MinGRUBlock``) are permitted and simply not inspected here.
+    """
     errors: list[str] = []
     main_tree = ast.parse(_git_show(f"{FROZEN_BASELINE}:min_gru.py"))
     pkg_tree = ast.parse(PKG_MIN_GRU.read_text())
-
-    main_lib = _without_main_block(main_tree)
-    pkg_lib = _without_main_block(pkg_tree)  # packaged file has no __main__ block
 
     if any(_is_main_block(n) for n in pkg_tree.body):
         errors.append(
@@ -193,16 +328,20 @@ def check_library_freeze() -> list[str]:
             "block (it must relocate to the root driver)"
         )
 
-    _canonicalize_retarget(pkg_lib)
+    _canonicalize_retarget(pkg_tree)
 
-    main_dump = _dump(main_lib.body)
-    pkg_dump = _dump(pkg_lib.body)
-    if main_dump != pkg_dump:
-        errors.append(
-            "library freeze: src/mingru/min_gru.py executable content diverges "
-            "from the frozen baseline (`FROZEN_BASELINE:min_gru.py`) beyond the permitted dispatch "
-            "retarget + __main__ removal.\n" + _first_divergence(main_dump, pkg_dump)
-        )
+    errors += _check_frozen_names(
+        FROZEN_DEFINITIONS,
+        _top_level_definitions(main_tree),
+        _top_level_definitions(pkg_tree),
+        kind="definition",
+    )
+    errors += _check_frozen_names(
+        _FROZEN_MODULE_CONSTANTS,
+        _top_level_module_constants(main_tree),
+        _top_level_module_constants(pkg_tree),
+        kind="module constant",
+    )
     return errors
 
 
@@ -279,8 +418,13 @@ def main() -> int:
         return 1
 
     print("frozen-AST check OK:")
-    print("  (a) src/mingru/min_gru.py library frozen vs the pinned baseline (only the dispatch")
-    print("      retarget + __main__ removal differ)")
+    print(
+        f"  (a) {len(FROZEN_DEFINITIONS)} certified definitions + "
+        f"{len(_FROZEN_MODULE_CONSTANTS)} certified module constants in "
+        "src/mingru/min_gru.py frozen"
+    )
+    print("      vs the pinned baseline (only the dispatch retarget differs); other")
+    print("      definitions/constants, including new ones, are unrestricted")
     print("  (b) root min_gru.py __main__ selftest relocated verbatim vs the pinned baseline")
     print("      (only the import header + module-name strings differ)")
     print("  (c) root triton_scans.py __main__ selftest relocated verbatim vs the pinned baseline")
