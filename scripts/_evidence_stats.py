@@ -13,19 +13,48 @@ dumping-ground ``utils.py``. Stdlib-only, no torch dependency.
 Ledger-row shape assumed by ``arm_stats``: the unchanged ``run_arm``
 schema from ``experiments/hetero_lab.py`` (``round``, ``task``,
 ``variant``, ``layers``, ``seed``, ``steps``, ``acc`` keyed by T as a
-string, ``secs``, ``max_steps``, ``ckpt.{step, val128}``, ``config``).
+string, ``secs``, ``max_steps``, ``ckpt.{step, val128, ...}``,
+``config``).
+
+``arm_stats`` is parameterized by ``(metric_key, threshold, direction,
+robustness)`` (2026-07-19 benchmark-round design spec section 6, "Stats
+parameterization") so the accepted-benchmark round's tasks -- whose fit
+metrics live under different ``ckpt`` keys and, for pendulum's MSE, are
+better when *lower* -- can reuse this same engine instead of forking a
+second copy. The defaults (``metric_key="val128"``, ``threshold=
+FIT_THRESHOLD``, ``direction="ge"``, ``robustness=ROBUSTNESS_THRESHOLDS``)
+reproduce the S3 matched-state round's hardcoded behavior exactly, so
+existing callers that pass nothing new see byte-identical reports.
 """
 
 from __future__ import annotations
 
 import math
+import operator
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 FIT_THRESHOLD = 0.99
 ROBUSTNESS_THRESHOLDS = (0.98, 0.99, 0.995)
 ACC_LENGTHS = (64, 256, 512, 1024)
 FIT_ONLY_LENGTHS = (512, 1024)
+
+FitDirection = Literal["ge", "le"]
+
+_DIRECTION_CMP: dict[FitDirection, Callable[[float, float], bool]] = {
+    "ge": operator.ge,
+    "le": operator.le,
+}
+
+
+def _fit_comparator(direction: FitDirection) -> Callable[[float, float], bool]:
+    """``>=`` for "higher is better" metrics, ``<=`` for "lower is better"
+    ones (e.g. the pendulum task's MSE fit metric)."""
+    try:
+        return _DIRECTION_CMP[direction]
+    except KeyError:
+        raise ValueError(f"unknown fit direction {direction!r}; expected 'ge' or 'le'") from None
 
 
 # --- Fisher exact (stdlib, exact hypergeometric enumeration) --------------
@@ -119,16 +148,28 @@ class ArmStats:
     robustness: dict[float, int]
 
 
-def arm_stats(rows: list[dict[str, Any]]) -> ArmStats:
+def arm_stats(
+    rows: list[dict[str, Any]],
+    *,
+    metric_key: str = "val128",
+    threshold: float = FIT_THRESHOLD,
+    direction: FitDirection = "ge",
+    robustness: tuple[float, ...] = ROBUSTNESS_THRESHOLDS,
+) -> ArmStats:
     """Fit counts, mean acc, fit-only acc, threshold-robustness -- all
     computed from ``rows`` (never hand-transcribed), matching
     TECHNICAL_REPORT section 4.4's definitions: a fit is the selected
-    checkpoint's val@128 >= threshold; acc@T is the mean over ALL rows;
-    fit-only acc@T is the mean over fitting rows only.
+    checkpoint's ``ckpt[metric_key]`` clearing ``threshold`` in the given
+    ``direction`` (``"ge"``: ``>= threshold``, e.g. S5/MQAR accuracy;
+    ``"le"``: ``<= threshold``, e.g. the pendulum task's MSE); acc@T is
+    the mean over ALL rows; fit-only acc@T is the mean over fitting rows
+    only. Defaults (``val128``, ``FIT_THRESHOLD``, ``"ge"``,
+    ``ROBUSTNESS_THRESHOLDS``) match the S3 matched-state round exactly.
     """
     n = len(rows)
-    val128s = [row["ckpt"]["val128"] for row in rows]
-    fit_rows = [row for row in rows if row["ckpt"]["val128"] >= FIT_THRESHOLD]
+    cmp = _fit_comparator(direction)
+    metric_values = [row["ckpt"][metric_key] for row in rows]
+    fit_rows = [row for row, v in zip(rows, metric_values, strict=True) if cmp(v, threshold)]
 
     def _mean_acc(subset: list[dict[str, Any]], t: int) -> float | None:
         if not subset:
@@ -140,5 +181,5 @@ def arm_stats(rows: list[dict[str, Any]]) -> ArmStats:
         fits=len(fit_rows),
         mean_acc={t: _mean_acc(rows, t) for t in ACC_LENGTHS},
         fit_only_acc={t: _mean_acc(fit_rows, t) for t in FIT_ONLY_LENGTHS},
-        robustness={th: sum(1 for v in val128s if v >= th) for th in ROBUSTNESS_THRESHOLDS},
+        robustness={th: sum(1 for v in metric_values if cmp(v, th)) for th in robustness},
     )

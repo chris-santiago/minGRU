@@ -1,0 +1,27 @@
+# Matched-state round: verdict-table stats (computed from `/Users/chrissantiago/Dropbox/GitHub/minGRU/experiments/lab_results.jsonl`)
+
+| config | seeds | fits | acc@64 | acc@256 | acc@512 | acc@1024 | fit-only @512/@1024 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| givens@64 (recorded, `hetero-loop-17-sg8`) | 12 | 8/12 | 0.949 | 0.885 | 0.787 | 0.613 | 0.927 / 0.733 |
+| delta@64-matched (`hetero-loop-20-pd64`) | 12 | 4/12 | 0.548 | 0.484 | 0.448 | 0.364 | 0.939 / 0.721 |
+| delta@1024 (`hetero-loop-21-pd1024`) | 12 | 12/12 | 1.000 | 0.988 | 0.833 | 0.556 | 0.833 / 0.556 |
+
+## Threshold-robustness (fits at {0.98, 0.99, 0.995})
+
+| config | 0.98 | 0.99 | 0.995 |
+| --- | --- | --- |
+| givens@64 (recorded, `hetero-loop-17-sg8`) | 9/12 | 8/12 | 8/12 |
+| delta@64-matched (`hetero-loop-20-pd64`) | 4/12 | 4/12 | 4/12 |
+| delta@1024 (`hetero-loop-21-pd1024`) | 12/12 | 12/12 | 12/12 |
+
+## Two-sided Fisher exact vs recorded givens@64
+
+- delta@64-matched (`hetero-loop-20-pd64`) (4/12) vs givens@64 (8/12): p = 0.2203
+- delta@1024 (`hetero-loop-21-pd1024`) (12/12) vs givens@64 (8/12): p = 0.09317
+
+## Composer parameter counts (computed arithmetically, not hardcoded)
+
+- givens@64 (`block_size=8, rounds=3, hidden_size=64`): 14,624
+- delta@64-matched (`n_heads=1, nh=2, d_k=d_v=8`): 3,306
+- delta@1024 (`n_heads=4, nh=2, d_k=d_v=16`): 25,480
+- (computed values match the recorded literature figures)
