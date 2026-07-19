@@ -52,6 +52,32 @@ _KERNELS = (
 _REQUIRED_RE = re.compile(r"Required: (\d+)")
 
 
+def _iter_compiled_caches(kern):
+    """Yield each per-device ``{key: CompiledKernel}`` dict of a JIT kernel.
+
+    Handles two Triton cache layouts, newest first: triton >= 3.3 keeps the
+    compiled cache in ``JITFunction.device_caches``, a dict whose values are
+    TUPLES ``(compiled_dict, ...)`` (the old ``JITFunction.cache`` dict of
+    dicts is retained only as a compatibility shim on some builds and reads
+    back empty on 3.4 -- the reason the first probe saw nothing). Falls back
+    to the legacy ``cache`` dict-of-dicts on < 3.3. Anything unrecognized is
+    skipped, never raised: the engage/fallback column never depends on this.
+    """
+    device_caches = getattr(kern, "device_caches", None)
+    if isinstance(device_caches, dict):
+        for entry in device_caches.values():
+            # 3.4: entry is a tuple whose first element is the compiled dict.
+            compiled = entry[0] if isinstance(entry, tuple) and entry else entry
+            if isinstance(compiled, dict):
+                yield compiled
+        return
+    cache = getattr(kern, "cache", None)
+    if isinstance(cache, dict):
+        for per_device in cache.values():
+            if isinstance(per_device, dict):
+                yield per_device
+
+
 def _cache_snapshot(kern) -> dict[object, int]:
     """Map every compiled-cache entry of one JIT kernel to its SMEM bytes.
 
@@ -60,12 +86,7 @@ def _cache_snapshot(kern) -> dict[object, int]:
     depends on this introspection).
     """
     out: dict[object, int] = {}
-    cache = getattr(kern, "cache", None)
-    if not isinstance(cache, dict):
-        return out
-    for per_device in cache.values():
-        if not isinstance(per_device, dict):
-            continue
+    for per_device in _iter_compiled_caches(kern):
         for key, compiled in per_device.items():
             meta = getattr(compiled, "metadata", None)
             shared = getattr(meta, "shared", None)

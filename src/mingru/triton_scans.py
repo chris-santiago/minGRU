@@ -2279,25 +2279,44 @@ if _HAS_TRITON:
             other=0.0,
         ).to(tl.float32)  # (BLOCK_M, BLOCK_K)
         beta_tile = tl.load(beta_ptr + beta_base + m, mask=row_valid, other=0.0).to(tl.float32)
-        Qtile = tl.load(
-            Q_ptr + Q_base + cc[:, None] * d_k + kk[None, :],
-            mask=tok_valid[:, None] & kcol[None, :],
-            other=0.0,
-        ).to(tl.float32)  # (BLOCK_C, BLOCK_K)
         dyc = tl.load(
             dy_ptr + dy_base + cc[:, None] * d_v + vv[None, :],
             mask=tok_valid[:, None] & vcol[None, :],
             other=0.0,
         ).to(tl.float32)  # (BLOCK_C, BLOCK_V)
 
-        # T = I + (K K^T) (.) beta_l (.) strict-lower (same build as forward).
-        KK = tl.dot(Ktile, tl.trans(Ktile), input_precision="ieee")  # (BLOCK_M, BLOCK_M)
+        # T = I + (K K^T) (.) beta_l (.) strict-lower (same build as forward),
+        # and the readout inner product S = Q K^T -- both feature-blocked over
+        # d_k into 16-wide sub-tiles loaded from global (fla's chunk_delta_rule
+        # BK-loop idiom, MIT). These two d_k-reductions otherwise co-stage the
+        # full (M, d_k) K and (C, d_k) Q operands with the (M, M) KK result, the
+        # measured SMEM peak of this pre-pass at wide d_k; the 16-wide split
+        # never stages a full K/Q operand and is an exact contraction
+        # re-association (fp32 sum-order, ~1e-7, inside the grad gate). Q is now
+        # only ever touched 16-wide (here and in the QtY solve below), so it is
+        # not loaded full; full Ktile stays only for the row-scaled BK = beta.K.
+        KK = tl.zeros((BLOCK_M, BLOCK_M), dtype=tl.float32)
+        S = tl.zeros((BLOCK_C, BLOCK_M), dtype=tl.float32)
+        for kb in tl.static_range(BLOCK_K // 16):
+            kcols = kb * 16 + tl.arange(0, 16)
+            kcm = kcols < d_k
+            Kb = tl.load(
+                K_ptr + K_base + m[:, None] * d_k + kcols[None, :],
+                mask=row_valid[:, None] & kcm[None, :],
+                other=0.0,
+            ).to(tl.float32)  # (BLOCK_M, 16)
+            Qb = tl.load(
+                Q_ptr + Q_base + cc[:, None] * d_k + kcols[None, :],
+                mask=tok_valid[:, None] & kcm[None, :],
+                other=0.0,
+            ).to(tl.float32)  # (BLOCK_C, 16)
+            KK += tl.dot(Kb, tl.trans(Kb), input_precision="ieee")
+            S += tl.dot(Qb, tl.trans(Kb), input_precision="ieee")
         strict = (m[:, None] > m[None, :]).to(tl.float32)
         eye = (m[:, None] == m[None, :]).to(tl.float32)
         Tmat = eye + KK * beta_tile[None, :] * strict
 
         # Readout half of dU: P = (Q K^T) (.) beta (.) read_mask; dU_read = P^T dy.
-        S = tl.dot(Qtile, tl.trans(Ktile), input_precision="ieee")  # (BLOCK_C, BLOCK_M)
         tok_of_m = m // nh
         read_mask = (
             (tok_of_m[None, :] <= cc[:, None]) & row_valid[None, :] & tok_valid[:, None]
@@ -2331,14 +2350,32 @@ if _HAS_TRITON:
             mask=row_valid[:, None] & kcol[None, :],
         )
 
-        # dHconst = Q^T dy - K^T Gr, Gr = XG.
-        QtY = tl.dot(tl.trans(Qtile), dyc, input_precision="ieee")  # (BLOCK_K, BLOCK_V)
-        KtGr = tl.dot(tl.trans(Ktile), XG, input_precision="ieee")  # (BLOCK_K, BLOCK_V)
-        tl.store(
-            dHconst_ptr + Hb_base + kk[:, None] * d_v + vv[None, :],
-            QtY - KtGr,
-            mask=kcol[:, None] & vcol[None, :],
-        )
+        # dHconst = Q^T dy - K^T Gr (Gr = XG), output-blocked over d_k into
+        # 16-wide row sub-tiles stored straight to global: the output rows are
+        # the d_k index, so blocking them is exact (columns independent), and
+        # neither dot then stages a full (C, d_k) Q or (M, d_k) K operand -- the
+        # last full K/Q dot operands in this pre-pass, whose co-staging with the
+        # solve tiles was the measured SMEM peak. Kb/Qb carry the same masks.
+        for kb in tl.static_range(BLOCK_K // 16):
+            kcols = kb * 16 + tl.arange(0, 16)
+            kcm = kcols < d_k
+            Kb = tl.load(
+                K_ptr + K_base + m[:, None] * d_k + kcols[None, :],
+                mask=row_valid[:, None] & kcm[None, :],
+                other=0.0,
+            ).to(tl.float32)  # (BLOCK_M, 16)
+            Qb = tl.load(
+                Q_ptr + Q_base + cc[:, None] * d_k + kcols[None, :],
+                mask=tok_valid[:, None] & kcm[None, :],
+                other=0.0,
+            ).to(tl.float32)  # (BLOCK_C, 16)
+            QtY = tl.dot(tl.trans(Qb), dyc, input_precision="ieee")  # (16, BLOCK_V)
+            KtGr = tl.dot(tl.trans(Kb), XG, input_precision="ieee")  # (16, BLOCK_V)
+            tl.store(
+                dHconst_ptr + Hb_base + kcols[:, None] * d_v + vv[None, :],
+                QtY - KtGr,
+                mask=kcm[:, None] & vcol[None, :],
+            )
 
     @triton.jit
     def _delta_bwd_state_kernel(
@@ -2443,6 +2480,7 @@ if _HAS_TRITON:
         dQ_ptr,
         dK_ptr,
         dK2_ptr,
+        dK3_ptr,
         dV_ptr,
         dbeta_ptr,
         T,
@@ -2480,22 +2518,32 @@ if _HAS_TRITON:
         Every ``(M, M)`` tile is per-program (never global). Padded rows/cols
         load as zero and are dropped on store.
 
-        Shared-memory discipline (the L4 launch-fit invariant). Every packed
-        multi-``tl.dot`` accumulation (``dQ``, ``dK``) is written as SEPARATE
-        sequential ``+=`` statements: a single summed expression lets Triton
-        co-stage several dots' operand tiles at once (the over-concurrency that
-        put the earlier one-expression ``dK`` at ~110 KB, over the 101376 B L4
-        limit), whereas sequential statements reuse the scratch so the peak is
-        one dot's operand pair. The two ``(M, M)``-operand terms ``dKK K`` and
-        ``dKK^T K`` (dominant: the ``(M, M)`` ``dKK`` tile is 65536 B at
-        ``M = 128``) are additionally BLOCKED over the ``d_k`` free dimension
-        into 16-wide sub-tiles loaded from global (fla's feature-blocking), so
-        ``dKK`` pairs only with an ``(M, 16)`` slice of ``K`` (<= 73728 B at
-        ``M = 128``, every ``d_k``) and are written to a separate ``dK2`` buffer
-        the launch folds into ``dK``. Output-column blocking is exact (matmul
-        columns are independent), so each block equals the matching columns of
-        the full ``(M, M)``-operand product. (tiling scheme after fla's
-        chunk_delta_rule wy_fast backward, MIT.)
+        Shared-memory discipline (the L4 launch-fit invariant). The MEASURED
+        SMEM peak of the backward at wide ``d_k`` is not one ``(M, M)`` tile but
+        the NUMBER of full ``d_k``-wide operand tiles Triton co-stages -- at
+        ``d_k = 64, M = 128`` the full ``(M, d_k)`` ``K``, ``(C, d_k)`` ``Q``
+        and their partners reconstruct the ~168 KB the probe observed, far over
+        the ``101376`` B L4 opt-in limit. Every full ``K``/``Q`` operand is
+        therefore feature-blocked into 16-wide ``d_k`` sub-tiles loaded straight
+        from global (fla's ``chunk_delta_rule`` BK-loop idiom, MIT), so no dot
+        ever stages one:
+
+        * The four opening ``d_k``-reductions ``KK = K K^T``, ``KHc = K Hc``,
+          ``S = Q K^T``, ``dbU = K dH_c`` accumulate over 16-wide ``d_k`` blocks
+          (contraction split -- an exact fp32 re-association).
+        * ``dQ = dy Hc^T + dS K``, the ``dS^T Q`` term of ``dK`` (-> ``dK3``),
+          and ``dKK K + dKK^T K`` (-> ``dK2``) are output-blocked over ``d_k``:
+          each 16-wide column block is computed and stored to global directly,
+          exact because matmul output columns are independent. ``dK2``/``dK3``
+          are folded into ``dK`` by the launch.
+
+        The only full-width dots left are the narrow ``(d_k, d_v)`` state-tile
+        contractions ``(beta.U) dH_c^T`` and ``G Hc^T``, whose operands never
+        exceed a single ``(M, d_v)`` computed tile. ``K``/``Q`` are thus never
+        resident full-width; the ``(M, M)`` ``KK``/``T``/``dT``/``dKK`` and
+        ``(C, M)`` ``S``/``P``/``dS`` intermediates stay per-program register
+        results, entering SMEM only as narrow-partnered dot operands. Padded
+        rows/cols load as zero and are dropped on store.
         """
         bh = tl.program_id(0)
         c = tl.program_id(1)
@@ -2522,22 +2570,15 @@ if _HAS_TRITON:
         dy_base = bh * (T * d_v) + start_tok * d_v
         Hb_base = bh * (num_chunks * d_k * d_v) + c * (d_k * d_v)
 
-        Ktile = tl.load(
-            K_ptr + K_base + m[:, None] * d_k + kk[None, :],
-            mask=row_valid[:, None] & kcol[None, :],
-            other=0.0,
-        ).to(tl.float32)  # (BLOCK_M, BLOCK_K)
+        # K and Q are only ever consumed 16-wide in d_k now (the region-A build
+        # loop and the output-blocked dQ/dK3/dKK loops), so neither is loaded
+        # full -- that full (M/C, d_k) residency was the co-staged SMEM peak.
         Vtile = tl.load(
             V_ptr + V_base + m[:, None] * d_v + vv[None, :],
             mask=row_valid[:, None] & vcol[None, :],
             other=0.0,
         ).to(tl.float32)  # (BLOCK_M, BLOCK_V)
         beta_tile = tl.load(beta_ptr + beta_base + m, mask=row_valid, other=0.0).to(tl.float32)
-        Qtile = tl.load(
-            Q_ptr + Q_base + cc[:, None] * d_k + kk[None, :],
-            mask=tok_valid[:, None] & kcol[None, :],
-            other=0.0,
-        ).to(tl.float32)  # (BLOCK_C, BLOCK_K)
         dyc = tl.load(
             dy_ptr + dy_base + cc[:, None] * d_v + vv[None, :],
             mask=tok_valid[:, None] & vcol[None, :],
@@ -2554,14 +2595,56 @@ if _HAS_TRITON:
             other=0.0,
         ).to(tl.float32)  # (BLOCK_K, BLOCK_V) -- output-state grad from B2
 
-        # Rebuild T (register).
-        KK = tl.dot(Ktile, tl.trans(Ktile), input_precision="ieee")  # (BLOCK_M, BLOCK_M)
+        # Region-A builds, feature-blocked over d_k (fla's chunk_delta_rule
+        # BK-loop idiom, MIT). The four d_k-reductions that open the grad pass
+        # -- KK = K K^T, KHc = K Hc, S = Q K^T, dbU = K dH_c -- are accumulated
+        # over 16-wide d_k sub-tiles loaded from global, so no dot ever stages a
+        # full (M, d_k) K or (C, d_k) Q operand. The co-staged full K + Q + KK
+        # set was the measured SMEM peak of this kernel (~164 KB at d_k=64,
+        # M=128 -- the dominant term is the NUMBER of d_k-wide operand tiles,
+        # not the (M, M) tile). Each output reduces over d_k, so splitting the
+        # contraction into 16-wide blocks is an exact re-association (fp32
+        # sum-order, ~1e-7, inside the grad gate); Kb/Qb/Hb/dHb loads carry the
+        # same masks as the full tiles so padded lanes contribute exactly zero.
+        KK = tl.zeros((BLOCK_M, BLOCK_M), dtype=tl.float32)
+        KHc = tl.zeros((BLOCK_M, BLOCK_V), dtype=tl.float32)
+        S = tl.zeros((BLOCK_C, BLOCK_M), dtype=tl.float32)
+        dbU = tl.zeros((BLOCK_M, BLOCK_V), dtype=tl.float32)
+        for kb in tl.static_range(BLOCK_K // 16):
+            kcols = kb * 16 + tl.arange(0, 16)
+            kcm = kcols < d_k
+            Kb = tl.load(
+                K_ptr + K_base + m[:, None] * d_k + kcols[None, :],
+                mask=row_valid[:, None] & kcm[None, :],
+                other=0.0,
+            ).to(tl.float32)  # (BLOCK_M, 16)
+            Qb = tl.load(
+                Q_ptr + Q_base + cc[:, None] * d_k + kcols[None, :],
+                mask=tok_valid[:, None] & kcm[None, :],
+                other=0.0,
+            ).to(tl.float32)  # (BLOCK_C, 16)
+            Hb = tl.load(
+                Hbound_ptr + Hb_base + kcols[:, None] * d_v + vv[None, :],
+                mask=kcm[:, None] & vcol[None, :],
+                other=0.0,
+            ).to(tl.float32)  # (16, BLOCK_V)
+            dHb = tl.load(
+                dHbound_ptr + Hb_base + kcols[:, None] * d_v + vv[None, :],
+                mask=kcm[:, None] & vcol[None, :],
+                other=0.0,
+            ).to(tl.float32)  # (16, BLOCK_V)
+            KK += tl.dot(Kb, tl.trans(Kb), input_precision="ieee")
+            KHc += tl.dot(Kb, Hb, input_precision="ieee")
+            S += tl.dot(Qb, tl.trans(Kb), input_precision="ieee")
+            dbU += tl.dot(Kb, dHb, input_precision="ieee")
+
+        # Rebuild T (register) from the blocked KK.
         strict = (m[:, None] > m[None, :]).to(tl.float32)
         eye = (m[:, None] == m[None, :]).to(tl.float32)
         Tmat = eye + KK * beta_tile[None, :] * strict
 
         # U = T^-1 (V - K Hc) by forward substitution (mirrors the pre-pass).
-        rhsU = Vtile - tl.dot(Ktile, Hc, input_precision="ieee")  # (BLOCK_M, BLOCK_V)
+        rhsU = Vtile - KHc  # (BLOCK_M, BLOCK_V)
         U = tl.zeros((BLOCK_M, BLOCK_V), dtype=tl.float32)
         for i in range(M):
             sel = m == i
@@ -2570,16 +2653,15 @@ if _HAS_TRITON:
             xu = rhs_i - tl.sum(T_row[:, None] * U, axis=0)
             U = tl.where(sel[:, None], xu[None, :], U)
 
-        # Readout mask / S / P (same build as the forward readout).
-        S = tl.dot(Qtile, tl.trans(Ktile), input_precision="ieee")  # (BLOCK_C, BLOCK_M)
+        # Readout mask / P from the blocked S (same build as the forward readout).
         tok_of_m = m // nh
         read_mask = (
             (tok_of_m[None, :] <= cc[:, None]) & row_valid[None, :] & tok_valid[:, None]
         ).to(tl.float32)  # (BLOCK_C, BLOCK_M)
         P = S * beta_tile[None, :] * read_mask
 
-        # dU = P^T dy + beta (.) (K dH_c); dbU = K dH_c reused for dbeta.
-        dbU = tl.dot(Ktile, dH_c, input_precision="ieee")  # (BLOCK_M, BLOCK_V)
+        # dU = P^T dy + beta (.) (K dH_c); dbU (= K dH_c) came from the blocked
+        # region-A loop above and is reused for dbeta.
         dU = tl.dot(tl.trans(P), dyc, input_precision="ieee") + beta_tile[:, None] * dbU
 
         # G = T^-T dU by backward substitution (down-counting i = M-1..0).
@@ -2604,27 +2686,64 @@ if _HAS_TRITON:
             + tl.sum(dT * KK * strict, axis=0)
         )  # (BLOCK_M,)
 
-        # dQ = dy Hc^T + dS K. Sequential += (one dot's operands staged at a
-        # time; the summed form let Triton co-stage both pairs -- see docstring).
-        dQc = tl.dot(dyc, tl.trans(Hc), input_precision="ieee")  # (BLOCK_C, BLOCK_K)
-        dQc += tl.dot(dS, Ktile, input_precision="ieee")
-        tl.store(
-            dQ_ptr + Q_base + cc[:, None] * d_k + kk[None, :],
-            dQc,
-            mask=tok_valid[:, None] & kcol[None, :],
-        )
+        # dQ = dy Hc^T + dS K, output-blocked over d_k into 16-wide column
+        # sub-tiles stored straight to global. The output columns are the d_k
+        # index, so blocking is exact (columns independent), and neither dot
+        # stages a full (C, d_k) K operand: dy Hc^T's column kcols is dy (Hc
+        # rows kcols)^T = dot(dyc, trans(Hb)), and dS K's column kcols is
+        # dot(dS, Kb). Both operand pairs are now 16-wide in d_k.
+        for kb in tl.static_range(BLOCK_K // 16):
+            kcols = kb * 16 + tl.arange(0, 16)
+            kcmask = kcols < d_k
+            Kblk = tl.load(
+                K_ptr + K_base + m[:, None] * d_k + kcols[None, :],
+                mask=row_valid[:, None] & kcmask[None, :],
+                other=0.0,
+            ).to(tl.float32)  # (BLOCK_M, 16)
+            Hblk = tl.load(
+                Hbound_ptr + Hb_base + kcols[:, None] * d_v + vv[None, :],
+                mask=kcmask[:, None] & vcol[None, :],
+                other=0.0,
+            ).to(tl.float32)  # (16, BLOCK_V) -- Hc rows kcols
+            dQblk = tl.dot(dyc, tl.trans(Hblk), input_precision="ieee")  # (BLOCK_C, 16)
+            dQblk += tl.dot(dS, Kblk, input_precision="ieee")
+            tl.store(
+                dQ_ptr + Q_base + cc[:, None] * d_k + kcols[None, :],
+                dQblk,
+                mask=tok_valid[:, None] & kcmask[None, :],
+            )
 
-        # dK direct terms = (beta (.) U) dH_c^T + dS^T Q - G Hc^T. Sequential +=;
-        # the two (M, M)-operand terms dKK K + dKK^T K are added below (blocked).
+        # dK direct d_v-reduction terms = (beta (.) U) dH_c^T - G Hc^T. These
+        # carry no full K/Q operand (dH_c, Hc are the narrow (d_k, d_v) state
+        # tiles), so they accumulate full-width into dK; the two remaining terms
+        # -- dS^T Q and dKK K + dKK^T K -- are output-blocked over d_k into the
+        # dK3 / dK2 buffers below (folded into dK by the launch), so no full
+        # (C, d_k) Q or (M, M) dKK operand ever co-stages with a wide K/Q tile.
         bU = beta_tile[:, None] * U  # (BLOCK_M, BLOCK_V)
         dK_local = tl.dot(bU, tl.trans(dH_c), input_precision="ieee")  # (BLOCK_M, BLOCK_K)
-        dK_local += tl.dot(tl.trans(dS), Qtile, input_precision="ieee")
         dK_local -= tl.dot(G, tl.trans(Hc), input_precision="ieee")
         tl.store(
             dK_ptr + K_base + m[:, None] * d_k + kk[None, :],
             dK_local,
             mask=row_valid[:, None] & kcol[None, :],
         )
+
+        # dS^T Q -> dK3, output-blocked over d_k (column kcols = dot(trans(dS),
+        # Qb)); exact (columns independent), no full (C, d_k) Q operand.
+        for kb in tl.static_range(BLOCK_K // 16):
+            kcols = kb * 16 + tl.arange(0, 16)
+            kcmask = kcols < d_k
+            Qblk = tl.load(
+                Q_ptr + Q_base + cc[:, None] * d_k + kcols[None, :],
+                mask=tok_valid[:, None] & kcmask[None, :],
+                other=0.0,
+            ).to(tl.float32)  # (BLOCK_C, 16)
+            dK3blk = tl.dot(tl.trans(dS), Qblk, input_precision="ieee")  # (BLOCK_M, 16)
+            tl.store(
+                dK3_ptr + K_base + m[:, None] * d_k + kcols[None, :],
+                dK3blk,
+                mask=row_valid[:, None] & kcmask[None, :],
+            )
 
         # dKK K + dKK^T K -> dK2 (folded into dK by the launch). dKK is (M, M)
         # (65536 B at M=128); block the d_k free dim into 16-wide sub-tiles so it
@@ -2659,6 +2778,30 @@ if _HAS_TRITON:
             dbeta_local,
             mask=row_valid,
         )
+
+    def _delta_launch_named(kernel_name: str, launch):
+        """Run one backward-kernel launch, tagging any failure with its name.
+
+        Re-raises the SAME exception object -- its type is preserved, so the
+        narrowed ``_DELTA_BWD_KERNEL_EXCEPTIONS`` funnel in
+        ``_DeltaScanFn.backward`` still decides identically which failures fall
+        back to the exact torch loop and which propagate as bugs -- with the
+        offending kernel's name prepended to the message. A resource/compile
+        overrun then self-attributes in the ``_DeltaBackwardFallbackWarning``
+        text (e.g. ``fused backward launch failed at _delta_bwd_grad_kernel:
+        out of resource: shared memory, Required: ...``), so every future OOM
+        names which of B1/B2/B3 overran without a re-run. Zero cost on the
+        success path (a bare ``try`` around the existing launch).
+        """
+        try:
+            launch()
+        except BaseException as exc:  # re-raised unchanged in type; only tagged
+            tag = f"fused backward launch failed at {kernel_name}"
+            if exc.args and isinstance(exc.args[0], str):
+                exc.args = (f"{tag}: {exc.args[0]}", *exc.args[1:])
+            else:
+                exc.args = (tag, *exc.args)
+            raise
 
     def _delta_backward_launch(
         Q: torch.Tensor,
@@ -2712,47 +2855,57 @@ if _HAS_TRITON:
         # kept separate so the (M, M) dKK operand never stages against a wide K
         # tile (the launch-fit SMEM fix -- see _delta_bwd_grad_kernel).
         dK2 = torch.zeros_like(K)
+        # dS^T Q term of dK, written d_k-blocked by B3 and folded into dK below;
+        # kept separate so no full (C, d_k) Q tile stages against the (M, M) or
+        # (C, M) computed operands in the grad pass (the launch-fit SMEM fix).
+        dK3 = torch.zeros_like(K)
         dV = torch.zeros_like(V)
         dbeta = torch.zeros_like(beta)
 
-        _delta_bwd_prepass_kernel[(bh, num_chunks)](
-            Q,
-            K,
-            beta,
-            dy,
-            TinvTBK,
-            dHconst,
-            T,
-            nh,
-            num_chunks,
-            chunk_size,
-            d_k,
-            d_v,
-            block_m,
-            block_c,
-            block_k,
-            block_v,
+        _delta_launch_named(
+            "_delta_bwd_prepass_kernel",
+            lambda: _delta_bwd_prepass_kernel[(bh, num_chunks)](
+                Q,
+                K,
+                beta,
+                dy,
+                TinvTBK,
+                dHconst,
+                T,
+                nh,
+                num_chunks,
+                chunk_size,
+                d_k,
+                d_v,
+                block_m,
+                block_c,
+                block_k,
+                block_v,
+            ),
         )
 
         # Serial reverse dH chain; num_stages=1 (strict serial dependency, same
         # as the forward state pass -- prefetch buys nothing, only enlarges SMEM).
-        _delta_bwd_state_kernel[(bh,)](
-            K,
-            TinvTBK,
-            dHconst,
-            dH_T,
-            dHbound,
-            dH0,
-            T,
-            nh,
-            num_chunks,
-            chunk_size,
-            d_k,
-            d_v,
-            block_m,
-            block_k,
-            block_v,
-            num_stages=1,
+        _delta_launch_named(
+            "_delta_bwd_state_kernel",
+            lambda: _delta_bwd_state_kernel[(bh,)](
+                K,
+                TinvTBK,
+                dHconst,
+                dH_T,
+                dHbound,
+                dH0,
+                T,
+                nh,
+                num_chunks,
+                chunk_size,
+                d_k,
+                d_v,
+                block_m,
+                block_k,
+                block_v,
+                num_stages=1,
+            ),
         )
 
         # Chunk-parallel grads; widen warps for the wide (d_k >= 32) tiles, as
@@ -2764,38 +2917,43 @@ if _HAS_TRITON:
         # 16-wide blocking exists to bound (73728 B uniform across the
         # envelope), so single-buffer is the safe choice.
         grad_warps = 8 if d_k >= 32 else 4
-        _delta_bwd_grad_kernel[(bh, num_chunks)](
-            Q,
-            K,
-            V,
-            beta,
-            Hbound,
-            dHbound,
-            dy,
-            dQ,
-            dK,
-            dK2,
-            dV,
-            dbeta,
-            T,
-            nh,
-            num_chunks,
-            chunk_size,
-            d_k,
-            d_v,
-            block_m,
-            block_c,
-            block_k,
-            block_v,
-            num_warps=grad_warps,
-            num_stages=1,
+        _delta_launch_named(
+            "_delta_bwd_grad_kernel",
+            lambda: _delta_bwd_grad_kernel[(bh, num_chunks)](
+                Q,
+                K,
+                V,
+                beta,
+                Hbound,
+                dHbound,
+                dy,
+                dQ,
+                dK,
+                dK2,
+                dK3,
+                dV,
+                dbeta,
+                T,
+                nh,
+                num_chunks,
+                chunk_size,
+                d_k,
+                d_v,
+                block_m,
+                block_c,
+                block_k,
+                block_v,
+                num_warps=grad_warps,
+                num_stages=1,
+            ),
         )
 
         need_Q, need_K, need_V, need_beta, need_H0, _ = needs_input_grad
         return (
             dQ if need_Q else None,
-            # Fold the d_k-blocked dKK K + dKK^T K terms into the direct dK.
-            (dK + dK2) if need_K else None,
+            # Fold the d_k-blocked dKK K + dKK^T K (dK2) and dS^T Q (dK3) terms
+            # into the direct dK.
+            (dK + dK2 + dK3) if need_K else None,
             dV if need_V else None,
             dbeta if need_beta else None,
             dH0 if need_H0 else None,
