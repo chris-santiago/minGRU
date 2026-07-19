@@ -17,23 +17,33 @@ pendulum's tau, added by a later task) are represented by `Budget`'s
 optional fields rather than guessed numbers -- this task ships the contract,
 not the calibrated values.
 
-Generator interface convention (`probes.py`, matched here): every generator
-is `make(batch, T, gen) -> tensors`, seeded by a caller-supplied
-`torch.Generator` so training/eval streams stay reproducible and disjoint
-(spec §7 seeding convention). Return shape follows the batch contract for
-the task's `loss_mode` (spec §6):
+Generator interface convention (`probes.py`, matched here): every synthetic
+task's generator is `make(batch, T, gen) -> tensors`, seeded by a
+caller-supplied `torch.Generator` so training/eval streams stay
+reproducible and disjoint (spec §7 seeding convention). psMNIST is the one
+task whose `data` is not this kind of generator -- an epoch dataset owns a
+fixed split and a fixed pixel permutation that must persist across calls,
+so its `data` value is a `Loader` instance instead (spec §6: `data:
+Callable | Loader`). Return/yield shape follows the batch contract for the
+task's `loss_mode` (spec §6):
 
 - `dense` (S5): `(x, y)`, both `(batch, T)` int64.
 - `masked_query` (MQAR): `(x, y, mask)`, all `(batch, T)` (`x`/`y` int64,
   `mask` bool); loss/accuracy apply only where `mask` is true.
+- `last_step` (psMNIST): `(x, y)`, `x` float `(batch, T, d_in)`, `y` int64
+  `(batch,)`; loss/accuracy apply only at the final position.
+- `regression` (pendulum): `(x, dt, y)`, `x`/`y` float `(batch, T, d_in)`/
+  `(batch, T, d_out)`, `dt` float `(batch, T)` feeding the decay channel via
+  the existing timestamped-input path (`probes.py`'s `TIMESTAMPED_TASKS`
+  convention: `dt[:, 0] == 0`, nothing precedes the first position).
 """
 
 from __future__ import annotations
 
 import itertools
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Protocol
 
 import torch
 
@@ -57,6 +67,31 @@ class EvalConfig:
 
     T: int
     num_pairs: int | None = None
+
+
+class Loader(Protocol):
+    """Epoch-based counterpart to the synthetic tasks' `make(batch, T, gen)`
+    generators (spec §6: `data: Callable | Loader`). psMNIST's `data` is an
+    instance of this protocol rather than a stateless per-call callable,
+    since an epoch dataset owns a fixed split and a fixed pixel permutation
+    that must not be regenerated on every batch (module docstring).
+
+    Every method yields `last_step` batches (module docstring): `x` float
+    `(batch, T, d_in)`, `y` int64 `(batch,)`.
+    """
+
+    def train_epoch(self, gen: torch.Generator) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        """One shuffled pass over the training split, reshuffled fresh each
+        call via `gen`."""
+        ...
+
+    def val(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        """The full validation split, in a fixed (non-shuffled) order."""
+        ...
+
+    def test(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        """The full test split, in a fixed (non-shuffled) order."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -98,9 +133,9 @@ class TaskSpec:
     loss_mode : LossMode
         Selects the batch contract (module docstring / spec §6) the driver
         applies to `data`'s output.
-    data : Callable
+    data : Callable | Loader
         `make(batch, T, gen) -> tensors` for the synthetic tasks (S5, MQAR,
-        pendulum); an epoch loader for psMNIST.
+        pendulum); a `Loader` instance (epoch-based) for psMNIST.
     fit_metric : FitMetric
         The ledger `ckpt` key a trained seed is selected/judged on.
     fit_threshold : float
@@ -123,7 +158,7 @@ class TaskSpec:
 
     name: str
     loss_mode: LossMode
-    data: Callable[..., tuple[torch.Tensor, ...]]
+    data: Callable[..., tuple[torch.Tensor, ...]] | Loader
     fit_metric: FitMetric
     fit_threshold: float
     fit_direction: FitDirection
@@ -303,3 +338,264 @@ def make_mqar(
     y[:, T - num_pairs : T] = query_values
     mask[:, T - num_pairs : T] = True
     return x, y, mask
+
+
+# ------------------------------------------------------------- Pendulum
+# Angle-observation pendulum regression (spec §4, "CRU-protocol-inspired"
+# per the design spec's key-decisions section): a frictionless simple
+# pendulum is ODE-simulated and observed as noisy (sin theta, cos theta)
+# pairs at irregularly spaced timestamps; the model predicts the true
+# (noiseless) (sin theta, cos theta) pair at each observation -- a
+# denoising target at the same 2-d observation space as `x`, so `d_out ==
+# d_in == 2` (the spec's "true state at each observation" read as the
+# state the observation itself encodes, position only -- angular velocity
+# is never observed and is not part of the regression target). `dt` feeds
+# the decay channel via the existing timestamped-input path (`probes.py`'s
+# TIMESTAMPED_TASKS convention): `regression` loss mode, MSE over all
+# positions (spec §6).
+
+PENDULUM_GRAVITY = 9.81  # m/s^2
+PENDULUM_LENGTH = 1.0  # m
+PENDULUM_THETA0_RANGE = (-1.0, 1.0)  # rad; single pendulum is non-chaotic at any amplitude
+PENDULUM_OMEGA0_RANGE = (-1.0, 1.0)  # rad/s
+PENDULUM_DT_RANGE = (0.05, 0.3)  # s; strictly positive -> strictly increasing timestamps
+PENDULUM_OBS_NOISE_STD = 0.05
+PENDULUM_SUBSTEPS = 20  # RK4 micro-steps per observation gap (integration accuracy)
+
+
+def _pendulum_derivative(
+    theta: torch.Tensor, omega: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Frictionless simple-pendulum ODE: theta' = omega, omega' =
+    -(g/L) sin(theta)."""
+    theta_dot = omega
+    omega_dot = -(PENDULUM_GRAVITY / PENDULUM_LENGTH) * torch.sin(theta)
+    return theta_dot, omega_dot
+
+
+def _rk4_step(
+    theta: torch.Tensor, omega: torch.Tensor, h: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One classical RK4 step of step size `h` (elementwise per batch row,
+    so rows may advance by different gaps)."""
+    k1_th, k1_om = _pendulum_derivative(theta, omega)
+    k2_th, k2_om = _pendulum_derivative(theta + 0.5 * h * k1_th, omega + 0.5 * h * k1_om)
+    k3_th, k3_om = _pendulum_derivative(theta + 0.5 * h * k2_th, omega + 0.5 * h * k2_om)
+    k4_th, k4_om = _pendulum_derivative(theta + h * k3_th, omega + h * k3_om)
+    theta_new = theta + (h / 6.0) * (k1_th + 2.0 * k2_th + 2.0 * k3_th + k4_th)
+    omega_new = omega + (h / 6.0) * (k1_om + 2.0 * k2_om + 2.0 * k3_om + k4_om)
+    return theta_new, omega_new
+
+
+def _integrate_pendulum(
+    theta0: torch.Tensor,
+    omega0: torch.Tensor,
+    dt: torch.Tensor,
+    n_substeps: int = PENDULUM_SUBSTEPS,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Integrate the pendulum ODE forward from `(theta0, omega0)` across
+    each row's per-position gap `dt` (batch, T): position 0 is the initial
+    condition (`dt[:, 0]` is ignored -- nothing precedes the first
+    position, matching `probes.py`'s no-t=0-exemption convention); each
+    subsequent gap is substepped into `n_substeps` fixed micro-steps of
+    RK4 for integration accuracy.
+
+    Returns
+    -------
+    tuple of torch.Tensor
+        `(theta, omega)`, each `(batch, T)`: the state trajectory.
+    """
+    batch, T = dt.shape
+    theta = theta0.clone()
+    omega = omega0.clone()
+    theta_traj = torch.empty(batch, T, dtype=theta0.dtype)
+    omega_traj = torch.empty(batch, T, dtype=omega0.dtype)
+    theta_traj[:, 0] = theta
+    omega_traj[:, 0] = omega
+    for t in range(1, T):
+        h = dt[:, t] / n_substeps
+        for _ in range(n_substeps):
+            theta, omega = _rk4_step(theta, omega, h)
+        theta_traj[:, t] = theta
+        omega_traj[:, t] = omega
+    return theta_traj, omega_traj
+
+
+def make_pendulum(
+    batch: int,
+    T: int,
+    gen: torch.Generator,
+    dt_range: tuple[float, float] = PENDULUM_DT_RANGE,
+    obs_noise_std: float = PENDULUM_OBS_NOISE_STD,
+    n_substeps: int = PENDULUM_SUBSTEPS,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`regression`-loss-mode pendulum generator (spec §4): per row, an
+    independent initial condition is drawn and the frictionless pendulum
+    ODE is integrated across independently drawn, strictly positive gaps
+    (`dt_range`) -- irregular and strictly increasing once accumulated
+    into timestamps. Observations are the true `(sin theta, cos theta)`
+    pair plus iid Gaussian noise (`obs_noise_std`); the label is the
+    noiseless pair at that same position.
+
+    Parameters
+    ----------
+    batch, T : int
+        Batch size and sequence length.
+    gen : torch.Generator
+        Seeds every random draw (initial conditions, gaps, observation
+        noise).
+    dt_range : tuple[float, float]
+        Per-position gap range (seconds); position 0's gap is forced to 0
+        (no preceding position).
+    obs_noise_std : float
+        Standard deviation of the additive Gaussian observation noise.
+    n_substeps : int
+        RK4 micro-steps per observation gap (integration accuracy).
+
+    Returns
+    -------
+    tuple of torch.Tensor
+        `(x, dt, y)`: `x`/`y` float `(batch, T, 2)`, `dt` float
+        `(batch, T)`.
+    """
+    theta0 = torch.empty(batch).uniform_(*PENDULUM_THETA0_RANGE, generator=gen)
+    omega0 = torch.empty(batch).uniform_(*PENDULUM_OMEGA0_RANGE, generator=gen)
+
+    dt = torch.empty(batch, T).uniform_(*dt_range, generator=gen)
+    dt[:, 0] = 0.0  # position 0 is the initial condition (probes.py convention)
+
+    theta, _ = _integrate_pendulum(theta0, omega0, dt, n_substeps)
+
+    true_state = torch.stack([torch.sin(theta), torch.cos(theta)], dim=-1)  # (batch, T, 2)
+    noise = torch.empty(batch, T, 2).normal_(mean=0.0, std=obs_noise_std, generator=gen)
+    x = true_state + noise
+    y = true_state
+    return x, dt, y
+
+
+# ----------------------------------------------------------------- psMNIST
+# Permuted-sequential MNIST (spec §4): MNIST pixels flattened to a
+# length-784 scalar sequence under one fixed permutation, single 10-class
+# label read at the final position (`last_step` loss mode). torchvision is
+# an optional import -- only `PsMNISTLoader.__init__` (which downloads and
+# reads the dataset) imports it; the permutation/split/batch helpers below
+# are pure tensor functions with no torchvision dependency, so they (and
+# this module) are testable/importable without it installed.
+
+PSMNIST_T = 28 * 28  # 784: MNIST pixels flattened (spec §4)
+PSMNIST_TRAIN_SIZE = 50_000
+PSMNIST_VAL_SIZE = 10_000
+# Test split is torchvision's MNIST test set as-is (10k rows, spec §4);
+# there is no size constant for it since nothing slices it.
+
+
+def make_psmnist_permutation(seed: int) -> torch.Tensor:
+    """The one fixed pixel permutation for psMNIST (spec §4: "one fixed
+    permutation from a recorded seed identical across arms and seeds"). A
+    pure function of `seed` -- reproducible across process runs, testable
+    without any dataset dependency.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randperm(PSMNIST_T, generator=gen)
+
+
+def _prepare_split(
+    images: torch.Tensor, labels: torch.Tensor, permutation: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flatten `images` (N, 28, 28) uint8 to (N, 784) scalar pixels, scale
+    to [0, 1], apply the fixed pixel `permutation`, and add the trailing
+    feature dim the `last_step` contract expects (spec §6: `x` float
+    `(batch, T, d_in)`, here `d_in == 1`).
+
+    Pure tensor transform (no torchvision dependency), so split/batch
+    logic is testable with synthetic images.
+    """
+    n = images.shape[0]
+    flat = images.reshape(n, PSMNIST_T).float() / 255.0
+    x = flat[:, permutation].unsqueeze(-1)  # (N, T, 1)
+    y = labels.long()
+    return x, y
+
+
+def _split_train_val(
+    images: torch.Tensor,
+    labels: torch.Tensor,
+    train_size: int = PSMNIST_TRAIN_SIZE,
+    val_size: int = PSMNIST_VAL_SIZE,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split MNIST's 60k training rows into the 50k/10k train/val split
+    (spec §4): the first `train_size` rows are train, the next `val_size`
+    are val. torchvision's MNIST ships in a fixed (non-shuffled) order, so
+    no reshuffle happens here -- shuffling is `train_epoch`'s job, applied
+    fresh every epoch.
+    """
+    train_images, train_labels = images[:train_size], labels[:train_size]
+    val_images = images[train_size : train_size + val_size]
+    val_labels = labels[train_size : train_size + val_size]
+    return train_images, train_labels, val_images, val_labels
+
+
+def _ordered_batches(
+    x: torch.Tensor, y: torch.Tensor, batch_size: int
+) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    """Yield `(x_batch, y_batch)` slices of `batch_size` in dataset order
+    (last batch may be smaller) -- val/test, so repeated evaluation sees a
+    stable, unshuffled order."""
+    n = x.shape[0]
+    for start in range(0, n, batch_size):
+        yield x[start : start + batch_size], y[start : start + batch_size]
+
+
+def _shuffled_batches(
+    x: torch.Tensor, y: torch.Tensor, batch_size: int, gen: torch.Generator
+) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+    """`_ordered_batches` over a fresh per-call shuffle of `x`/`y`, seeded
+    by `gen` -- training, reshuffled every epoch."""
+    order = torch.randperm(x.shape[0], generator=gen)
+    yield from _ordered_batches(x[order], y[order], batch_size)
+
+
+class PsMNISTLoader:
+    """`Loader` (spec §6) for psMNIST (spec §4): downloads MNIST via
+    torchvision, applies the fixed pixel permutation recorded by
+    `permutation_seed`, and splits into the 50k/10k/10k train/val/test used
+    everywhere in this round.
+
+    torchvision is imported lazily inside `__init__`, not at module level,
+    so constructing this loader is the only thing that requires it
+    installed (module docstring / spec-and-plan requirement).
+    """
+
+    def __init__(
+        self,
+        permutation_seed: int,
+        batch_size: int,
+        root: str = "./data",
+        download: bool = True,
+    ) -> None:
+        import torchvision  # local import: optional dependency (module docstring)
+
+        self.permutation_seed = permutation_seed
+        self.batch_size = batch_size
+        self.permutation = make_psmnist_permutation(permutation_seed)
+
+        train_full = torchvision.datasets.MNIST(root=root, train=True, download=download)
+        test_set = torchvision.datasets.MNIST(root=root, train=False, download=download)
+
+        train_images, train_labels, val_images, val_labels = _split_train_val(
+            train_full.data, train_full.targets
+        )
+        self._train_x, self._train_y = _prepare_split(train_images, train_labels, self.permutation)
+        self._val_x, self._val_y = _prepare_split(val_images, val_labels, self.permutation)
+        self._test_x, self._test_y = _prepare_split(
+            test_set.data, test_set.targets, self.permutation
+        )
+
+    def train_epoch(self, gen: torch.Generator) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        yield from _shuffled_batches(self._train_x, self._train_y, self.batch_size, gen)
+
+    def val(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        yield from _ordered_batches(self._val_x, self._val_y, self.batch_size)
+
+    def test(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        yield from _ordered_batches(self._test_x, self._test_y, self.batch_size)
