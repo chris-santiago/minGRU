@@ -2442,6 +2442,7 @@ if _HAS_TRITON:
         dy_ptr,
         dQ_ptr,
         dK_ptr,
+        dK2_ptr,
         dV_ptr,
         dbeta_ptr,
         T,
@@ -2472,12 +2473,29 @@ if _HAS_TRITON:
             dbeta = sum_v(U (.) K dH_c) + sum_t(dP (.) S (.) mask) + sum_i(dT (.) KK (.) strict)
 
         with ``dP = dy U^T``, ``dS = dP (.) beta (.) mask``, ``dT = -(G U^T)``,
-        ``dKK = dT (.) beta (.) strict`` -- byte-for-byte the reference torch
-        loop, just tiled. Recomputing ``T``/``U``/``G`` per chunk (rather than
+        ``dKK = dT (.) beta (.) strict`` -- the reference torch loop's math,
+        just tiled. Recomputing ``T``/``U``/``G`` per chunk (rather than
         persisting sequence-sized ``U``/``Gr`` from B1) keeps the backward
         workspace lean, mirroring the forward readout's recompute-of-``U`` call.
         Every ``(M, M)`` tile is per-program (never global). Padded rows/cols
         load as zero and are dropped on store.
+
+        Shared-memory discipline (the L4 launch-fit invariant). Every packed
+        multi-``tl.dot`` accumulation (``dQ``, ``dK``) is written as SEPARATE
+        sequential ``+=`` statements: a single summed expression lets Triton
+        co-stage several dots' operand tiles at once (the over-concurrency that
+        put the earlier one-expression ``dK`` at ~110 KB, over the 101376 B L4
+        limit), whereas sequential statements reuse the scratch so the peak is
+        one dot's operand pair. The two ``(M, M)``-operand terms ``dKK K`` and
+        ``dKK^T K`` (dominant: the ``(M, M)`` ``dKK`` tile is 65536 B at
+        ``M = 128``) are additionally BLOCKED over the ``d_k`` free dimension
+        into 16-wide sub-tiles loaded from global (fla's feature-blocking), so
+        ``dKK`` pairs only with an ``(M, 16)`` slice of ``K`` (<= 73728 B at
+        ``M = 128``, every ``d_k``) and are written to a separate ``dK2`` buffer
+        the launch folds into ``dK``. Output-column blocking is exact (matmul
+        columns are independent), so each block equals the matching columns of
+        the full ``(M, M)``-operand product. (tiling scheme after fla's
+        chunk_delta_rule wy_fast backward, MIT.)
         """
         bh = tl.program_id(0)
         c = tl.program_id(1)
@@ -2578,41 +2596,59 @@ if _HAS_TRITON:
         dP = tl.dot(dyc, tl.trans(U), input_precision="ieee")  # (BLOCK_C, BLOCK_M)
         dS = dP * beta_tile[None, :] * read_mask  # (BLOCK_C, BLOCK_M)
         dT = -tl.dot(G, tl.trans(U), input_precision="ieee")  # (BLOCK_M, BLOCK_M)
-        dKK = dT * beta_tile[None, :] * strict  # (BLOCK_M, BLOCK_M)
 
-        # dbeta: state + readout(P) + T-build terms.
+        # dbeta: state + readout(P) + T-build terms (register reductions, no dot).
         dbeta_local = (
             tl.sum(U * dbU, axis=1)
             + tl.sum(dP * S * read_mask, axis=0)
             + tl.sum(dT * KK * strict, axis=0)
         )  # (BLOCK_M,)
 
-        # dQ = dy Hc^T + dS K.
-        dQc = tl.dot(dyc, tl.trans(Hc), input_precision="ieee") + tl.dot(
-            dS, Ktile, input_precision="ieee"
-        )  # (BLOCK_C, BLOCK_K)
-
-        # dK = (beta (.) U) dH_c^T + dS^T Q - G Hc^T + dKK K + dKK^T K.
-        bU = beta_tile[:, None] * U  # (BLOCK_M, BLOCK_V)
-        dK_local = (
-            tl.dot(bU, tl.trans(dH_c), input_precision="ieee")
-            + tl.dot(tl.trans(dS), Qtile, input_precision="ieee")
-            - tl.dot(G, tl.trans(Hc), input_precision="ieee")
-            + tl.dot(dKK, Ktile, input_precision="ieee")
-            + tl.dot(tl.trans(dKK), Ktile, input_precision="ieee")
-        )  # (BLOCK_M, BLOCK_K)
-
-        # dV = G.
+        # dQ = dy Hc^T + dS K. Sequential += (one dot's operands staged at a
+        # time; the summed form let Triton co-stage both pairs -- see docstring).
+        dQc = tl.dot(dyc, tl.trans(Hc), input_precision="ieee")  # (BLOCK_C, BLOCK_K)
+        dQc += tl.dot(dS, Ktile, input_precision="ieee")
         tl.store(
             dQ_ptr + Q_base + cc[:, None] * d_k + kk[None, :],
             dQc,
             mask=tok_valid[:, None] & kcol[None, :],
         )
+
+        # dK direct terms = (beta (.) U) dH_c^T + dS^T Q - G Hc^T. Sequential +=;
+        # the two (M, M)-operand terms dKK K + dKK^T K are added below (blocked).
+        bU = beta_tile[:, None] * U  # (BLOCK_M, BLOCK_V)
+        dK_local = tl.dot(bU, tl.trans(dH_c), input_precision="ieee")  # (BLOCK_M, BLOCK_K)
+        dK_local += tl.dot(tl.trans(dS), Qtile, input_precision="ieee")
+        dK_local -= tl.dot(G, tl.trans(Hc), input_precision="ieee")
         tl.store(
             dK_ptr + K_base + m[:, None] * d_k + kk[None, :],
             dK_local,
             mask=row_valid[:, None] & kcol[None, :],
         )
+
+        # dKK K + dKK^T K -> dK2 (folded into dK by the launch). dKK is (M, M)
+        # (65536 B at M=128); block the d_k free dim into 16-wide sub-tiles so it
+        # only ever pairs with an (M, 16) slice of K. Output-column blocking is
+        # exact (matmul columns are independent). BLOCK_K is a multiple of 16.
+        # (tiling scheme after fla's chunk_delta_rule wy_fast bwd, MIT.)
+        dKK = dT * beta_tile[None, :] * strict  # (BLOCK_M, BLOCK_M)
+        for kb in tl.static_range(BLOCK_K // 16):
+            kcols = kb * 16 + tl.arange(0, 16)
+            kcmask = kcols < d_k
+            Kblk = tl.load(
+                K_ptr + K_base + m[:, None] * d_k + kcols[None, :],
+                mask=row_valid[:, None] & kcmask[None, :],
+                other=0.0,
+            ).to(tl.float32)  # (BLOCK_M, 16)
+            dKKblk = tl.dot(dKK, Kblk, input_precision="ieee")  # (BLOCK_M, 16)
+            dKKblk += tl.dot(tl.trans(dKK), Kblk, input_precision="ieee")
+            tl.store(
+                dK2_ptr + K_base + m[:, None] * d_k + kcols[None, :],
+                dKKblk,
+                mask=row_valid[:, None] & kcmask[None, :],
+            )
+
+        # dV = G.
         tl.store(
             dV_ptr + V_base + m[:, None] * d_v + vv[None, :],
             G,
@@ -2672,6 +2708,10 @@ if _HAS_TRITON:
 
         dQ = torch.zeros_like(Q)
         dK = torch.zeros_like(K)
+        # dKK K + dKK^T K, written d_k-blocked by B3 and folded into dK below;
+        # kept separate so the (M, M) dKK operand never stages against a wide K
+        # tile (the launch-fit SMEM fix -- see _delta_bwd_grad_kernel).
+        dK2 = torch.zeros_like(K)
         dV = torch.zeros_like(V)
         dbeta = torch.zeros_like(beta)
 
@@ -2718,10 +2758,11 @@ if _HAS_TRITON:
         # Chunk-parallel grads; widen warps for the wide (d_k >= 32) tiles, as
         # the readout does. num_stages=1: the two in-kernel substitution loops
         # carry a register accumulator with NO in-loop global load (nothing to
-        # prefetch), and this kernel's dominant dot (dKK @ K, an (M, M)x(M, d_k)
-        # operand pair) is the tightest SMEM footprint of the whole trio at the
-        # widest shape (M=128, d_k=64), so single-buffer is the safe choice --
-        # multi-buffering could only enlarge SMEM for no pipelining gain.
+        # prefetch), and the d_k-blocked dKK sub-tile loop DOES load from
+        # global in-loop -- multi-buffering it would re-stage the (M, M) dKK
+        # operand per stage, re-inflating exactly the SMEM footprint the
+        # 16-wide blocking exists to bound (73728 B uniform across the
+        # envelope), so single-buffer is the safe choice.
         grad_warps = 8 if d_k >= 32 else 4
         _delta_bwd_grad_kernel[(bh, num_chunks)](
             Q,
@@ -2733,6 +2774,7 @@ if _HAS_TRITON:
             dy,
             dQ,
             dK,
+            dK2,
             dV,
             dbeta,
             T,
@@ -2752,7 +2794,8 @@ if _HAS_TRITON:
         need_Q, need_K, need_V, need_beta, need_H0, _ = needs_input_grad
         return (
             dQ if need_Q else None,
-            dK if need_K else None,
+            # Fold the d_k-blocked dKK K + dKK^T K terms into the direct dK.
+            (dK + dK2) if need_K else None,
             dV if need_V else None,
             dbeta if need_beta else None,
             dH0 if need_H0 else None,
