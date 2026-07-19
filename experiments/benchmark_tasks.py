@@ -664,7 +664,9 @@ S5_TASK = TaskSpec(
     fit_direction="ge",
     robustness=(0.98, 0.99, 0.995),
     eval_protocol=(EvalConfig(T=256), EvalConfig(T=512), EvalConfig(T=1024)),
-    budget=Budget(lr=3e-3, batch_size=128, steps=1600, eval_every=100),  # PILOT-PLACEHOLDER
+    # PILOT-PLACEHOLDER round 2: all arms (log/givens/delta) sat at chance at the
+    # S3-scale steps=1600 (pilot jobs at 368ce8b, bench-s5-01 rows); probing 8x.
+    budget=Budget(lr=3e-3, batch_size=128, steps=12800, eval_every=100),
     seeds=36,
 )
 
@@ -680,7 +682,9 @@ MQAR_TASK = TaskSpec(
         EvalConfig(T=256, num_pairs=16),
         EvalConfig(T=256, num_pairs=32),
     ),
-    budget=Budget(lr=3e-3, batch_size=128, steps=1600, eval_every=100),
+    # PILOT-PLACEHOLDER round 2: delta reached only 0.21 val_qacc at the working
+    # default steps=1600 (pilot jobs at 368ce8b, bench-mqar-01 rows); probing 8x.
+    budget=Budget(lr=3e-3, batch_size=128, steps=12800, eval_every=100),
     seeds=36,
 )
 
@@ -693,7 +697,12 @@ PSMNIST_TASK = TaskSpec(
     fit_direction="ge",
     robustness=(0.88, 0.90, 0.92),
     eval_protocol=(),  # test-set accuracy reported directly (spec §4); no length/pair-count generalization axis
-    budget=Budget(lr=3e-3, batch_size=128, epochs=10),  # PILOT-PLACEHOLDER
+    # PILOT-PLACEHOLDER round 2: log reached 0.73-0.78 val_acc still climbing at
+    # epochs=10 (pilot jobs at 368ce8b, bench-psmnist-01 rows); probing the spec
+    # 4 table's ~30 epochs. lr corrected 3e-3 -> 1e-3: the design spec's 2
+    # training-config table fixes psMNIST at Adam 1e-3 (the earlier 3e-3 was a
+    # provisional-default deviation caught from the pilot rows' config).
+    budget=Budget(lr=1e-3, batch_size=128, epochs=30),
     seeds=12,
 )
 
