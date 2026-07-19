@@ -2840,6 +2840,17 @@ class DeltaMinGRU(nn.Module):
     return_state=True)`` equals ``forward(cat(x1, x2))`` on both outputs
     and gradients.
 
+    On CUDA, ``torch.compile`` is the recommended execution path (it
+    recovers most of the chunked-WY forward's fusion headroom with no
+    engineering). A hand-written Triton kernel for the forward also
+    exists: under ``MINGRU_SCAN=auto`` it engages only in a narrow,
+    measured win region (long sequences with narrow head dims), where it
+    is faster than eager and lighter on memory; ``MINGRU_SCAN=triton``
+    forces the full kernel envelope; ``MINGRU_SCAN=eager`` disables it.
+    The kernel does not reach ``torch.compile``-class speed and is not a
+    substitute for it -- see the docs' "Choose a mixer" guide (GPU
+    execution path) for the full picture.
+
     References
     ----------
     Yang et al., "Parallelizing Linear Transformers with the Delta

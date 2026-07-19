@@ -44,7 +44,7 @@ The optional Triton scan backend is imported lazily on first use of a Triton-bac
 
 An optional Triton backend supplies fused forward+backward GPU kernels for all four scan primitives (`linear_scan`, `matrix_scan`, `matrix_affine_scan`, `parallel_scan_log`) plus an angle-fused rotation path for `GivensMinGRU`. It sits behind a zero-config dispatch seam set by `MINGRU_SCAN`: `auto` (default: use Triton when a CUDA GPU and a working Triton install are present, else the pure-PyTorch eager path), `eager`, or `triton` (force it). CPU-only installs never import Triton.
 
-The win is concentrated in the matrix/block ops. Measured on an NVIDIA L4 (torch 2.8.0+cu128, Triton 3.4.0), forward+backward the Triton kernels run 39x–168x faster than eager on `matrix_scan`/`matrix_affine_scan`, and the angle-fused `GivensMinGRU` backward cuts peak memory from 395 MB to 38 MB. The log-space `parallel_scan_log` is the exception. Its recompute-in-backward kernel is 0.70x–0.80x *slower* than eager forward+backward, so eager stays the right default for the baseline `MinGRU`/`SignedMinGRU` mixers. All 590 CPU-vs-GPU parity checks pass. `DeltaMinGRU`'s chunked-WY `forward` is not one of these scan ops and has no hand-written Triton kernel: a separate GPU probe found `torch.compile` already recovers 70–91% of its available fusion headroom, so `torch.compile` — not this Triton backend — is the recommended CUDA path for `mixer="delta"` (see "Givens variant," below). Kernel design and the full benchmark tables are in the [Triton scan kernels explanation](https://chris-santiago.github.io/minGRU/explanation/triton-scans/) and `experiments/bench/` (`scan_bench.md`, `scan_memory.md`, `scan_parity.md`).
+The win is concentrated in the matrix/block ops. Measured on an NVIDIA L4 (torch 2.8.0+cu128, Triton 3.4.0), forward+backward the Triton kernels run 39x–168x faster than eager on `matrix_scan`/`matrix_affine_scan`, and the angle-fused `GivensMinGRU` backward cuts peak memory from 395 MB to 38 MB. The log-space `parallel_scan_log` is the exception. Its recompute-in-backward kernel is 0.70x–0.80x *slower* than eager forward+backward, so eager stays the right default for the baseline `MinGRU`/`SignedMinGRU` mixers. All 590 CPU-vs-GPU parity checks pass. `DeltaMinGRU`'s chunked-WY `forward` is not one of these scan ops: it has its own Triton kernel (forward trio + torch-composed backward, gated separately), but `torch.compile` — not this kernel — is the recommended CUDA path for `mixer="delta"`. A GPU probe found `torch.compile` recovers 68–89% of the available fusion headroom, while the kernel runs 1.85x–3.79x slower than compile on every probed shape; under `MINGRU_SCAN=auto` the kernel therefore engages only in a narrow measured win region (long sequences, narrow head dims), where it beats eager and saves ~3x memory, and stays eager everywhere else (see "Givens variant," below). Kernel design and the full benchmark tables are in the [Triton scan kernels explanation](https://chris-santiago.github.io/minGRU/explanation/triton-scans/) and `experiments/bench/` (`scan_bench.md`, `scan_memory.md`, `scan_parity.md`).
 
 ## What this shows
 
@@ -1088,12 +1088,17 @@ fit-only 0.721 delta vs 0.733 givens at T=1024); the low pooled mean is a
 fit-rate artifact. Delta@1024 is in fact the most accurate arm at or near
 training length on both strata (CPU: 1.000@64/0.988@256; GPU:
 0.984@64/0.971@256) and only trails on the long-extrapolation tail. On
-GPU, delta's own path is `torch.compile`, not a hand-written kernel: a
-fusion-headroom probe (`experiments/bench/gpu_delta_probe.md`) found
-compile already recovers 70-91% of available headroom, so a Triton
-chunked-WY kernel was judged not worth building. Remaining caveat: no
-comparison against the incumbents' released tuned kernels has been
-measured. Full mechanism, tables, and Fisher statistics for both
+GPU, delta's recommended path is `torch.compile`: a fusion-headroom
+probe (`experiments/bench/gpu_delta_probe.md`, NVIDIA L4) found compile
+recovers 68-89% of available headroom. A hand-written Triton chunked-WY
+kernel now exists but does not reach compile-class speed (1.85x-3.79x
+slower than compile on every probed shape; a fully fused Triton backward
+was 8-12x slower and was reverted; the same relative gap holds on an
+A100, a separate stratum), so `MINGRU_SCAN=auto` engages it only in a
+narrow measured win region — long sequences, narrow head dims — where it
+beats eager (0.61x) and saves ~3x peak memory, and stays eager
+otherwise. Remaining caveat: no comparison against the incumbents'
+released tuned kernels has been measured. Full mechanism, tables, and Fisher statistics for both
 composers are at the docs site's
 [Givens & Delta deep dive](https://chris-santiago.github.io/minGRU/explanation/givens-delta/)
 and in `experiments/EXPERIMENTS.md` (rounds `hetero-loop-20-pd64`,
