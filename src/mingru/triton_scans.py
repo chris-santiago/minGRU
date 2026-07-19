@@ -89,10 +89,21 @@ sequential pass. Unlike the four scan ops and the angle-fused path, this trio
 is plain `@triton.jit` launched directly via
 `_delta_forward_launch` (not `triton_op`/`register_autograd`): the delta
 path's backward is a hand-derived `torch.autograd.Function` (`_DeltaScanFn`,
-which `delta_scan_impl` routes through) whose recompute-based reverse-chunk
-loop is seeded from `Hbound`, and its target user is eager-only, so the
-compile-tracing machinery the four scan ops use is deliberately not in this
-path. Every tile is padded to `max(16, next_pow2(...))`
+which `delta_scan_impl` routes through) seeded from `Hbound`, and its target
+user is eager-only, so the compile-tracing machinery the four scan ops use is
+deliberately not in this path. That backward is itself a fused Triton trio
+(Kernel 7a/7b/7c, `_delta_backward_launch`) MIRRORING the forward
+decomposition: `_delta_bwd_prepass_kernel` (chunk-parallel) hoists the
+`dH`-independent transpose solve into `TinvTBK`/`dHconst`,
+`_delta_bwd_state_kernel` (serial per `batch*head`) carries the reverse `dH`
+chain writing `dHbound`/`dH0`, and `_delta_bwd_grad_kernel` (chunk-parallel)
+recomputes `T`/`U`/`G` per chunk and writes `dQ`/`dK`/`dV`/`dbeta` -- so the
+whole training step is kernel-resident (a torch-op backward would serialize
+~12 ops per chunk and forfeit the fwd+bwd speed bar). The verified torch
+reverse-chunk loop (`_delta_backward_torch`) is retained as the documented
+fallback if the fused launch raises (a resource/compile failure): exact,
+slower, warned, never a silent wrong grad. Every tile is padded to
+`max(16, next_pow2(...))`
 (`_delta_block_sizes`) so all `tl.dot`s route through
 `input_precision="ieee"` and stay bit-exact fp32, matching Kernel 5/6's
 `d_k == d_v`, fp32-only envelope (`_delta_validate_envelope`/
@@ -109,6 +120,7 @@ import contextlib
 import copy
 import os
 import types
+import warnings
 
 import torch
 import torch.nn.functional as F
@@ -2153,6 +2165,795 @@ if _HAS_TRITON:
         )
         return y, H_T, Hbound
 
+    # --- DeltaMinGRU fused backward trio (Kernel 7a/7b/7c) ------------------
+    #
+    # The reverse-chunk gradient of the chunked-WY forward, decomposed to
+    # MIRROR the forward trio: the forward's ONLY serial dependency is the `H`
+    # chain (everything H-independent -- T-build, T^-1 V, T^-1 K -- parallelizes
+    # across chunks in the pre-pass); the backward's ONLY serial dependency is
+    # the `dH` chain carried last-to-first (everything dH-independent
+    # parallelizes across chunks).
+    #
+    # Serial-vs-parallel analysis. Per chunk the exact torch backward forms
+    # `G = T^-T @ dU` with `dU = dU_read + beta (.) (K dH)`, where
+    # `dU_read = P^T dy` is dH-independent and `beta (.) (K dH) = BK @ dH`
+    # (`BK = beta (.) K`). `T^-T` is `H`/`dH`-independent (built from `K`/`beta`
+    # only), so `G` splits LINEARLY in `dH`:
+    #     G = T^-T dU_read + T^-T (BK @ dH) = Gr + (T^-T BK) @ dH,
+    # exactly the forward's `U = T^-1 V - (T^-1 K) H` trick transposed. The dH
+    # recurrence `dHc = Q^T dy + dH - K^T G` therefore becomes an AFFINE map
+    #     dHc = (Q^T dy - K^T Gr) + dH - K^T ((T^-T BK) @ dH)
+    #         = dHconst + dH - K^T (TinvTBK @ dH),
+    # so the transpose SOLVE is hoisted OUT of the serial pass (into the
+    # chunk-parallel B1), leaving the serial pass (B2) only small GEMMs on the
+    # `dH` chain -- the difference between a fast and a slow backward. The final
+    # per-chunk grads need the full `G`/`U` (which depend on the resolved
+    # `dH_c`), so they run in a third chunk-parallel pass (B3) AFTER the serial
+    # `dH` chain is known, seeded from the per-chunk `dHbound[c]` B2 writes --
+    # the transposed analogue of the forward readout reading `Hbound[c]`.
+    #
+    # Memory. The torch backward materialized ~4 concurrent `(B, n_heads, M, M)`
+    # global tensors (`KK`, `T_mat`, `dT`, `dKK`), the peak that overran eager at
+    # `pd1024_T64`. Here every `(M, M)` tile is per-program register/SMEM, NEVER
+    # a global batched tensor; the only extra global workspace is `TinvTBK`
+    # (K-shaped, B1->B2) plus the two cheap boundary tensors `dHconst`/`dHbound`
+    # (`num_chunks * d_k * d_v` per head) and `dH0` -- strictly leaner than the
+    # torch peak, and B3 RECOMPUTES `T`/`U`/`G` per chunk rather than persisting
+    # any sequence-sized `U`/`Gr` (the same recompute-over-persist call the
+    # forward readout makes for `U`).
+    #
+    # Every contraction is `input_precision="ieee"` with all three matmul dims
+    # >= 16 by construction (`_delta_block_sizes`); the only division is the
+    # implicit unit diagonal of the triangular substitutions -- forward
+    # substitution for `U` (mirrors the pre-pass), BACKWARD substitution for the
+    # transpose solves `T^-T (.)` (down-counting micro-step index, unit diagonal,
+    # no division), transcribed from the verified torch backward, not re-derived.
+
+    @triton.jit
+    def _delta_bwd_prepass_kernel(
+        Q_ptr,
+        K_ptr,
+        beta_ptr,
+        dy_ptr,
+        TinvTBK_ptr,
+        dHconst_ptr,
+        T,
+        nh,
+        num_chunks,
+        chunk_size,
+        d_k: tl.constexpr,
+        d_v: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_C: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        BLOCK_V: tl.constexpr,
+    ):
+        """Backward pre-pass (Kernel 7a): per (batch*head, chunk), hoist the transpose solve.
+
+        Rebuilds the chunk's unit-lower-triangular ``T`` (register, exactly the
+        forward pre-pass build) and produces the two dH-independent products the
+        serial ``dH`` pass consumes:
+
+        * ``TinvTBK = T^-T (beta (.) K)`` ``(M, d_k)`` -- the linear operator
+          the serial recurrence applies to ``dH`` (written K-shaped so B2 reads
+          it at the same chunk offset as ``K``).
+        * ``dHconst = Q^T dy - K^T Gr`` ``(d_k, d_v)`` where ``Gr = T^-T (P^T dy)``
+          is the readout half of ``G`` -- the constant term of the affine ``dH``
+          recurrence (written boundary-shaped, ``num_chunks * d_k * d_v``).
+
+        Both ``T^-T`` actions are BACKWARD substitutions (unit upper ``T^T``,
+        down-counting micro-step ``i = M-1..0``): ``x_i = rhs_i - sum_l T[l,i] x_l``,
+        unit diagonal so no division. Padded rows/cols load as zero and get an
+        identity ``T`` row/col, so they never contribute. No ``U`` and no ``H``
+        are needed here (the readout ``dU_read`` and ``BK`` are both
+        ``H``-independent), so this pass is a pure function of ``K``/``beta``/
+        ``Q``/``dy``.
+        """
+        bh = tl.program_id(0)
+        c = tl.program_id(1)
+
+        start_tok = c * chunk_size
+        rem = T - start_tok
+        C = tl.where(rem < chunk_size, rem, chunk_size)
+        M = nh * C
+        row0 = start_tok * nh
+
+        m = tl.arange(0, BLOCK_M)
+        cc = tl.arange(0, BLOCK_C)
+        kk = tl.arange(0, BLOCK_K)
+        vv = tl.arange(0, BLOCK_V)
+        row_valid = m < M
+        tok_valid = cc < C
+        kcol = kk < d_k
+        vcol = vv < d_v
+
+        K_base = bh * (T * nh * d_k) + row0 * d_k
+        beta_base = bh * (T * nh) + row0
+        Q_base = bh * (T * d_k) + start_tok * d_k
+        dy_base = bh * (T * d_v) + start_tok * d_v
+        Hb_base = bh * (num_chunks * d_k * d_v) + c * (d_k * d_v)
+
+        Ktile = tl.load(
+            K_ptr + K_base + m[:, None] * d_k + kk[None, :],
+            mask=row_valid[:, None] & kcol[None, :],
+            other=0.0,
+        ).to(tl.float32)  # (BLOCK_M, BLOCK_K)
+        beta_tile = tl.load(beta_ptr + beta_base + m, mask=row_valid, other=0.0).to(tl.float32)
+        Qtile = tl.load(
+            Q_ptr + Q_base + cc[:, None] * d_k + kk[None, :],
+            mask=tok_valid[:, None] & kcol[None, :],
+            other=0.0,
+        ).to(tl.float32)  # (BLOCK_C, BLOCK_K)
+        dyc = tl.load(
+            dy_ptr + dy_base + cc[:, None] * d_v + vv[None, :],
+            mask=tok_valid[:, None] & vcol[None, :],
+            other=0.0,
+        ).to(tl.float32)  # (BLOCK_C, BLOCK_V)
+
+        # T = I + (K K^T) (.) beta_l (.) strict-lower (same build as forward).
+        KK = tl.dot(Ktile, tl.trans(Ktile), input_precision="ieee")  # (BLOCK_M, BLOCK_M)
+        strict = (m[:, None] > m[None, :]).to(tl.float32)
+        eye = (m[:, None] == m[None, :]).to(tl.float32)
+        Tmat = eye + KK * beta_tile[None, :] * strict
+
+        # Readout half of dU: P = (Q K^T) (.) beta (.) read_mask; dU_read = P^T dy.
+        S = tl.dot(Qtile, tl.trans(Ktile), input_precision="ieee")  # (BLOCK_C, BLOCK_M)
+        tok_of_m = m // nh
+        read_mask = (
+            (tok_of_m[None, :] <= cc[:, None]) & row_valid[None, :] & tok_valid[:, None]
+        ).to(tl.float32)  # (BLOCK_C, BLOCK_M)
+        P = S * beta_tile[None, :] * read_mask
+        dU_read = tl.dot(tl.trans(P), dyc, input_precision="ieee")  # (BLOCK_M, BLOCK_V)
+
+        # BK = beta (.) K (row-scaled); pad rows already zero (beta/K masked).
+        BK = beta_tile[:, None] * Ktile  # (BLOCK_M, BLOCK_K)
+
+        # Backward substitution (unit upper T^T), down-counting i = M-1..0:
+        #   XA = T^-T BK, XG = T^-T dU_read. For real row i,
+        #   x_i = rhs_i - sum_l T[l, i] x_l (l>i already written; l<i -> T[l,i]=0;
+        #   l=i -> x_i not yet written = 0), so summing over ALL rows is exact.
+        XA = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+        XG = tl.zeros((BLOCK_M, BLOCK_V), dtype=tl.float32)
+        for step in range(M):
+            i = M - 1 - step
+            sel = m == i
+            T_col = tl.sum(tl.where(sel[None, :], Tmat, 0.0), axis=1)  # Tmat[:, i] (BLOCK_M,)
+            rhs_a = tl.sum(tl.where(sel[:, None], BK, 0.0), axis=0)  # (BLOCK_K,)
+            rhs_g = tl.sum(tl.where(sel[:, None], dU_read, 0.0), axis=0)  # (BLOCK_V,)
+            xa = rhs_a - tl.sum(T_col[:, None] * XA, axis=0)
+            xg = rhs_g - tl.sum(T_col[:, None] * XG, axis=0)
+            XA = tl.where(sel[:, None], xa[None, :], XA)
+            XG = tl.where(sel[:, None], xg[None, :], XG)
+
+        tl.store(
+            TinvTBK_ptr + K_base + m[:, None] * d_k + kk[None, :],
+            XA,
+            mask=row_valid[:, None] & kcol[None, :],
+        )
+
+        # dHconst = Q^T dy - K^T Gr, Gr = XG.
+        QtY = tl.dot(tl.trans(Qtile), dyc, input_precision="ieee")  # (BLOCK_K, BLOCK_V)
+        KtGr = tl.dot(tl.trans(Ktile), XG, input_precision="ieee")  # (BLOCK_K, BLOCK_V)
+        tl.store(
+            dHconst_ptr + Hb_base + kk[:, None] * d_v + vv[None, :],
+            QtY - KtGr,
+            mask=kcol[:, None] & vcol[None, :],
+        )
+
+    @triton.jit
+    def _delta_bwd_state_kernel(
+        K_ptr,
+        TinvTBK_ptr,
+        dHconst_ptr,
+        dHT_ptr,
+        dHbound_ptr,
+        dH0_ptr,
+        T,
+        nh,
+        num_chunks,
+        chunk_size,
+        d_k: tl.constexpr,
+        d_v: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        BLOCK_V: tl.constexpr,
+    ):
+        """Serial reverse ``dH`` pass (Kernel 7b): per (batch*head), carry ``dH`` last-to-first.
+
+        One program owns a ``(batch, head)`` lane and walks chunks
+        ``num_chunks-1 .. 0``, carrying ``dH`` (grad w.r.t. the chunk's OUTPUT
+        state, seeded from ``dH_T``). Per chunk it stores the incoming ``dH`` as
+        ``dHbound[c]`` (what the B3 grad pass needs as this chunk's output-state
+        grad) BEFORE updating, then applies the affine recurrence
+        ``dHc = dHconst_c + dH - K^T (TinvTBK_c @ dH)`` using the two B1 products
+        -- only small GEMMs, no solve (the transpose solve was hoisted to B1).
+        After the loop ``dH`` is the grad w.r.t. ``H0`` and is written to
+        ``dH0``. ``num_stages=1`` on the launch: the ``dH`` carry is a strict
+        serial dependency the pipeliner cannot overlap (exactly the forward
+        state pass). Padded rows load as zero and never contribute.
+        """
+        bh = tl.program_id(0)
+
+        m = tl.arange(0, BLOCK_M)
+        kk = tl.arange(0, BLOCK_K)
+        vv = tl.arange(0, BLOCK_V)
+        kcol = kk < d_k
+        vcol = vv < d_v
+
+        H0_base = bh * (d_k * d_v)
+        dH = tl.load(
+            dHT_ptr + H0_base + kk[:, None] * d_v + vv[None, :],
+            mask=kcol[:, None] & vcol[None, :],
+            other=0.0,
+        ).to(tl.float32)  # (BLOCK_K, BLOCK_V) -- grad w.r.t. final state
+
+        for step in range(num_chunks):
+            c = num_chunks - 1 - step
+            start_tok = c * chunk_size
+            rem = T - start_tok
+            C = tl.where(rem < chunk_size, rem, chunk_size)
+            M = nh * C
+            row0 = start_tok * nh
+            row_valid = m < M
+
+            K_base = bh * (T * nh * d_k) + row0 * d_k
+            Hb_base = bh * (num_chunks * d_k * d_v) + c * (d_k * d_v)
+
+            # dHbound[c] = incoming dH (grad w.r.t. this chunk's output state).
+            tl.store(
+                dHbound_ptr + Hb_base + kk[:, None] * d_v + vv[None, :],
+                dH,
+                mask=kcol[:, None] & vcol[None, :],
+            )
+
+            TinvTBK = tl.load(
+                TinvTBK_ptr + K_base + m[:, None] * d_k + kk[None, :],
+                mask=row_valid[:, None] & kcol[None, :],
+                other=0.0,
+            ).to(tl.float32)  # (BLOCK_M, BLOCK_K)
+            Ktile = tl.load(
+                K_ptr + K_base + m[:, None] * d_k + kk[None, :],
+                mask=row_valid[:, None] & kcol[None, :],
+                other=0.0,
+            ).to(tl.float32)  # (BLOCK_M, BLOCK_K)
+            dHconst = tl.load(
+                dHconst_ptr + Hb_base + kk[:, None] * d_v + vv[None, :],
+                mask=kcol[:, None] & vcol[None, :],
+                other=0.0,
+            ).to(tl.float32)  # (BLOCK_K, BLOCK_V)
+
+            tmp = tl.dot(TinvTBK, dH, input_precision="ieee")  # (BLOCK_M, BLOCK_V)
+            dH = dHconst + dH - tl.dot(tl.trans(Ktile), tmp, input_precision="ieee")
+
+        tl.store(
+            dH0_ptr + H0_base + kk[:, None] * d_v + vv[None, :],
+            dH,
+            mask=kcol[:, None] & vcol[None, :],
+        )
+
+    @triton.jit
+    def _delta_bwd_grad_kernel(
+        Q_ptr,
+        K_ptr,
+        V_ptr,
+        beta_ptr,
+        Hbound_ptr,
+        dHbound_ptr,
+        dy_ptr,
+        dQ_ptr,
+        dK_ptr,
+        dV_ptr,
+        dbeta_ptr,
+        T,
+        nh,
+        num_chunks,
+        chunk_size,
+        d_k: tl.constexpr,
+        d_v: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_C: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        BLOCK_V: tl.constexpr,
+    ):
+        """Chunk-parallel grad pass (Kernel 7c): per (batch*head, chunk), write dQ/dK/dV/dbeta.
+
+        Runs AFTER the serial ``dH`` chain (B2) has resolved every chunk's
+        output-state grad. One independent program per chunk reads its
+        start-of-chunk state ``Hc = Hbound[c]`` (forward-saved) and its
+        output-state grad ``dH_c = dHbound[c]`` (from B2), recomputes ``T`` and
+        the intra-chunk intermediates the torch backward built (``U`` via
+        forward substitution; the full ``G = T^-T dU`` via backward substitution
+        with ``dU = P^T dy + beta (.) (K dH_c)``), then transcribes the exact
+        torch grad accumulations:
+
+            dQ = dy Hc^T + dS K
+            dK = (beta (.) U) dH_c^T + dS^T Q - G Hc^T + dKK K + dKK^T K
+            dV = G
+            dbeta = sum_v(U (.) K dH_c) + sum_t(dP (.) S (.) mask) + sum_i(dT (.) KK (.) strict)
+
+        with ``dP = dy U^T``, ``dS = dP (.) beta (.) mask``, ``dT = -(G U^T)``,
+        ``dKK = dT (.) beta (.) strict`` -- byte-for-byte the reference torch
+        loop, just tiled. Recomputing ``T``/``U``/``G`` per chunk (rather than
+        persisting sequence-sized ``U``/``Gr`` from B1) keeps the backward
+        workspace lean, mirroring the forward readout's recompute-of-``U`` call.
+        Every ``(M, M)`` tile is per-program (never global). Padded rows/cols
+        load as zero and are dropped on store.
+        """
+        bh = tl.program_id(0)
+        c = tl.program_id(1)
+
+        start_tok = c * chunk_size
+        rem = T - start_tok
+        C = tl.where(rem < chunk_size, rem, chunk_size)
+        M = nh * C
+        row0 = start_tok * nh
+
+        m = tl.arange(0, BLOCK_M)
+        cc = tl.arange(0, BLOCK_C)
+        kk = tl.arange(0, BLOCK_K)
+        vv = tl.arange(0, BLOCK_V)
+        row_valid = m < M
+        tok_valid = cc < C
+        kcol = kk < d_k
+        vcol = vv < d_v
+
+        K_base = bh * (T * nh * d_k) + row0 * d_k
+        V_base = bh * (T * nh * d_v) + row0 * d_v
+        beta_base = bh * (T * nh) + row0
+        Q_base = bh * (T * d_k) + start_tok * d_k
+        dy_base = bh * (T * d_v) + start_tok * d_v
+        Hb_base = bh * (num_chunks * d_k * d_v) + c * (d_k * d_v)
+
+        Ktile = tl.load(
+            K_ptr + K_base + m[:, None] * d_k + kk[None, :],
+            mask=row_valid[:, None] & kcol[None, :],
+            other=0.0,
+        ).to(tl.float32)  # (BLOCK_M, BLOCK_K)
+        Vtile = tl.load(
+            V_ptr + V_base + m[:, None] * d_v + vv[None, :],
+            mask=row_valid[:, None] & vcol[None, :],
+            other=0.0,
+        ).to(tl.float32)  # (BLOCK_M, BLOCK_V)
+        beta_tile = tl.load(beta_ptr + beta_base + m, mask=row_valid, other=0.0).to(tl.float32)
+        Qtile = tl.load(
+            Q_ptr + Q_base + cc[:, None] * d_k + kk[None, :],
+            mask=tok_valid[:, None] & kcol[None, :],
+            other=0.0,
+        ).to(tl.float32)  # (BLOCK_C, BLOCK_K)
+        dyc = tl.load(
+            dy_ptr + dy_base + cc[:, None] * d_v + vv[None, :],
+            mask=tok_valid[:, None] & vcol[None, :],
+            other=0.0,
+        ).to(tl.float32)  # (BLOCK_C, BLOCK_V)
+        Hc = tl.load(
+            Hbound_ptr + Hb_base + kk[:, None] * d_v + vv[None, :],
+            mask=kcol[:, None] & vcol[None, :],
+            other=0.0,
+        ).to(tl.float32)  # (BLOCK_K, BLOCK_V) -- start-of-chunk state
+        dH_c = tl.load(
+            dHbound_ptr + Hb_base + kk[:, None] * d_v + vv[None, :],
+            mask=kcol[:, None] & vcol[None, :],
+            other=0.0,
+        ).to(tl.float32)  # (BLOCK_K, BLOCK_V) -- output-state grad from B2
+
+        # Rebuild T (register).
+        KK = tl.dot(Ktile, tl.trans(Ktile), input_precision="ieee")  # (BLOCK_M, BLOCK_M)
+        strict = (m[:, None] > m[None, :]).to(tl.float32)
+        eye = (m[:, None] == m[None, :]).to(tl.float32)
+        Tmat = eye + KK * beta_tile[None, :] * strict
+
+        # U = T^-1 (V - K Hc) by forward substitution (mirrors the pre-pass).
+        rhsU = Vtile - tl.dot(Ktile, Hc, input_precision="ieee")  # (BLOCK_M, BLOCK_V)
+        U = tl.zeros((BLOCK_M, BLOCK_V), dtype=tl.float32)
+        for i in range(M):
+            sel = m == i
+            T_row = tl.sum(tl.where(sel[:, None], Tmat, 0.0), axis=0)  # Tmat[i, :] (BLOCK_M,)
+            rhs_i = tl.sum(tl.where(sel[:, None], rhsU, 0.0), axis=0)  # (BLOCK_V,)
+            xu = rhs_i - tl.sum(T_row[:, None] * U, axis=0)
+            U = tl.where(sel[:, None], xu[None, :], U)
+
+        # Readout mask / S / P (same build as the forward readout).
+        S = tl.dot(Qtile, tl.trans(Ktile), input_precision="ieee")  # (BLOCK_C, BLOCK_M)
+        tok_of_m = m // nh
+        read_mask = (
+            (tok_of_m[None, :] <= cc[:, None]) & row_valid[None, :] & tok_valid[:, None]
+        ).to(tl.float32)  # (BLOCK_C, BLOCK_M)
+        P = S * beta_tile[None, :] * read_mask
+
+        # dU = P^T dy + beta (.) (K dH_c); dbU = K dH_c reused for dbeta.
+        dbU = tl.dot(Ktile, dH_c, input_precision="ieee")  # (BLOCK_M, BLOCK_V)
+        dU = tl.dot(tl.trans(P), dyc, input_precision="ieee") + beta_tile[:, None] * dbU
+
+        # G = T^-T dU by backward substitution (down-counting i = M-1..0).
+        G = tl.zeros((BLOCK_M, BLOCK_V), dtype=tl.float32)
+        for step in range(M):
+            i = M - 1 - step
+            sel = m == i
+            T_col = tl.sum(tl.where(sel[None, :], Tmat, 0.0), axis=1)  # Tmat[:, i] (BLOCK_M,)
+            rhs_g = tl.sum(tl.where(sel[:, None], dU, 0.0), axis=0)  # (BLOCK_V,)
+            xg = rhs_g - tl.sum(T_col[:, None] * G, axis=0)
+            G = tl.where(sel[:, None], xg[None, :], G)
+
+        # --- transcribe torch grad accumulations -----------------------------
+        dP = tl.dot(dyc, tl.trans(U), input_precision="ieee")  # (BLOCK_C, BLOCK_M)
+        dS = dP * beta_tile[None, :] * read_mask  # (BLOCK_C, BLOCK_M)
+        dT = -tl.dot(G, tl.trans(U), input_precision="ieee")  # (BLOCK_M, BLOCK_M)
+        dKK = dT * beta_tile[None, :] * strict  # (BLOCK_M, BLOCK_M)
+
+        # dbeta: state + readout(P) + T-build terms.
+        dbeta_local = (
+            tl.sum(U * dbU, axis=1)
+            + tl.sum(dP * S * read_mask, axis=0)
+            + tl.sum(dT * KK * strict, axis=0)
+        )  # (BLOCK_M,)
+
+        # dQ = dy Hc^T + dS K.
+        dQc = tl.dot(dyc, tl.trans(Hc), input_precision="ieee") + tl.dot(
+            dS, Ktile, input_precision="ieee"
+        )  # (BLOCK_C, BLOCK_K)
+
+        # dK = (beta (.) U) dH_c^T + dS^T Q - G Hc^T + dKK K + dKK^T K.
+        bU = beta_tile[:, None] * U  # (BLOCK_M, BLOCK_V)
+        dK_local = (
+            tl.dot(bU, tl.trans(dH_c), input_precision="ieee")
+            + tl.dot(tl.trans(dS), Qtile, input_precision="ieee")
+            - tl.dot(G, tl.trans(Hc), input_precision="ieee")
+            + tl.dot(dKK, Ktile, input_precision="ieee")
+            + tl.dot(tl.trans(dKK), Ktile, input_precision="ieee")
+        )  # (BLOCK_M, BLOCK_K)
+
+        # dV = G.
+        tl.store(
+            dQ_ptr + Q_base + cc[:, None] * d_k + kk[None, :],
+            dQc,
+            mask=tok_valid[:, None] & kcol[None, :],
+        )
+        tl.store(
+            dK_ptr + K_base + m[:, None] * d_k + kk[None, :],
+            dK_local,
+            mask=row_valid[:, None] & kcol[None, :],
+        )
+        tl.store(
+            dV_ptr + V_base + m[:, None] * d_v + vv[None, :],
+            G,
+            mask=row_valid[:, None] & vcol[None, :],
+        )
+        tl.store(
+            dbeta_ptr + beta_base + m,
+            dbeta_local,
+            mask=row_valid,
+        )
+
+    def _delta_backward_launch(
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        beta: torch.Tensor,
+        Hbound: torch.Tensor,
+        dy: torch.Tensor,
+        dH_T: torch.Tensor,
+        chunk_size: int,
+        needs_input_grad: tuple,
+    ) -> tuple:
+        """Fused three-kernel backward launch; returns the positional grad tuple.
+
+        Mirrors ``_delta_forward_launch``: B1 (``_delta_bwd_prepass_kernel``,
+        chunk-parallel) hoists the transpose solve into ``TinvTBK``/``dHconst``;
+        B2 (``_delta_bwd_state_kernel``, serial per ``batch*head``,
+        ``num_stages=1``) carries ``dH`` last-to-first writing ``dHbound``/``dH0``;
+        B3 (``_delta_bwd_grad_kernel``, chunk-parallel) writes
+        ``dQ``/``dK``/``dV``/``dbeta``. ``needs_input_grad`` gates the returned
+        tuple exactly like the torch fallback -- an input whose grad is not
+        needed gets ``None`` (its kernel output is still computed but dropped;
+        the wide grid makes per-input gating not worth a kernel specialization),
+        and ``chunk_size`` (non-tensor) always gets ``None``.
+        """
+        Q = Q.contiguous()
+        K = K.contiguous()
+        V = V.contiguous()
+        beta = beta.contiguous()
+        Hbound = Hbound.contiguous()
+        dy = dy.contiguous()
+        dH_T = dH_T.contiguous()
+
+        B, n_heads, T, d_k = Q.shape
+        nh = K.shape[3]
+        d_v = V.shape[4]
+        bh = B * n_heads
+        num_chunks = triton.cdiv(T, chunk_size)
+        block_m, block_c, block_k, block_v = _delta_block_sizes(nh, chunk_size, d_k, d_v)
+
+        TinvTBK = torch.empty_like(K)
+        dHconst = torch.empty(
+            B, n_heads, num_chunks, d_k, d_v, device=Q.device, dtype=torch.float32
+        )
+        dHbound = torch.empty_like(dHconst)
+        dH0 = torch.empty(B, n_heads, d_k, d_v, device=Q.device, dtype=torch.float32)
+
+        dQ = torch.zeros_like(Q)
+        dK = torch.zeros_like(K)
+        dV = torch.zeros_like(V)
+        dbeta = torch.zeros_like(beta)
+
+        _delta_bwd_prepass_kernel[(bh, num_chunks)](
+            Q,
+            K,
+            beta,
+            dy,
+            TinvTBK,
+            dHconst,
+            T,
+            nh,
+            num_chunks,
+            chunk_size,
+            d_k,
+            d_v,
+            block_m,
+            block_c,
+            block_k,
+            block_v,
+        )
+
+        # Serial reverse dH chain; num_stages=1 (strict serial dependency, same
+        # as the forward state pass -- prefetch buys nothing, only enlarges SMEM).
+        _delta_bwd_state_kernel[(bh,)](
+            K,
+            TinvTBK,
+            dHconst,
+            dH_T,
+            dHbound,
+            dH0,
+            T,
+            nh,
+            num_chunks,
+            chunk_size,
+            d_k,
+            d_v,
+            block_m,
+            block_k,
+            block_v,
+            num_stages=1,
+        )
+
+        # Chunk-parallel grads; widen warps for the wide (d_k >= 32) tiles, as
+        # the readout does. num_stages=1: the two in-kernel substitution loops
+        # carry a register accumulator with NO in-loop global load (nothing to
+        # prefetch), and this kernel's dominant dot (dKK @ K, an (M, M)x(M, d_k)
+        # operand pair) is the tightest SMEM footprint of the whole trio at the
+        # widest shape (M=128, d_k=64), so single-buffer is the safe choice --
+        # multi-buffering could only enlarge SMEM for no pipelining gain.
+        grad_warps = 8 if d_k >= 32 else 4
+        _delta_bwd_grad_kernel[(bh, num_chunks)](
+            Q,
+            K,
+            V,
+            beta,
+            Hbound,
+            dHbound,
+            dy,
+            dQ,
+            dK,
+            dV,
+            dbeta,
+            T,
+            nh,
+            num_chunks,
+            chunk_size,
+            d_k,
+            d_v,
+            block_m,
+            block_c,
+            block_k,
+            block_v,
+            num_warps=grad_warps,
+            num_stages=1,
+        )
+
+        need_Q, need_K, need_V, need_beta, need_H0, _ = needs_input_grad
+        return (
+            dQ if need_Q else None,
+            dK if need_K else None,
+            dV if need_V else None,
+            dbeta if need_beta else None,
+            dH0 if need_H0 else None,
+            None,  # chunk_size (non-tensor)
+        )
+
+    def _delta_backward_torch(
+        Q: torch.Tensor,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        beta: torch.Tensor,
+        Hbound: torch.Tensor,
+        dy: torch.Tensor,
+        dH_T: torch.Tensor,
+        chunk_size: int,
+        needs_input_grad: tuple,
+    ) -> tuple:
+        """Reference reverse-chunk backward in torch (the fused kernels' fallback).
+
+        The verified, exact-to-eager hand-derived reverse-chunk recurrence (two
+        independent reviewers + the L4 grad-parity suite). Retained as the
+        DOCUMENTED fallback path for ``_DeltaScanFn.backward``: if the fused
+        three-kernel launch raises (a resource/compile failure at launch), the
+        Function warns and runs THIS loop -- safe and exact, only slower, never
+        a silent wrong grad. It is also this file's second and last copy of the
+        chunked-WY backward math (the fused kernels transcribe from it).
+
+        Returns grads positionally for ``(Q, K, V, beta, H0, chunk_size)``;
+        ``chunk_size`` gets ``None`` and any input whose ``needs_input_grad`` is
+        ``False`` also gets ``None``.
+        """
+        need_Q, need_K, need_V, need_beta, need_H0, _ = needs_input_grad
+
+        B, n_heads, T, d_k = Q.shape
+        nh = K.shape[3]
+        d_v = V.shape[4]
+
+        def mT(x):
+            return x.transpose(-1, -2)
+
+        dH = dH_T
+
+        dQ = torch.zeros_like(Q)
+        dK = torch.zeros_like(K)
+        dV = torch.zeros_like(V)
+        dbeta = torch.zeros_like(beta)
+
+        num_chunks = Hbound.shape[2]
+        for c in range(num_chunks - 1, -1, -1):
+            start = c * chunk_size
+            end = min(start + chunk_size, T)
+            C = end - start
+            M = nh * C
+
+            Kc = K[:, :, start:end].reshape(B, n_heads, M, d_k)
+            Vc = V[:, :, start:end].reshape(B, n_heads, M, d_v)
+            betac = beta[:, :, start:end].reshape(B, n_heads, M)
+            Qc = Q[:, :, start:end]  # (B, n_heads, C, d_k)
+            Hc = Hbound[:, :, c]  # (B, n_heads, d_k, d_v) -- start-of-chunk state
+            dyc = dy[:, :, start:end]  # (B, n_heads, C, d_v)
+
+            # --- recompute intra-chunk intermediates (eager math) --------
+            KK = Kc @ mT(Kc)  # (B, n_heads, M, M)
+            strict = torch.tril(Kc.new_ones(M, M), diagonal=-1)
+            eye_M = torch.eye(M, dtype=Kc.dtype, device=Kc.device)
+            betac_col = betac.unsqueeze(-2)  # (B, n_heads, 1, M)
+            T_mat = eye_M + KK * betac_col * strict  # unit lower-triangular
+            U = torch.linalg.solve_triangular(
+                T_mat, Vc - Kc @ Hc, upper=False, unitriangular=True
+            )  # (B, n_heads, M, d_v)
+            del Vc  # only feeds U's rhs; free the M x d_v recompute copy
+            S = Qc @ mT(Kc)  # (B, n_heads, C, M)
+            read_mask = torch.tril(Qc.new_ones(C, C)).repeat_interleave(nh, dim=1)  # (C, M)
+            P = S * betac_col * read_mask  # (B, n_heads, C, M)
+
+            # --- backward through y = Q H + P U --------------------------
+            # Large intra-chunk intermediates (the batched (M, M) and
+            # (C, M) tensors: KK, T_mat, S, P, dP, dS, dT, dKK) are freed
+            # with `del` at their last use so the recompute backward's
+            # instantaneous peak stays at a couple of them at once rather
+            # than the whole set -- the spec section 7 kernel-peak <= eager
+            # -peak invariant is tightest at the widest single-chunk shape
+            # (M = nh * chunk_size = 128), where each (M, M) batched tensor
+            # is the dominant allocation. Pure memory hygiene; the math is
+            # unchanged.
+            dQc = dyc @ mT(Hc)  # (B, n_heads, C, d_k)
+            dHc = mT(Qc) @ dyc  # (B, n_heads, d_k, d_v)
+            dP = dyc @ mT(U)  # (B, n_heads, C, M)
+            dU = mT(P) @ dyc  # (B, n_heads, M, d_v)
+            del P  # last use above
+
+            # --- backward through H_out = H + K^T (beta * U) -------------
+            dK_local = (betac.unsqueeze(-1) * U) @ mT(dH)  # from K^T (beta U)
+            dbU = Kc @ dH  # (B, n_heads, M, d_v)
+            dU = dU + betac.unsqueeze(-1) * dbU
+            dbeta_local = (U * dbU).sum(-1)  # (B, n_heads, M)
+            del dbU  # last use above
+            dHc = dHc + dH  # identity term of H_out = H + ...
+
+            # --- backward through P = (Q K^T) * beta * read_mask ---------
+            dS = dP * betac_col * read_mask  # (B, n_heads, C, M)
+            dbeta_local = dbeta_local + (dP * S * read_mask).sum(-2)
+            del dP, S  # last use above (read_mask already consumed into dS)
+            dQc = dQc + dS @ Kc
+            dK_local = dK_local + mT(dS) @ Qc
+            del dS  # last use above
+
+            # --- backward through U = T^-1 (V - K H): transpose solve ----
+            G = torch.linalg.solve_triangular(
+                mT(T_mat), dU, upper=True, unitriangular=True
+            )  # T^-T dU, (B, n_heads, M, d_v)
+            del T_mat, dU  # both consumed by the transpose solve
+            dT = -(G @ mT(U))  # (B, n_heads, M, M)
+            dV_local = G  # alias -- G stays live via dV_local until the scatter
+            dK_local = dK_local - G @ mT(Hc)
+            dHc = dHc - mT(Kc) @ G
+
+            # --- backward through T = I + (K K^T) * beta * strict --------
+            dKK = dT * betac_col * strict  # (B, n_heads, M, M)
+            dbeta_local = dbeta_local + (dT * KK * strict).sum(-2)
+            del dT, KK  # last use above
+            dK_local = dK_local + dKK @ Kc + mT(dKK) @ Kc
+            del dKK  # last use above
+
+            # --- scatter chunk grads; carry dH to the previous chunk -----
+            dQ[:, :, start:end] = dQc
+            dK[:, :, start:end] = dK_local.reshape(B, n_heads, C, nh, d_k)
+            dV[:, :, start:end] = dV_local.reshape(B, n_heads, C, nh, d_v)
+            dbeta[:, :, start:end] = dbeta_local.reshape(B, n_heads, C, nh)
+            dH = dHc
+
+        return (
+            dQ if need_Q else None,
+            dK if need_K else None,
+            dV if need_V else None,
+            dbeta if need_beta else None,
+            dH if need_H0 else None,
+            None,  # chunk_size (non-tensor)
+        )
+
+    class _DeltaBackwardFallbackWarning(RuntimeWarning):
+        """Raised when ``_DeltaScanFn.backward`` falls back to the torch loop.
+
+        A distinct category (not a bare ``RuntimeWarning``) so the
+        grad-parity suite (``_run_delta_grad_parity_body``'s ``check_raw``/
+        ``check_module``) can assert, per case, that the fused Kernel 7 trio
+        actually executed -- by recording warnings under
+        ``warnings.catch_warnings(record=True)`` around the triton-path
+        backward and filtering on THIS category, not a message string.
+        Because ``_delta_backward_torch`` is numerically EXACT, a fallback
+        that fires silently would let grad parity stay green forever even if
+        the fused kernels never once executed correctly, silently defeating
+        the round's speed goal -- the whole reason the parity oracle treats
+        this warning itself as a failure signal, not informational noise.
+        """
+
+    def _delta_backward_fallback_exceptions() -> tuple[type[BaseException], ...]:
+        """Genuine Triton launch/resource/compile failure types, resolved lazily.
+
+        ``_DeltaScanFn.backward`` narrows its ``except`` clause to EXACTLY
+        this tuple -- never a bare ``except Exception`` -- so only a failure
+        that could not have executed the kernel at all falls back to the
+        exact torch loop: shared-memory/register overflow
+        (``triton.runtime.errors.OutOfResources``), a Triton compile error
+        (``triton.compiler.errors.CompilationError``), or a CUDA allocation
+        failure building a backward workspace tensor
+        (``torch.cuda.OutOfMemoryError`` -- the same scoped resource-failure
+        precedent ``scripts/bench_scans.py``'s ``_compile_backend_exceptions``
+        uses for the compile path). A bug in the launch's own Python glue
+        (wrong shape, wrong dtype, an index error, or a ``RuntimeError`` from
+        a genuine kernel correctness bug such as an illegal memory access)
+        must propagate loudly instead: the torch fallback is numerically
+        EXACT, so silently swallowing a correctness bug there would mask it
+        forever -- grad parity would stay green without the fused kernels
+        ever having run correctly, the exact failure mode the commit gate
+        flagged.
+
+        Resolved lazily and defensively at import time (Triton's exception
+        module paths have moved across versions): each candidate type is
+        added only if importable under this Triton install; an unresolvable
+        type is simply omitted (never breaks this module's import). If
+        nothing resolves beyond the always-present ``OutOfMemoryError``, the
+        catch stays scoped to that one type rather than silently widening.
+        """
+        types: list[type[BaseException]] = [torch.cuda.OutOfMemoryError]
+        try:
+            from triton.runtime.errors import OutOfResources
+
+            types.append(OutOfResources)
+        except ImportError:
+            pass
+        try:
+            from triton.compiler.errors import CompilationError
+
+            types.append(CompilationError)
+        except ImportError:
+            pass
+        return tuple(types)
+
+    _DELTA_BWD_KERNEL_EXCEPTIONS = _delta_backward_fallback_exceptions()
+
     class _DeltaScanFn(torch.autograd.Function):
         """Autograd wrapper making the three-kernel delta forward differentiable.
 
@@ -2176,13 +2977,24 @@ if _HAS_TRITON:
         ``num_chunks * d_k * d_v`` per batch-head); the intra-chunk
         intermediates (``T``, ``U``, the masks) are recomputed in the
         backward, so kernel-path peak training memory stays at or below the
-        eager path's. The backward is pure cuBLAS-shaped torch (batched GEMMs
-        + two triangular solves) -- spec section 5 permits torch ops where
-        cuBLAS-shaped and does not require a single-kernel backward; the speed
-        bar is what governs. ``@once_differentiable`` runs the backward under
-        ``no_grad`` so a second ``.backward()`` raises rather than silently
-        mis-differentiating (double-backward is unsupported, the standard
-        custom-Function limitation).
+        eager path's. The backward is a fused three-kernel Triton trio
+        (``_delta_backward_launch``) mirroring the forward trio -- a
+        chunk-parallel transpose-solve hoist, a serial ``dH`` chain, and a
+        chunk-parallel grad pass -- so the round's fwd+bwd speed bar is met
+        without a torch-op backward that serializes ~12 ops per chunk. If that
+        launch raises one of ``_DELTA_BWD_KERNEL_EXCEPTIONS`` (a genuine
+        launch/resource/compile failure -- SMEM/register overflow, a Triton
+        compile error, a CUDA allocation failure), it falls back to the
+        verified torch reverse-chunk loop (``_delta_backward_torch``) with a
+        ``_DeltaBackwardFallbackWarning``: safe and exact, only slower, never
+        a silent wrong grad. Any OTHER exception (a Python-glue bug: wrong
+        shape, wrong dtype, an index error) propagates loudly instead of
+        falling back -- the exact-fallback would otherwise mask a real
+        correctness bug forever, since grad parity would stay green without
+        the fused kernels ever having run correctly. ``@once_differentiable``
+        runs the backward under ``no_grad`` so a second ``.backward()``
+        raises rather than silently mis-differentiating (double-backward is
+        unsupported, the standard custom-Function limitation).
         """
 
         @staticmethod
@@ -2202,134 +3014,51 @@ if _HAS_TRITON:
         @staticmethod
         @torch.autograd.function.once_differentiable
         def backward(ctx, dy, dH_T):
-            """Reverse-chunk backward carrying ``dH``; recompute intra-chunk state.
+            """Fused reverse-chunk backward (Kernel 7 trio); torch loop fallback.
 
-            Walks chunks last-to-first, carrying ``dH`` = gradient w.r.t. the
-            chunk's output state (seeded from ``dH_T``). Per chunk it rebuilds
-            ``T``, ``U`` and the masks from the saved inputs and the saved
-            start-of-chunk state ``Hbound[c]`` (matching the eager
-            ``_forward_chunked`` math exactly), then applies the transpose
-            triangular solve for the backward through ``U = T^-1 (V - K H)``.
-            Returns grads positionally for ``(Q, K, V, beta, H0, chunk_size)``;
-            ``chunk_size`` (non-tensor) gets ``None``, and any input whose
-            ``needs_input_grad`` is ``False`` also gets ``None``.
+            Launches ``_delta_backward_launch`` (B1 transpose-solve hoist, B2
+            serial ``dH`` chain, B3 chunk-parallel grads) seeded from the saved
+            inputs and the saved start-of-chunk states ``Hbound``. If that
+            launch raises one of ``_DELTA_BWD_KERNEL_EXCEPTIONS`` (a genuine
+            launch/resource/compile failure -- SMEM/register overflow, a
+            Triton compile error, or a CUDA allocation failure; see
+            ``_delta_backward_fallback_exceptions``'s docstring), warns with
+            ``_DeltaBackwardFallbackWarning`` and runs the verified torch
+            reverse-chunk loop (``_delta_backward_torch``) -- safe, exact,
+            slower, never a silent wrong grad. Any OTHER exception (a bug in
+            the launch's own Python glue -- wrong shape, wrong dtype, an
+            index error) is NOT caught here and propagates loudly: catching
+            it would let the numerically-exact torch fallback mask the bug
+            forever, since grad parity would stay green without the fused
+            kernels ever having run correctly. Returns grads positionally for
+            ``(Q, K, V, beta, H0, chunk_size)``; ``chunk_size`` (non-tensor)
+            gets ``None``, and any input whose ``needs_input_grad`` is
+            ``False`` also gets ``None``.
+
+            ``dy`` / ``dH_T`` always arrive as materialized (possibly all-zero)
+            tensors here, never ``None``: forward never calls
+            ``ctx.set_materialize_grads(False)``, so an unused output still gets
+            a concrete zero grad -- see the ``register_autograd``
+            None-grad-handling note above (~line 1277) for the same
+            verified-against-torch-2.8 behavior on the sibling backwards.
             """
             Q, K, V, beta, H0, Hbound = ctx.saved_tensors
             chunk_size = ctx.chunk_size
-            need_Q, need_K, need_V, need_beta, need_H0, _ = ctx.needs_input_grad
-
-            B, n_heads, T, d_k = Q.shape
-            nh = K.shape[3]
-            d_v = V.shape[4]
-
-            def mT(x):
-                return x.transpose(-1, -2)
-
-            # dy / dH_T always arrive as materialized (possibly all-zero)
-            # tensors here, never None: forward never calls
-            # `ctx.set_materialize_grads(False)`, so an unused output still
-            # gets a concrete zero grad -- see the `register_autograd`
-            # None-grad-handling note above (~line 1277) for the same
-            # verified-against-torch-2.8 behavior on the sibling backwards.
-            dH = dH_T
-
-            dQ = torch.zeros_like(Q)
-            dK = torch.zeros_like(K)
-            dV = torch.zeros_like(V)
-            dbeta = torch.zeros_like(beta)
-
-            num_chunks = Hbound.shape[2]
-            for c in range(num_chunks - 1, -1, -1):
-                start = c * chunk_size
-                end = min(start + chunk_size, T)
-                C = end - start
-                M = nh * C
-
-                Kc = K[:, :, start:end].reshape(B, n_heads, M, d_k)
-                Vc = V[:, :, start:end].reshape(B, n_heads, M, d_v)
-                betac = beta[:, :, start:end].reshape(B, n_heads, M)
-                Qc = Q[:, :, start:end]  # (B, n_heads, C, d_k)
-                Hc = Hbound[:, :, c]  # (B, n_heads, d_k, d_v) -- start-of-chunk state
-                dyc = dy[:, :, start:end]  # (B, n_heads, C, d_v)
-
-                # --- recompute intra-chunk intermediates (eager math) --------
-                KK = Kc @ mT(Kc)  # (B, n_heads, M, M)
-                strict = torch.tril(Kc.new_ones(M, M), diagonal=-1)
-                eye_M = torch.eye(M, dtype=Kc.dtype, device=Kc.device)
-                betac_col = betac.unsqueeze(-2)  # (B, n_heads, 1, M)
-                T_mat = eye_M + KK * betac_col * strict  # unit lower-triangular
-                U = torch.linalg.solve_triangular(
-                    T_mat, Vc - Kc @ Hc, upper=False, unitriangular=True
-                )  # (B, n_heads, M, d_v)
-                del Vc  # only feeds U's rhs; free the M x d_v recompute copy
-                S = Qc @ mT(Kc)  # (B, n_heads, C, M)
-                read_mask = torch.tril(Qc.new_ones(C, C)).repeat_interleave(nh, dim=1)  # (C, M)
-                P = S * betac_col * read_mask  # (B, n_heads, C, M)
-
-                # --- backward through y = Q H + P U --------------------------
-                # Large intra-chunk intermediates (the batched (M, M) and
-                # (C, M) tensors: KK, T_mat, S, P, dP, dS, dT, dKK) are freed
-                # with `del` at their last use so the recompute backward's
-                # instantaneous peak stays at a couple of them at once rather
-                # than the whole set -- the spec section 7 kernel-peak <= eager
-                # -peak invariant is tightest at the widest single-chunk shape
-                # (M = nh * chunk_size = 128), where each (M, M) batched tensor
-                # is the dominant allocation. Pure memory hygiene; the math is
-                # unchanged.
-                dQc = dyc @ mT(Hc)  # (B, n_heads, C, d_k)
-                dHc = mT(Qc) @ dyc  # (B, n_heads, d_k, d_v)
-                dP = dyc @ mT(U)  # (B, n_heads, C, M)
-                dU = mT(P) @ dyc  # (B, n_heads, M, d_v)
-                del P  # last use above
-
-                # --- backward through H_out = H + K^T (beta * U) -------------
-                dK_local = (betac.unsqueeze(-1) * U) @ mT(dH)  # from K^T (beta U)
-                dbU = Kc @ dH  # (B, n_heads, M, d_v)
-                dU = dU + betac.unsqueeze(-1) * dbU
-                dbeta_local = (U * dbU).sum(-1)  # (B, n_heads, M)
-                del dbU  # last use above
-                dHc = dHc + dH  # identity term of H_out = H + ...
-
-                # --- backward through P = (Q K^T) * beta * read_mask ---------
-                dS = dP * betac_col * read_mask  # (B, n_heads, C, M)
-                dbeta_local = dbeta_local + (dP * S * read_mask).sum(-2)
-                del dP, S  # last use above (read_mask already consumed into dS)
-                dQc = dQc + dS @ Kc
-                dK_local = dK_local + mT(dS) @ Qc
-                del dS  # last use above
-
-                # --- backward through U = T^-1 (V - K H): transpose solve ----
-                G = torch.linalg.solve_triangular(
-                    mT(T_mat), dU, upper=True, unitriangular=True
-                )  # T^-T dU, (B, n_heads, M, d_v)
-                del T_mat, dU  # both consumed by the transpose solve
-                dT = -(G @ mT(U))  # (B, n_heads, M, M)
-                dV_local = G  # alias -- G stays live via dV_local until the scatter
-                dK_local = dK_local - G @ mT(Hc)
-                dHc = dHc - mT(Kc) @ G
-
-                # --- backward through T = I + (K K^T) * beta * strict --------
-                dKK = dT * betac_col * strict  # (B, n_heads, M, M)
-                dbeta_local = dbeta_local + (dT * KK * strict).sum(-2)
-                del dT, KK  # last use above
-                dK_local = dK_local + dKK @ Kc + mT(dKK) @ Kc
-                del dKK  # last use above
-
-                # --- scatter chunk grads; carry dH to the previous chunk -----
-                dQ[:, :, start:end] = dQc
-                dK[:, :, start:end] = dK_local.reshape(B, n_heads, C, nh, d_k)
-                dV[:, :, start:end] = dV_local.reshape(B, n_heads, C, nh, d_v)
-                dbeta[:, :, start:end] = dbeta_local.reshape(B, n_heads, C, nh)
-                dH = dHc
-
-            return (
-                dQ if need_Q else None,
-                dK if need_K else None,
-                dV if need_V else None,
-                dbeta if need_beta else None,
-                dH if need_H0 else None,
-                None,  # chunk_size (non-tensor)
-            )
+            try:
+                return _delta_backward_launch(
+                    Q, K, V, beta, Hbound, dy, dH_T, chunk_size, ctx.needs_input_grad
+                )
+            except _DELTA_BWD_KERNEL_EXCEPTIONS as exc:  # launch/resource/compile failure only
+                warnings.warn(
+                    "DeltaMinGRU fused backward launch failed "
+                    f"({type(exc).__name__}: {exc}); falling back to the exact "
+                    "torch reverse-chunk loop (correct, slower).",
+                    _DeltaBackwardFallbackWarning,
+                    stacklevel=2,
+                )
+                return _delta_backward_torch(
+                    Q, K, V, beta, Hbound, dy, dH_T, chunk_size, ctx.needs_input_grad
+                )
 
     def delta_scan_impl(
         Q: torch.Tensor,
@@ -3547,7 +4276,15 @@ def _run_delta_grad_parity(collect: list[dict] | None = None) -> int:
 
 
 def _run_delta_grad_parity_body(collect: list[dict] | None = None) -> int:
-    """The DeltaMinGRU gradient-parity sweep; see ``_run_delta_grad_parity``."""
+    """The DeltaMinGRU gradient-parity sweep; see ``_run_delta_grad_parity``.
+
+    Both ``check_raw`` and ``check_module`` run their triton-path backward
+    under ``warnings.catch_warnings(record=True)`` and fail the case if a
+    ``_DeltaBackwardFallbackWarning`` fired -- i.e. this suite proves the
+    fused Kernel 7 backward trio actually EXECUTED, not merely that the
+    (numerically exact) torch fallback would have produced the right grads
+    if the fused kernels had silently never run.
+    """
     from mingru import min_gru
 
     device = "cuda"
@@ -3612,7 +4349,21 @@ def _run_delta_grad_parity_body(collect: list[dict] | None = None) -> int:
         cot_y = torch.randn_like(y_e)
         cot_H = torch.randn_like(HT_e)
         loss_t = (cot_y * y_t).sum() + (cot_H * HT_t).sum()
-        loss_t.backward()
+        # Record warnings raised during the triton-path backward specifically,
+        # so a fused-kernel-launch fallback (`_DeltaBackwardFallbackWarning`)
+        # is caught HERE as a parity failure -- not merely inferred from
+        # coincidentally-correct grads. `_delta_backward_torch` is
+        # numerically exact, so a silent fallback would let this suite stay
+        # green forever without the fused Kernel 7 trio ever having executed,
+        # defeating the round's speed goal.
+        with warnings.catch_warnings(record=True) as caught_t:
+            warnings.simplefilter("always")
+            loss_t.backward()
+        fallback_msgs = [
+            str(w.message)
+            for w in caught_t
+            if issubclass(w.category, _DeltaBackwardFallbackWarning)
+        ]
         loss_e = (cot_y * y_e).sum() + (cot_H * HT_e).sum()
         loss_e.backward()
         loss_e64 = (cot_y.double() * y_e64).sum() + (cot_H.double() * HT_e64).sum()
@@ -3638,6 +4389,10 @@ def _run_delta_grad_parity_body(collect: list[dict] | None = None) -> int:
             own_dev = max(own_dev, oa)
 
         gate = _delta_gate(own_dev, _DELTA_GATE_FLOOR_GRAD)
+        if fallback_msgs:
+            ok = False
+            failures.append(f"{label}: fused backward did not engage: {fallback_msgs[0]}")
+            print(f"  [FAIL] {label}: fused backward did not engage: {fallback_msgs[0]}")
         ok = ok and max_err <= gate
         if ok:
             n_pass += 1
@@ -3736,7 +4491,19 @@ def _run_delta_grad_parity_body(collect: list[dict] | None = None) -> int:
                     )
                 )
             return
-        (cot * out_t).sum().backward()
+        # Same discriminating-fallback rationale as check_raw above: record
+        # warnings around the triton-path backward and treat
+        # `_DeltaBackwardFallbackWarning` as a parity failure, not just
+        # informational noise -- otherwise a silently-falling-back fused
+        # backward would leave this end-to-end module case green forever.
+        with warnings.catch_warnings(record=True) as caught_t:
+            warnings.simplefilter("always")
+            (cot * out_t).sum().backward()
+        fallback_msgs = [
+            str(w.message)
+            for w in caught_t
+            if issubclass(w.category, _DeltaBackwardFallbackWarning)
+        ]
         grads_t = {nm: p.grad.detach().clone() for nm, p in mixer.named_parameters()}
         os.environ["MINGRU_SCAN"] = "eager"
 
@@ -3762,6 +4529,11 @@ def _run_delta_grad_parity_body(collect: list[dict] | None = None) -> int:
             grad_own = max(grad_own, oa)
         grad_gate = _delta_gate(grad_own, _DELTA_GATE_FLOOR_GRAD)
         grad_ok = grad_ok and grad_abs <= grad_gate
+
+        if fallback_msgs:
+            grad_ok = False
+            failures.append(f"{name}: fused backward did not engage: {fallback_msgs[0]}")
+            print(f"  [FAIL] {name}: fused backward did not engage: {fallback_msgs[0]}")
 
         ok = out_ok and grad_ok
         if ok:
