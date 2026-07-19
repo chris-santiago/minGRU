@@ -470,6 +470,141 @@ except ImportError as _exc:  # pragma: no cover - exercised only off-GPU
     _TRITON_IMPORT_ERROR = _exc
 
 
+def _delta_backward_torch(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    beta: torch.Tensor,
+    Hbound: torch.Tensor,
+    dy: torch.Tensor,
+    dH_T: torch.Tensor,
+    chunk_size: int,
+    needs_input_grad: tuple,
+) -> tuple:
+    """Reverse-chunk backward in torch: the one and only DeltaMinGRU backward.
+
+    The verified, exact-to-eager hand-derived reverse-chunk recurrence (two
+    independent reviewers + the L4 grad-parity suite). Called DIRECTLY by
+    ``_DeltaScanFn.backward`` -- safe and exact. A fully fused Triton
+    backward trio was built and validated but measured 8-12x slower than
+    ``torch.compile`` on an L4 and was reverted (see the module docstring's
+    "do not rebuild blind" note); this loop is now the sole backward path,
+    not a fallback.
+
+    Returns grads positionally for ``(Q, K, V, beta, H0, chunk_size)``;
+    ``chunk_size`` gets ``None`` and any input whose ``needs_input_grad`` is
+    ``False`` also gets ``None``.
+    """
+    need_Q, need_K, need_V, need_beta, need_H0, _ = needs_input_grad
+
+    B, n_heads, T, d_k = Q.shape
+    nh = K.shape[3]
+    d_v = V.shape[4]
+
+    def mT(x):
+        return x.transpose(-1, -2)
+
+    dH = dH_T
+
+    dQ = torch.zeros_like(Q)
+    dK = torch.zeros_like(K)
+    dV = torch.zeros_like(V)
+    dbeta = torch.zeros_like(beta)
+
+    num_chunks = Hbound.shape[2]
+    for c in range(num_chunks - 1, -1, -1):
+        start = c * chunk_size
+        end = min(start + chunk_size, T)
+        C = end - start
+        M = nh * C
+
+        Kc = K[:, :, start:end].reshape(B, n_heads, M, d_k)
+        Vc = V[:, :, start:end].reshape(B, n_heads, M, d_v)
+        betac = beta[:, :, start:end].reshape(B, n_heads, M)
+        Qc = Q[:, :, start:end]  # (B, n_heads, C, d_k)
+        Hc = Hbound[:, :, c]  # (B, n_heads, d_k, d_v) -- start-of-chunk state
+        dyc = dy[:, :, start:end]  # (B, n_heads, C, d_v)
+
+        # --- recompute intra-chunk intermediates (eager math) --------
+        KK = Kc @ mT(Kc)  # (B, n_heads, M, M)
+        strict = torch.tril(Kc.new_ones(M, M), diagonal=-1)
+        eye_M = torch.eye(M, dtype=Kc.dtype, device=Kc.device)
+        betac_col = betac.unsqueeze(-2)  # (B, n_heads, 1, M)
+        T_mat = eye_M + KK * betac_col * strict  # unit lower-triangular
+        U = torch.linalg.solve_triangular(
+            T_mat, Vc - Kc @ Hc, upper=False, unitriangular=True
+        )  # (B, n_heads, M, d_v)
+        del Vc  # only feeds U's rhs; free the M x d_v recompute copy
+        S = Qc @ mT(Kc)  # (B, n_heads, C, M)
+        read_mask = torch.tril(Qc.new_ones(C, C)).repeat_interleave(nh, dim=1)  # (C, M)
+        P = S * betac_col * read_mask  # (B, n_heads, C, M)
+
+        # --- backward through y = Q H + P U --------------------------
+        # Large intra-chunk intermediates (the batched (M, M) and
+        # (C, M) tensors: KK, T_mat, S, P, dP, dS, dT, dKK) are freed
+        # with `del` at their last use so the recompute backward's
+        # instantaneous peak stays at a couple of them at once rather
+        # than the whole set -- the spec section 7 kernel-peak <= eager
+        # -peak invariant is tightest at the widest single-chunk shape
+        # (M = nh * chunk_size = 128), where each (M, M) batched tensor
+        # is the dominant allocation. Pure memory hygiene; the math is
+        # unchanged.
+        dQc = dyc @ mT(Hc)  # (B, n_heads, C, d_k)
+        dHc = mT(Qc) @ dyc  # (B, n_heads, d_k, d_v)
+        dP = dyc @ mT(U)  # (B, n_heads, C, M)
+        dU = mT(P) @ dyc  # (B, n_heads, M, d_v)
+        del P  # last use above
+
+        # --- backward through H_out = H + K^T (beta * U) -------------
+        dK_local = (betac.unsqueeze(-1) * U) @ mT(dH)  # from K^T (beta U)
+        dbU = Kc @ dH  # (B, n_heads, M, d_v)
+        dU = dU + betac.unsqueeze(-1) * dbU
+        dbeta_local = (U * dbU).sum(-1)  # (B, n_heads, M)
+        del dbU  # last use above
+        dHc = dHc + dH  # identity term of H_out = H + ...
+
+        # --- backward through P = (Q K^T) * beta * read_mask ---------
+        dS = dP * betac_col * read_mask  # (B, n_heads, C, M)
+        dbeta_local = dbeta_local + (dP * S * read_mask).sum(-2)
+        del dP, S  # last use above (read_mask already consumed into dS)
+        dQc = dQc + dS @ Kc
+        dK_local = dK_local + mT(dS) @ Qc
+        del dS  # last use above
+
+        # --- backward through U = T^-1 (V - K H): transpose solve ----
+        G = torch.linalg.solve_triangular(
+            mT(T_mat), dU, upper=True, unitriangular=True
+        )  # T^-T dU, (B, n_heads, M, d_v)
+        del T_mat, dU  # both consumed by the transpose solve
+        dT = -(G @ mT(U))  # (B, n_heads, M, M)
+        dV_local = G  # alias -- G stays live via dV_local until the scatter
+        dK_local = dK_local - G @ mT(Hc)
+        dHc = dHc - mT(Kc) @ G
+
+        # --- backward through T = I + (K K^T) * beta * strict --------
+        dKK = dT * betac_col * strict  # (B, n_heads, M, M)
+        dbeta_local = dbeta_local + (dT * KK * strict).sum(-2)
+        del dT, KK  # last use above
+        dK_local = dK_local + dKK @ Kc + mT(dKK) @ Kc
+        del dKK  # last use above
+
+        # --- scatter chunk grads; carry dH to the previous chunk -----
+        dQ[:, :, start:end] = dQc
+        dK[:, :, start:end] = dK_local.reshape(B, n_heads, C, nh, d_k)
+        dV[:, :, start:end] = dV_local.reshape(B, n_heads, C, nh, d_v)
+        dbeta[:, :, start:end] = dbeta_local.reshape(B, n_heads, C, nh)
+        dH = dHc
+
+    return (
+        dQ if need_Q else None,
+        dK if need_K else None,
+        dV if need_V else None,
+        dbeta if need_beta else None,
+        dH if need_H0 else None,
+        None,  # chunk_size (non-tensor)
+    )
+
+
 if _HAS_TRITON:
     from torch.library import register_autograd, triton_op, wrap_triton
 
@@ -2185,140 +2320,6 @@ if _HAS_TRITON:
             num_warps=readout_warps,
         )
         return y, H_T, Hbound
-
-    def _delta_backward_torch(
-        Q: torch.Tensor,
-        K: torch.Tensor,
-        V: torch.Tensor,
-        beta: torch.Tensor,
-        Hbound: torch.Tensor,
-        dy: torch.Tensor,
-        dH_T: torch.Tensor,
-        chunk_size: int,
-        needs_input_grad: tuple,
-    ) -> tuple:
-        """Reverse-chunk backward in torch: the one and only DeltaMinGRU backward.
-
-        The verified, exact-to-eager hand-derived reverse-chunk recurrence (two
-        independent reviewers + the L4 grad-parity suite). Called DIRECTLY by
-        ``_DeltaScanFn.backward`` -- safe and exact. A fully fused Triton
-        backward trio was built and validated but measured 8-12x slower than
-        ``torch.compile`` on an L4 and was reverted (see the module docstring's
-        "do not rebuild blind" note); this loop is now the sole backward path,
-        not a fallback.
-
-        Returns grads positionally for ``(Q, K, V, beta, H0, chunk_size)``;
-        ``chunk_size`` gets ``None`` and any input whose ``needs_input_grad`` is
-        ``False`` also gets ``None``.
-        """
-        need_Q, need_K, need_V, need_beta, need_H0, _ = needs_input_grad
-
-        B, n_heads, T, d_k = Q.shape
-        nh = K.shape[3]
-        d_v = V.shape[4]
-
-        def mT(x):
-            return x.transpose(-1, -2)
-
-        dH = dH_T
-
-        dQ = torch.zeros_like(Q)
-        dK = torch.zeros_like(K)
-        dV = torch.zeros_like(V)
-        dbeta = torch.zeros_like(beta)
-
-        num_chunks = Hbound.shape[2]
-        for c in range(num_chunks - 1, -1, -1):
-            start = c * chunk_size
-            end = min(start + chunk_size, T)
-            C = end - start
-            M = nh * C
-
-            Kc = K[:, :, start:end].reshape(B, n_heads, M, d_k)
-            Vc = V[:, :, start:end].reshape(B, n_heads, M, d_v)
-            betac = beta[:, :, start:end].reshape(B, n_heads, M)
-            Qc = Q[:, :, start:end]  # (B, n_heads, C, d_k)
-            Hc = Hbound[:, :, c]  # (B, n_heads, d_k, d_v) -- start-of-chunk state
-            dyc = dy[:, :, start:end]  # (B, n_heads, C, d_v)
-
-            # --- recompute intra-chunk intermediates (eager math) --------
-            KK = Kc @ mT(Kc)  # (B, n_heads, M, M)
-            strict = torch.tril(Kc.new_ones(M, M), diagonal=-1)
-            eye_M = torch.eye(M, dtype=Kc.dtype, device=Kc.device)
-            betac_col = betac.unsqueeze(-2)  # (B, n_heads, 1, M)
-            T_mat = eye_M + KK * betac_col * strict  # unit lower-triangular
-            U = torch.linalg.solve_triangular(
-                T_mat, Vc - Kc @ Hc, upper=False, unitriangular=True
-            )  # (B, n_heads, M, d_v)
-            del Vc  # only feeds U's rhs; free the M x d_v recompute copy
-            S = Qc @ mT(Kc)  # (B, n_heads, C, M)
-            read_mask = torch.tril(Qc.new_ones(C, C)).repeat_interleave(nh, dim=1)  # (C, M)
-            P = S * betac_col * read_mask  # (B, n_heads, C, M)
-
-            # --- backward through y = Q H + P U --------------------------
-            # Large intra-chunk intermediates (the batched (M, M) and
-            # (C, M) tensors: KK, T_mat, S, P, dP, dS, dT, dKK) are freed
-            # with `del` at their last use so the recompute backward's
-            # instantaneous peak stays at a couple of them at once rather
-            # than the whole set -- the spec section 7 kernel-peak <= eager
-            # -peak invariant is tightest at the widest single-chunk shape
-            # (M = nh * chunk_size = 128), where each (M, M) batched tensor
-            # is the dominant allocation. Pure memory hygiene; the math is
-            # unchanged.
-            dQc = dyc @ mT(Hc)  # (B, n_heads, C, d_k)
-            dHc = mT(Qc) @ dyc  # (B, n_heads, d_k, d_v)
-            dP = dyc @ mT(U)  # (B, n_heads, C, M)
-            dU = mT(P) @ dyc  # (B, n_heads, M, d_v)
-            del P  # last use above
-
-            # --- backward through H_out = H + K^T (beta * U) -------------
-            dK_local = (betac.unsqueeze(-1) * U) @ mT(dH)  # from K^T (beta U)
-            dbU = Kc @ dH  # (B, n_heads, M, d_v)
-            dU = dU + betac.unsqueeze(-1) * dbU
-            dbeta_local = (U * dbU).sum(-1)  # (B, n_heads, M)
-            del dbU  # last use above
-            dHc = dHc + dH  # identity term of H_out = H + ...
-
-            # --- backward through P = (Q K^T) * beta * read_mask ---------
-            dS = dP * betac_col * read_mask  # (B, n_heads, C, M)
-            dbeta_local = dbeta_local + (dP * S * read_mask).sum(-2)
-            del dP, S  # last use above (read_mask already consumed into dS)
-            dQc = dQc + dS @ Kc
-            dK_local = dK_local + mT(dS) @ Qc
-            del dS  # last use above
-
-            # --- backward through U = T^-1 (V - K H): transpose solve ----
-            G = torch.linalg.solve_triangular(
-                mT(T_mat), dU, upper=True, unitriangular=True
-            )  # T^-T dU, (B, n_heads, M, d_v)
-            del T_mat, dU  # both consumed by the transpose solve
-            dT = -(G @ mT(U))  # (B, n_heads, M, M)
-            dV_local = G  # alias -- G stays live via dV_local until the scatter
-            dK_local = dK_local - G @ mT(Hc)
-            dHc = dHc - mT(Kc) @ G
-
-            # --- backward through T = I + (K K^T) * beta * strict --------
-            dKK = dT * betac_col * strict  # (B, n_heads, M, M)
-            dbeta_local = dbeta_local + (dT * KK * strict).sum(-2)
-            del dT, KK  # last use above
-            dK_local = dK_local + dKK @ Kc + mT(dKK) @ Kc
-            del dKK  # last use above
-
-            # --- scatter chunk grads; carry dH to the previous chunk -----
-            dQ[:, :, start:end] = dQc
-            dK[:, :, start:end] = dK_local.reshape(B, n_heads, C, nh, d_k)
-            dV[:, :, start:end] = dV_local.reshape(B, n_heads, C, nh, d_v)
-            dbeta[:, :, start:end] = dbeta_local.reshape(B, n_heads, C, nh)
-            dH = dHc
-
-        return (
-            dQ if need_Q else None,
-            dK if need_K else None,
-            dV if need_V else None,
-            dbeta if need_beta else None,
-            dH if need_H0 else None,
-            None,  # chunk_size (non-tensor)
-        )
 
     class _DeltaScanFn(torch.autograd.Function):
         """Autograd wrapper making the three-kernel delta forward differentiable.

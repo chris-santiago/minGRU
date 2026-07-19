@@ -1,5 +1,16 @@
 """One-shot L4 diagnostic: per-forward-kernel SMEM for the delta path, per class.
 
+Standalone diagnostic script, not a ``scripts/gpu_check.py --job`` mode: it
+has no CLI/argparse surface of its own and is invoked directly via an in-job
+command (see ``experiments/index.md``'s "in-job" tag and the run instructions
+below), not dispatched through ``gpu_check.py``'s job-mode table. Its primary
+historical role was the fused-backward SMEM-fitting campaign (six tuning
+iterations reaching full envelope engagement under the shared-memory limit,
+but ultimately reverted for speed — see ``experiments/EXPERIMENTS.md`` round
+``gpu-delta-kernel-01``); it is retained here as a forward-kernel SMEM
+instrument, since the shipping backward is the torch-composed reverse-chunk
+loop and no longer has a fused-kernel SMEM budget to measure.
+
 Ground-truth instrument for the delta forward-trio SMEM budget. Three
 successive analytic shared-memory models each missed an envelope class (the
 compiler's operand staging is not reliably predictable from first principles),

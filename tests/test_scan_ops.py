@@ -21,6 +21,10 @@ Sections
 6. Delta parity harness y-layout regression guard -- CPU-only pin for
    ``_run_delta_forward_parity_body``/``_run_delta_grad_parity_body``'s
    ``delta_scan_impl``-vs-eager ``y`` axis-order restore
+7. Delta backward-torch vs eager-autograd fp64 semantic guard -- runs on any
+   CPU, with or without the ``triton`` package, pinning
+   ``triton_scans._delta_backward_torch``'s hand-derived gradients against
+   ``torch.autograd.grad`` through the eager oracle
 """
 
 from __future__ import annotations
@@ -411,3 +415,118 @@ class TestDeltaParityHarnessYLayout:
         y_t = y_fake_kernel.permute(0, 2, 1, 3)
         assert y_t.shape == y_e.shape
         assert torch.equal(y_t, y_e)
+
+
+# ===========================================================================
+# 7. Delta backward-torch vs eager-autograd fp64 semantic guard
+# ===========================================================================
+#
+# ``triton_scans._delta_backward_torch`` is the hand-derived reverse-chunk
+# gradient recurrence that ``_DeltaScanFn.backward`` calls directly (no
+# dispatcher, no fallback -- see that class's docstring); it is a plain torch
+# function with no Triton launch inside it, defined at module level in
+# ``triton_scans.py`` (outside the ``if _HAS_TRITON:`` guard, unlike the
+# kernel-touching ``_DeltaScanFn``/``delta_scan_impl``), so it is always
+# importable and runnable on CPU -- no GPU, and not even the ``triton``
+# package itself, is required. This suite pins its math against
+# ``torch.autograd.grad`` through the certified eager oracle
+# ``DeltaMinGRU._forward_chunked`` (via the ``_delta_ref_forward`` shim),
+# both in fp64, so a future hand-edit to either hand-maintained copy of the
+# chunked-WY backward -- this file's reverse-chunk loop, or the shim's
+# forward (which autograd differentiates through) -- that silently drifts
+# the chunk convention between the two is caught unconditionally, on every
+# CPU-only contributor's machine, without needing an L4 to run the real
+# grad-parity sweep (``_run_delta_grad_parity``, GPU-only, requires the
+# Triton kernel forward for its ``Hbound``).
+
+
+def _delta_chunk_boundary_states(
+    Q: torch.Tensor,
+    K: torch.Tensor,
+    V: torch.Tensor,
+    beta: torch.Tensor,
+    H0: torch.Tensor,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Per-chunk start-of-chunk states, matching ``_delta_forward_launch``'s
+    ``Hbound`` convention (entry ``c`` is the state BEFORE chunk ``c`` is
+    applied).
+
+    Built by driving the certified ``_delta_ref_forward`` oracle one chunk at
+    a time -- each call's own ``chunk_size`` equals that chunk's length, so
+    its internal loop runs exactly one iteration over that slice -- reusing
+    the oracle's own math instead of re-deriving the chunked-WY state update
+    a third time in this file (see ``_delta_ref_forward``'s
+    ``DUPLICATION-PENDING`` note about the two copies that already exist).
+    """
+    T = Q.shape[2]
+    H = H0
+    bounds = []
+    for start in range(0, T, chunk_size):
+        end = min(start + chunk_size, T)
+        bounds.append(H)
+        _, H = triton_scans._delta_ref_forward(
+            Q[:, :, start:end],
+            K[:, :, start:end],
+            V[:, :, start:end],
+            beta[:, :, start:end],
+            H,
+            end - start,
+        )
+    return torch.stack(bounds, dim=2)
+
+
+class TestDeltaBackwardTorchVsEagerAutograd:
+    """fp64 CPU pin: ``_delta_backward_torch``'s grads vs ``torch.autograd.grad``
+    through ``_delta_ref_forward``, on small multi-chunk ragged-``T``, ``nh``,
+    ``d_k`` shapes with nonzero ``H0``."""
+
+    B, N_HEADS, CHUNK_SIZE = 2, 2, 4
+
+    @pytest.mark.parametrize("nh", [1, 2])
+    @pytest.mark.parametrize("d_k", [4, 16])
+    def test_grads_match_to_fp64_precision(self, nh, d_k):
+        torch.manual_seed(SEED)
+        device = "cpu"
+        # Two full chunks plus a ragged tail (CHUNK_SIZE=4 -> chunks of
+        # length 4, 4, 2).
+        T = 2 * self.CHUNK_SIZE + self.CHUNK_SIZE // 2
+
+        Q, K, V, beta, H0 = (
+            t.double()
+            for t in triton_scans._delta_inputs(self.B, self.N_HEADS, T, nh, d_k, d_k, device)
+        )
+
+        Hbound = _delta_chunk_boundary_states(Q, K, V, beta, H0, self.CHUNK_SIZE)
+
+        Q_g, K_g, V_g, beta_g, H0_g = (t.clone().requires_grad_(True) for t in (Q, K, V, beta, H0))
+        y_e, HT_e = triton_scans._delta_ref_forward(Q_g, K_g, V_g, beta_g, H0_g, self.CHUNK_SIZE)
+
+        torch.manual_seed(SEED + 1)
+        cot_y_eager = torch.randn_like(y_e)  # eager's own (B, T, n_heads, d_v) layout
+        cot_H = torch.randn_like(HT_e)
+
+        ref_grads = torch.autograd.grad(
+            (y_e, HT_e),
+            (Q_g, K_g, V_g, beta_g, H0_g),
+            grad_outputs=(cot_y_eager, cot_H),
+        )
+
+        # `_delta_backward_torch`'s `dy` is the kernel's (B, n_heads, T, d_v)
+        # layout (matches Q's own axis order), not eager's (B, T, n_heads,
+        # d_v) -- the same restore Section 6 above pins at the `y` seam.
+        cot_y_kernel = cot_y_eager.permute(0, 2, 1, 3).contiguous()
+
+        needs_input_grad = (True, True, True, True, True, False)
+        dQ, dK, dV, dbeta, dH0, dchunk = triton_scans._delta_backward_torch(
+            Q, K, V, beta, Hbound, cot_y_kernel, cot_H, self.CHUNK_SIZE, needs_input_grad
+        )
+        assert dchunk is None
+
+        names = ("dQ", "dK", "dV", "dbeta", "dH0")
+        got_grads = (dQ, dK, dV, dbeta, dH0)
+        for name, got, want in zip(names, got_grads, ref_grads, strict=True):
+            assert got is not None, f"{name} unexpectedly None"
+            torch.testing.assert_close(
+                got, want, atol=1e-12, rtol=1e-12, msg=f"{name} mismatch vs eager autograd"
+            )

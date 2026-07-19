@@ -120,15 +120,19 @@ _warned_delta_fallback = False
 # Basis (stated here directly; measured on an NVIDIA L4, fwd+bwd medians,
 # B=128, on this file's shipping configuration -- Triton forward trio +
 # torch-composed backward): the kernel beat eager only at long sequences with
-# narrow head dims (triton/eager 0.61 at T=1024/d_k=16), was >= 1.04x eager on
+# narrow head dims (triton/eager 0.61 at T=1024/d_k=16), was >= 1.02x eager on
 # every other probed shape, and exceeded eager's peak memory at the T=64
-# shape. A follow-up experiment that fused the backward into Triton kernels
-# measured 8-12x slower than torch.compile on the same grid (shared-memory
-# tiling destroyed dot efficiency on the 101 KB part) and is reverted in this
-# same change. The per-shape probe artifact
-# (experiments/bench/gpu_delta_probe.{json,md}) is regenerated on this
-# configuration as part of the round's close; until then it holds the interim
-# fused-backward measurements. So `auto` engages the kernel
+# shape. That win is measured at a single cell (d_k=16, long T); the region
+# below generalizes it to `d_k` in {4, 8} at long T too (smaller tiles, same
+# structure) -- those cells are an extrapolation, not separately measured. A
+# follow-up experiment that fused the backward into Triton kernels measured
+# 8-12x slower than torch.compile on the same grid (shared-memory tiling
+# destroyed dot efficiency on the 101 KB part) and is reverted in this same
+# change. The per-shape probe artifact (experiments/bench/gpu_delta_probe.
+# {json,md}) was regenerated (2026-07-19T11:31:55Z) on this shipping
+# configuration and now holds those measurements; the interim fused-backward
+# numbers it previously held are preserved separately at
+# experiments/bench/gpu_delta_probe_fused_l4.md. So `auto` engages the kernel
 # ONLY when the sequence spans at least `_DELTA_AUTO_MIN_T_CHUNKS` chunks AND
 # the head dim `d_k` is at most `_DELTA_AUTO_MAX_DK`; every other in-envelope
 # shape stays eager under `auto` (silently -- that is the designed default, not
