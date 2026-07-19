@@ -42,6 +42,7 @@ Project rules for Claude sessions. These extend `~/.claude/CLAUDE.md`; project-s
 
 - `scripts/gpu_check.py` has pre-existing ruff-format drift; `scripts/bench_scans.py` has project-excluded lint findings. Both recorded; leave unless the task is specifically their cleanup.
 - `_scan_env` is deliberately triplicated (triton_scans.py, gpu_hetero_campaign.py, gpu_delta_probe.py) — hoist only if a fourth site appears.
+- The guarded-JSONL-read parse is deliberately duplicated across 4 sites with 3 distinct contracts: `gpu_check.py` `_existing_keys_by_key` and `report_benchmarks.py` `_load_all_rows` (full guard: skip blanks + try/except json.loads); `benchmark_lab.py` `_row_exists` and `run_matched_state.py` `_load_rows_by_round` (blank-line-skip only, malformed raises). Hoist deferred by owner decision.
 - 3 `tests/test_packaging.py` failures under the 2.5.1 evidence pin are expected (triton-lazy-import tests assume torch ≥ 2.8); the suite is green under the default env.
 
 ## Release
