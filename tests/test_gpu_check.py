@@ -26,15 +26,36 @@ points.
 
 The ``hetero36`` tests (Task 3, plus two quality-review fix cycles) cover
 the GPU 36-seed round's submitter path: ``_extract_all`` (the ALL-rows
-sibling of ``_extract_last``), ``_existing_round_seed_pairs``/
-``_append_new_rows`` (shape-guarded dedup + idempotent append against a
-ledger, including intra-batch last-N-wins resolution with full
+sibling of ``_extract_last``), ``_existing_keys_by_key``/``_append_new_rows``
+(shape-guarded dedup + idempotent append against a ledger, including
+intra-batch last-N-wins resolution with full
 appended/skipped_duplicate/skipped_invalid/deduped_in_batch count
-reconciliation), and ``_finish_hetero36`` end-to-end. All ledger and
+reconciliation), and ``_finish_hetero36`` end-to-end. ``_existing_keys_by_key``
+and ``_dedup_batch_last_wins_by_key`` are the generic key-parameterized core
+shared with the benchmarks job mode's dedup path (Task 6) -- the
+hetero36-specific ``_existing_round_seed_pairs``/``_dedup_batch_last_wins``
+wrappers were removed as dead code once ``_append_new_rows`` started calling
+``_append_rows_by_key`` directly (see ``_hetero36_key``). All ledger and
 sidecar I/O in these tests targets ``tmp_path`` fixtures via
 ``monkeypatch`` on the module's ``_LEDGER_PATH``/``_HETERO36_SIDECAR``
 constants -- the real ``experiments/lab_results.jsonl`` and
 ``experiments/bench/gpu36_env.json`` are never touched.
+
+The ``benchmarks`` tests (Task 6) cover the accepted-benchmark validation
+round's submitter path: ``_valid_benchmarks_key`` (the four-field
+``(round, task, variant, seed)`` sibling of ``_valid_hetero36_key`` --
+``variant`` is load-bearing here since a task's five arms share one round
+tag), ``_append_benchmarks_rows`` (same shape-guarded dedup contract as
+``_append_new_rows``, now over the four-field key -- pinning that two arms
+at the same seed are NOT deduped against each other), ``_build_benchmarks_
+sidecar`` (``per_variant_seed_wall_secs`` keyed ``{variant: {seed: secs}}``,
+not ``{round: {seed: secs}}``), and ``_finish_benchmarks`` end-to-end
+(multi-task logs split into one sidecar per task, a row with no
+attributable ``task`` field warned about and dropped). All ledger/sidecar
+I/O targets ``tmp_path`` fixtures via ``monkeypatch`` on the module's
+``_LEDGER_PATH``/``_DELTA_PROBE_OUT_DIR`` constants -- the real
+``experiments/lab_results.jsonl`` and ``experiments/bench/bench_*_env.json``
+files are never touched.
 """
 
 from __future__ import annotations
@@ -187,12 +208,23 @@ def test_extract_all_returns_non_dict_payloads_verbatim_shape_unfiltered():
 # --- dedup / append against the local ledger --------------------------------
 
 
-def test_existing_round_seed_pairs_empty_when_ledger_absent(tmp_path):
+def _hetero36_key(row: Any) -> tuple[str, int] | None:
+    """Bind hetero36's ``(round, seed)`` key for the generic core helpers
+    (``_existing_keys_by_key``/``_dedup_batch_last_wins_by_key``) -- the
+    hetero36-specific ``_existing_round_seed_pairs``/``_dedup_batch_last_wins``
+    wrappers were removed as dead code once ``_append_new_rows`` started
+    calling ``_append_rows_by_key`` directly; these tests now exercise the
+    generic core the same way the one remaining production call site does.
+    """
+    return gpu_check._valid_hetero36_key(row, _ROUNDS)
+
+
+def test_existing_keys_by_key_empty_when_ledger_absent(tmp_path):
     ledger = tmp_path / "lab_results.jsonl"
-    assert gpu_check._existing_round_seed_pairs(ledger, _ROUNDS) == set()
+    assert gpu_check._existing_keys_by_key(ledger, _hetero36_key) == set()
 
 
-def test_existing_round_seed_pairs_filters_to_named_rounds_and_skips_malformed(
+def test_existing_keys_by_key_filters_to_named_rounds_and_skips_malformed(
     tmp_path,
 ):
     ledger = tmp_path / "lab_results.jsonl"
@@ -205,13 +237,13 @@ def test_existing_round_seed_pairs_filters_to_named_rounds_and_skips_malformed(
         + json.dumps(_row(_ROUNDS[1], 3))
         + "\n"
     )
-    assert gpu_check._existing_round_seed_pairs(ledger, _ROUNDS) == {
+    assert gpu_check._existing_keys_by_key(ledger, _hetero36_key) == {
         (_ROUNDS[0], 0),
         (_ROUNDS[1], 3),
     }
 
 
-def test_existing_round_seed_pairs_skips_non_dict_ledger_line_without_crash(tmp_path):
+def test_existing_keys_by_key_skips_non_dict_ledger_line_without_crash(tmp_path):
     # A shape-invalid line already sitting in the ledger (e.g. from a bug
     # in an older version of the append path) must never crash every
     # future run that reads the ledger back -- it's skipped like any
@@ -223,7 +255,7 @@ def test_existing_round_seed_pairs_skips_non_dict_ledger_line_without_crash(tmp_
         + json.dumps(_row(_ROUNDS[0], 0))
         + "\n"
     )
-    assert gpu_check._existing_round_seed_pairs(ledger, _ROUNDS) == {(_ROUNDS[0], 0)}
+    assert gpu_check._existing_keys_by_key(ledger, _hetero36_key) == {(_ROUNDS[0], 0)}
 
 
 def _assert_counts_reconcile(rows_count: int, result) -> None:
@@ -310,7 +342,7 @@ def test_append_new_rows_dict_missing_keys_is_skipped_invalid_not_appended(tmp_p
     _assert_counts_reconcile(len(rows), result)
     written = [json.loads(line) for line in ledger.read_text().splitlines()]
     assert written == [good]
-    assert (None, None) not in gpu_check._existing_round_seed_pairs(ledger, _ROUNDS)
+    assert (None, None) not in gpu_check._existing_keys_by_key(ledger, _hetero36_key)
 
 
 def test_append_new_rows_wrong_round_name_is_skipped_invalid(tmp_path):
@@ -722,3 +754,305 @@ def test_render_delta_probe_markdown_no_shapes_still_renders_headers():
     md = _render_delta_probe_markdown(_delta_probe_result())
     assert "triton median (s)" in md
     assert "memory bar met" in md
+
+
+# --- benchmarks job mode (Task 6): _valid_benchmarks_key / dedup / sidecar /
+# _finish_benchmarks end-to-end ---------------------------------------------
+
+_BENCH_ROUNDS = gpu_check._BENCHMARKS_ROUNDS
+_BENCH_ROW_PREFIX = gpu_check._BENCHMARKS_ROW_PREFIX
+_BENCH_ENV_PREFIX = gpu_check._BENCHMARKS_ENV_PREFIX
+
+
+def _bench_row(round_name: str, task: str, variant: str, seed: int, secs: float = 10.0) -> dict:
+    return {
+        "round": round_name,
+        "task": task,
+        "variant": variant,
+        "layers": 2,
+        "seed": seed,
+        "steps": 3000,
+        "acc": {"128": 1.0},
+        "secs": secs,
+        "ckpt": {"step": 3000, "val128": 1.0},
+        "config": {"device": "cuda", "torch": "2.8.0"},
+    }
+
+
+def test_valid_benchmarks_key_accepts_well_formed_row():
+    row = _bench_row(_BENCH_ROUNDS[0], "s5", "log", 0)
+    assert gpu_check._valid_benchmarks_key(row, _BENCH_ROUNDS) == (_BENCH_ROUNDS[0], "s5", "log", 0)
+
+
+def test_valid_benchmarks_key_rejects_non_dict_payload():
+    assert gpu_check._valid_benchmarks_key([1, 2, 3], _BENCH_ROUNDS) is None
+
+
+def test_valid_benchmarks_key_rejects_unrecognized_round():
+    row = _bench_row("not-a-benchmarks-round", "s5", "log", 0)
+    assert gpu_check._valid_benchmarks_key(row, _BENCH_ROUNDS) is None
+
+
+def test_valid_benchmarks_key_rejects_non_string_variant():
+    row = _bench_row(_BENCH_ROUNDS[0], "s5", "log", 0)
+    row["variant"] = 3  # not a string
+    assert gpu_check._valid_benchmarks_key(row, _BENCH_ROUNDS) is None
+
+
+def test_valid_benchmarks_key_rejects_non_string_task():
+    row = _bench_row(_BENCH_ROUNDS[0], "s5", "log", 0)
+    row["task"] = 3  # not a string
+    assert gpu_check._valid_benchmarks_key(row, _BENCH_ROUNDS) is None
+
+
+def test_valid_benchmarks_key_rejects_bool_seed_not_seed_one():
+    # Same bool/int subtlety pinned for hetero36 -- a JSON true/false must
+    # never be silently accepted as the int seed 1/0.
+    row = _bench_row(_BENCH_ROUNDS[0], "s5", "log", 0)
+    row["seed"] = True
+    assert gpu_check._valid_benchmarks_key(row, _BENCH_ROUNDS) is None
+
+
+def test_valid_benchmarks_key_rejects_empty_string_task():
+    # Quality review OPTIONAL FIX 3: the docstring promises "non-empty
+    # strings" -- an empty task must be rejected, not silently accepted
+    # (an empty task would otherwise route to a malformed
+    # `bench__env.json` sidecar path in `_finish_benchmarks`).
+    row = _bench_row(_BENCH_ROUNDS[0], "s5", "log", 0)
+    row["task"] = ""
+    assert gpu_check._valid_benchmarks_key(row, _BENCH_ROUNDS) is None
+
+
+def test_valid_benchmarks_key_rejects_empty_string_variant():
+    row = _bench_row(_BENCH_ROUNDS[0], "s5", "log", 0)
+    row["variant"] = ""
+    assert gpu_check._valid_benchmarks_key(row, _BENCH_ROUNDS) is None
+
+
+def test_row_task_rejects_non_dict_and_empty_string_returns_task_for_valid_row():
+    assert gpu_check._row_task([1, 2, 3]) is None
+    assert gpu_check._row_task({"task": ""}) is None
+    assert gpu_check._row_task({"task": 3}) is None
+    assert gpu_check._row_task({"task": "s5"}) == "s5"
+
+
+def test_append_benchmarks_rows_two_arms_same_seed_are_not_duplicates(tmp_path):
+    # The load-bearing difference from hetero36's (round, seed) key: two
+    # different arms (variants) at the SAME seed under the SAME round tag
+    # must both be appended, not treated as duplicates of each other.
+    ledger = tmp_path / "lab_results.jsonl"
+    rows = [
+        _bench_row(_BENCH_ROUNDS[0], "s5", "log", 0),
+        _bench_row(_BENCH_ROUNDS[0], "s5", "signed", 0),
+    ]
+    result = gpu_check._append_benchmarks_rows(ledger, rows, _BENCH_ROUNDS)
+    assert (result.appended, result.skipped_duplicate, result.skipped_invalid) == (2, 0, 0)
+    assert result.deduped_in_batch == 0
+    written = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert written == rows
+
+
+def test_append_benchmarks_rows_dedups_same_round_task_variant_seed(tmp_path):
+    ledger = tmp_path / "lab_results.jsonl"
+    ledger.write_text(json.dumps(_bench_row(_BENCH_ROUNDS[0], "s5", "log", 0)) + "\n")
+    rows = [
+        _bench_row(_BENCH_ROUNDS[0], "s5", "log", 0),  # already in ledger
+        _bench_row(_BENCH_ROUNDS[0], "s5", "log", 1),
+    ]
+    result = gpu_check._append_benchmarks_rows(ledger, rows, _BENCH_ROUNDS)
+    assert (result.appended, result.skipped_duplicate, result.skipped_invalid) == (1, 1, 0)
+    lines = ledger.read_text().splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[-1])["seed"] == 1
+
+
+def test_append_benchmarks_rows_retry_is_idempotent(tmp_path):
+    ledger = tmp_path / "lab_results.jsonl"
+    rows = [_bench_row(_BENCH_ROUNDS[0], "s5", "log", s) for s in range(3)]
+    first = gpu_check._append_benchmarks_rows(ledger, rows, _BENCH_ROUNDS)
+    assert (first.appended, first.skipped_duplicate, first.skipped_invalid) == (3, 0, 0)
+    second = gpu_check._append_benchmarks_rows(ledger, rows, _BENCH_ROUNDS)
+    assert (second.appended, second.skipped_duplicate, second.skipped_invalid) == (0, 3, 0)
+    assert len(ledger.read_text().splitlines()) == 3
+
+
+def test_build_benchmarks_sidecar_keys_per_variant_seed_not_bare_seed():
+    # Two arms sharing seed 0 must land under distinct variant sub-keys,
+    # never collide onto a single seed-keyed map the way hetero36's
+    # per_seed_wall_secs would (there, one round already implied one arm).
+    rows = [
+        _bench_row(_BENCH_ROUNDS[0], "s5", "log", 0, secs=11.0),
+        _bench_row(_BENCH_ROUNDS[0], "s5", "signed", 0, secs=22.0),
+    ]
+    result = gpu_check._append_benchmarks_rows(Path("/nonexistent-ledger"), [], _BENCH_ROUNDS)
+    sidecar = gpu_check._build_benchmarks_sidecar({"torch": "2.8.0"}, "s5", rows, result)
+    assert sidecar["per_variant_seed_wall_secs"] == {
+        "log": {"0": 11.0},
+        "signed": {"0": 22.0},
+    }
+    assert sidecar["task"] == "s5"
+    assert sidecar["rows_extracted"] == 2
+
+
+class _FakeBenchJob:
+    def __init__(self, logs: str) -> None:
+        self.logs = logs
+
+
+def _patch_benchmarks_paths(monkeypatch, tmp_path):
+    ledger = tmp_path / "lab_results.jsonl"
+    out_dir = tmp_path / "bench"
+    monkeypatch.setattr(gpu_check, "_LEDGER_PATH", ledger)
+    monkeypatch.setattr(gpu_check, "_DELTA_PROBE_OUT_DIR", out_dir)
+    return ledger, out_dir
+
+
+def test_finish_benchmarks_absent_rows_is_clear_error_and_writes_nothing(tmp_path, monkeypatch):
+    ledger, out_dir = _patch_benchmarks_paths(monkeypatch, tmp_path)
+    job = _FakeBenchJob(logs="no marked lines in this log at all\n")
+    rc = gpu_check._finish_benchmarks(job, ok=True)
+    assert rc == 1
+    assert not ledger.exists()
+    assert not out_dir.exists()
+
+
+def test_finish_benchmarks_absent_env_line_is_clear_error_and_writes_nothing(tmp_path, monkeypatch):
+    ledger, out_dir = _patch_benchmarks_paths(monkeypatch, tmp_path)
+    row = _bench_row(_BENCH_ROUNDS[0], "s5", "log", 0)
+    logs = f"{_BENCH_ROW_PREFIX}{json.dumps(row)}\n"  # no MINGRU_LAB_ENV line
+    job = _FakeBenchJob(logs=logs)
+    rc = gpu_check._finish_benchmarks(job, ok=True)
+    assert rc == 1
+    assert not ledger.exists()
+    assert not out_dir.exists()
+
+
+def test_finish_benchmarks_writes_one_sidecar_per_task_and_appends_rows(tmp_path, monkeypatch):
+    ledger, out_dir = _patch_benchmarks_paths(monkeypatch, tmp_path)
+    rows = [
+        _bench_row(_BENCH_ROUNDS[0], "s5", "log", 0),
+        _bench_row(_BENCH_ROUNDS[0], "s5", "signed", 0),
+        _bench_row(_BENCH_ROUNDS[1], "mqar", "log", 0, secs=5.0),
+    ]
+    env = {"torch": "2.8.0", "cuda_device_name": "NVIDIA L4"}
+    logs = "".join(f"{_BENCH_ROW_PREFIX}{json.dumps(r)}\n" for r in rows)
+    logs += f"{_BENCH_ENV_PREFIX}{json.dumps(env)}\n"
+    job = _FakeBenchJob(logs=logs)
+
+    rc = gpu_check._finish_benchmarks(job, ok=True)
+
+    assert rc == 0
+    # Rows are appended per-task bucket (spec section 4: "merges are
+    # order-independent" across tasks), so the ledger's cross-task row
+    # order isn't the original log order -- only membership and each
+    # task's own relative row order matter here.
+    written = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert {json.dumps(r, sort_keys=True) for r in written} == {
+        json.dumps(r, sort_keys=True) for r in rows
+    }
+
+    s5_sidecar = json.loads((out_dir / "bench_s5_env.json").read_text())
+    assert s5_sidecar["env"] == env
+    assert s5_sidecar["task"] == "s5"
+    assert s5_sidecar["rows_extracted"] == 2
+    assert s5_sidecar["rows_appended"] == 2
+    assert s5_sidecar["per_variant_seed_wall_secs"]["log"]["0"] == rows[0]["secs"]
+    assert s5_sidecar["per_variant_seed_wall_secs"]["signed"]["0"] == rows[1]["secs"]
+
+    mqar_sidecar = json.loads((out_dir / "bench_mqar_env.json").read_text())
+    assert mqar_sidecar["task"] == "mqar"
+    assert mqar_sidecar["rows_extracted"] == 1
+    assert mqar_sidecar["rows_appended"] == 1
+    assert mqar_sidecar["per_variant_seed_wall_secs"]["log"]["0"] == 5.0
+
+    assert not (out_dir / "bench_psmnist_env.json").exists()
+    assert not (out_dir / "bench_pendulum_env.json").exists()
+
+
+def test_finish_benchmarks_row_missing_task_is_warned_and_dropped_not_a_crash(
+    tmp_path, monkeypatch, capsys
+):
+    ledger, out_dir = _patch_benchmarks_paths(monkeypatch, tmp_path)
+    good = _bench_row(_BENCH_ROUNDS[0], "s5", "log", 0)
+    no_task = {"round": _BENCH_ROUNDS[0], "variant": "log", "seed": 1, "secs": 1.0}
+    logs = (
+        f"{_BENCH_ROW_PREFIX}{json.dumps(good)}\n"
+        f"{_BENCH_ROW_PREFIX}{json.dumps(no_task)}\n"
+        f"{_BENCH_ENV_PREFIX}{json.dumps({'torch': '2.8.0'})}\n"
+    )
+    job = _FakeBenchJob(logs=logs)
+
+    rc = gpu_check._finish_benchmarks(job, ok=True)
+
+    assert rc == 0
+    written = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert written == [good]
+    assert "no attributable" in capsys.readouterr().err
+    assert (out_dir / "bench_s5_env.json").exists()
+
+
+def test_finish_benchmarks_non_dict_row_is_warned_and_dropped_not_a_crash(
+    tmp_path, monkeypatch, capsys
+):
+    # Quality review REQUIRED FIX 1/2: a non-dict MINGRU_LAB_ROW payload
+    # (e.g. `[1, 2, 3]` -- exactly the case _extract_all's own docstring
+    # calls out as expected, since that extractor only guards
+    # PARSEABILITY, not SHAPE) must not crash the per-task bucketing loop
+    # with AttributeError. It's warned about and dropped, exactly like the
+    # missing-task-field case above (a different shape -- that one IS a
+    # dict, just without a usable task field) -- valid rows still append
+    # and their task's sidecar still writes.
+    ledger, out_dir = _patch_benchmarks_paths(monkeypatch, tmp_path)
+    good = _bench_row(_BENCH_ROUNDS[0], "s5", "log", 0)
+    logs = (
+        f"{_BENCH_ROW_PREFIX}[1, 2, 3]\n"
+        f"{_BENCH_ROW_PREFIX}{json.dumps(good)}\n"
+        f"{_BENCH_ENV_PREFIX}{json.dumps({'torch': '2.8.0'})}\n"
+    )
+    job = _FakeBenchJob(logs=logs)
+
+    rc = gpu_check._finish_benchmarks(job, ok=True)
+
+    assert rc == 0
+    written = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert written == [good]
+    assert "no attributable" in capsys.readouterr().err
+    sidecar = json.loads((out_dir / "bench_s5_env.json").read_text())
+    assert sidecar["rows_extracted"] == 1
+    assert sidecar["rows_appended"] == 1
+
+
+def test_finish_benchmarks_retry_is_idempotent_end_to_end(tmp_path, monkeypatch):
+    ledger, out_dir = _patch_benchmarks_paths(monkeypatch, tmp_path)
+    rows = [
+        _bench_row(_BENCH_ROUNDS[0], "s5", "log", 0),
+        _bench_row(_BENCH_ROUNDS[0], "s5", "log", 1),
+    ]
+    env = {"torch": "2.8.0"}
+    logs = "".join(f"{_BENCH_ROW_PREFIX}{json.dumps(r)}\n" for r in rows)
+    logs += f"{_BENCH_ENV_PREFIX}{json.dumps(env)}\n"
+    job = _FakeBenchJob(logs=logs)
+
+    first_rc = gpu_check._finish_benchmarks(job, ok=True)
+    second_rc = gpu_check._finish_benchmarks(job, ok=True)
+
+    assert (first_rc, second_rc) == (0, 0)
+    assert len(ledger.read_text().splitlines()) == 2
+    sidecar = json.loads((out_dir / "bench_s5_env.json").read_text())
+    assert sidecar["rows_appended"] == 0
+    assert sidecar["rows_extracted"] == 2
+
+
+def test_finish_benchmarks_nonzero_exit_when_job_not_ok_despite_valid_rows(tmp_path, monkeypatch):
+    ledger, out_dir = _patch_benchmarks_paths(monkeypatch, tmp_path)
+    row = _bench_row(_BENCH_ROUNDS[0], "s5", "log", 0)
+    logs = (
+        f"{_BENCH_ROW_PREFIX}{json.dumps(row)}\n"
+        f"{_BENCH_ENV_PREFIX}{json.dumps({'torch': '2.8.0'})}\n"
+    )
+    job = _FakeBenchJob(logs=logs)
+
+    rc = gpu_check._finish_benchmarks(job, ok=False)
+
+    assert rc == 1
+    assert ledger.exists()

@@ -124,7 +124,7 @@ _DIRECTION_CMP: dict[str, Callable[[float, float], bool]] = {"ge": operator.ge, 
 def _load_all_rows(path: Path) -> list[dict[str, Any]]:
     """Every well-formed JSON line in ``path``; a blank or malformed line is
     skipped, never raised. Only ``scripts/gpu_check.py``'s
-    ``_existing_round_seed_pairs`` already applies this same guarded-parse
+    ``_existing_keys_by_key`` already applies this same guarded-parse
     contract (blank lines skipped AND a ``try/except`` around
     ``json.loads``); ``experiments/benchmark_lab.py``'s ``_row_exists`` and
     ``scripts/run_matched_state.py``'s ``_load_rows_by_round`` only skip

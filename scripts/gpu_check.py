@@ -77,6 +77,43 @@ Job modes (``--job``, default ``check``, existing invocations unaffected):
   rows_skipped_duplicate + rows_skipped_invalid + rows_deduped_in_batch``).
   Rows or the env line missing/malformed entirely is a clear error exit;
   nothing is appended or written in that case.
+
+``benchmarks`` (accepted-benchmark validation round, Task 6, consumes Task 5)
+  Runs ``scripts/gpu_benchmark_campaign.py`` instead: the four-task x
+  five-arm benchmark validation round (S5, MQAR, psMNIST, pendulum -- see
+  ``.claude/output/specs/2026-07-19-benchmark-round-design.md`` sections 4
+  and 6). Same clone/checkout/triton-install preamble as ``hetero36``, plus
+  a ``torchvision`` install (psMNIST downloads MNIST inside the job -- see
+  ``build_benchmarks_command``). ``--tasks``/``--arms``/``--seeds`` pass
+  through to the campaign script's own CLI when given (default: its own
+  defaults, every task/arm/seed); the production command NEVER passes
+  ``--steps`` -- that flag is a local-smoke-only override that shrinks the
+  campaign's eval cadence, not a production budget knob (spec section 7:
+  "no per-arm tuning"; the committed ``TaskSpec`` budgets are frozen).
+  Foreground-only, no-keepalive command chain -- see
+  ``build_delta_probe_command``'s docstring for why.
+
+  After the job completes, this script fetches its logs, extracts every
+  ``MINGRU_LAB_ROW`` line (guarded parse, malformed lines skipped -- see
+  ``_extract_all``) and the single ``MINGRU_LAB_ENV`` line (guarded,
+  last-wins -- see ``_extract_last``). Either rows entirely absent or the
+  env line missing/malformed is a clear error exit with nothing appended or
+  written, mirroring ``hetero36``'s contract. Unlike ``hetero36``, this
+  round's dedup key is the four-field ``(round, task, variant, seed)``
+  (spec section 6's marker-line protocol) -- a task's five arms and 36 (or
+  12, psMNIST) seeds all share one round tag, so ``variant`` (the arm) is
+  load-bearing in the key. Rows are bucketed by their own ``task`` field
+  (dict rows only, non-empty string ``task`` only -- a row that isn't a
+  dict, or is a dict with a missing/empty ``task``, can't be attributed to
+  any task and is dropped with a warning, never appended anywhere) and each
+  task's bucket is dedup-appended to the
+  ledger and written to its own ``experiments/bench/bench_<task>_env.json``
+  sidecar (one per task present in the parsed rows), mirroring
+  ``gpu36_env.json``'s shape except ``per_seed_wall_secs`` is keyed by
+  ``{variant: {seed: secs}}`` rather than ``{round: {seed: secs}}`` -- a
+  task's rows span many arms at the same seed, so seed alone would collide
+  across arms the way it never could in ``hetero36`` (there, one round
+  already implied exactly one arm).
 """
 
 from __future__ import annotations
@@ -86,6 +123,7 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -112,6 +150,16 @@ _HETERO36_ENV_PREFIX = "MINGRU_LAB_ENV "
 _HETERO36_ROUNDS = ("hetero-gpu36-sg8", "hetero-gpu36-pd64", "hetero-gpu36-pd1024")
 _LEDGER_PATH = _REPO_ROOT / "experiments" / "lab_results.jsonl"
 _HETERO36_SIDECAR = _DELTA_PROBE_OUT_DIR / "gpu36_env.json"
+
+# --- benchmarks job mode (Task 6, consumes Task 5) ----------------------
+
+_BENCHMARKS_JOB_NAME = "mingru-gpu-benchmarks"
+_BENCHMARKS_ROW_PREFIX = "MINGRU_LAB_ROW "
+_BENCHMARKS_ENV_PREFIX = "MINGRU_LAB_ENV "
+# Spec's Global Constraints (exact) -- the only round names this round's
+# submitting/dedup path recognizes as its own rows. One round per task,
+# independent of which arms/seeds that task's cell selects.
+_BENCHMARKS_ROUNDS = ("bench-s5-01", "bench-mqar-01", "bench-psmnist-01", "bench-pendulum-01")
 
 
 def _sh(cmd: list[str]) -> str:
@@ -201,6 +249,44 @@ def build_hetero36_command(repo: str, ref: str) -> str:
     """
     steps = _job_preamble_steps(repo, ref)
     steps.append("cd /tmp/minGRU && python scripts/gpu_hetero_campaign.py")
+    return " && ".join(steps)
+
+
+def build_benchmarks_command(
+    repo: str,
+    ref: str,
+    tasks: list[str] | None,
+    arms: list[str] | None,
+    seeds: list[int] | None,
+) -> str:
+    """Job-shell command for ``--job benchmarks``: clone + benchmark campaign run.
+
+    Uses the shared clone/checkout/triton-install preamble, then installs
+    ``torchvision`` (Task 6 brief -- the psMNIST task downloads MNIST inside
+    the job; no other job mode needs it, so this install is appended here
+    rather than folded into ``_job_preamble_steps`` itself, keeping every
+    other job mode's preamble unchanged), then runs
+    ``scripts/gpu_benchmark_campaign.py`` with ``--tasks``/``--arms``/
+    ``--seeds`` passthrough when given (omitted entirely when ``None``, so
+    the campaign script's own defaults -- every task/arm/seed -- apply).
+    Deliberately NEVER passes ``--steps``: that flag is the campaign
+    script's local-smoke-only override (shrinks its eval cadence via
+    ``_resolve_eval_every``) -- production budgets are the committed
+    ``TaskSpec`` values (spec section 7: "no per-arm tuning"). Foreground-
+    only, no keepalive -- see ``build_delta_probe_command``'s docstring for
+    why a backgrounded loop outlives a studio-mode job's command chain and
+    keeps it billing.
+    """
+    steps = _job_preamble_steps(repo, ref)
+    steps.append("pip install --no-cache-dir torchvision")
+    command = "cd /tmp/minGRU && python scripts/gpu_benchmark_campaign.py"
+    if tasks:
+        command += " --tasks " + " ".join(tasks)
+    if arms:
+        command += " --arms " + " ".join(arms)
+    if seeds:
+        command += " --seeds " + " ".join(str(s) for s in seeds)
+    steps.append(command)
     return " && ".join(steps)
 
 
@@ -435,60 +521,66 @@ def _valid_hetero36_key(row: Any, rounds: tuple[str, ...]) -> tuple[str, int] | 
     return round_name, seed
 
 
-def _existing_round_seed_pairs(ledger_path: Path, rounds: tuple[str, ...]) -> set[tuple[str, int]]:
-    """(round, seed) pairs already present in the local ledger for ``rounds``.
+def _valid_benchmarks_key(row: Any, rounds: tuple[str, ...]) -> tuple[str, str, str, int] | None:
+    """Return ``row``'s ``(round, task, variant, seed)`` key if shape-valid, else ``None``.
 
-    Guarded per-line parse (a malformed ledger line is skipped, never
-    raised) mirrors the extraction contract this module already applies to
-    job logs; shape-invalid lines (non-dict JSON, or a dict that fails
-    ``_valid_hetero36_key``) are skipped the same way -- a garbage line
-    already in the ledger must never crash every future run that reads it
-    back. A ledger that doesn't exist yet (fresh checkout, or a
-    ``tmp_path`` fixture in tests) is treated as "no existing rows".
+    Sibling to ``_valid_hetero36_key`` for the benchmarks round's four-field
+    dedup key (spec section 6's marker-line protocol): a task's five arms
+    and many seeds all share one round tag, so ``variant`` (the arm) must
+    be part of the key or two different arms at the same seed would
+    collide. Same guard shape as ``_valid_hetero36_key``: ``row`` must be a
+    ``dict``, its ``round`` must be one of ``rounds`` (the four benchmarks
+    round names), its ``task``/``variant`` must be non-empty strings, and
+    its ``seed`` must be an ``int`` excluding ``bool``.
     """
-    pairs: set[tuple[str, int]] = set()
-    if not ledger_path.exists():
-        return pairs
-    for line in ledger_path.read_text().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            row = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        key = _valid_hetero36_key(row, rounds)
-        if key is not None:
-            pairs.add(key)
-    return pairs
+    if not isinstance(row, dict):
+        return None
+    round_name = row.get("round")
+    task = row.get("task")
+    variant = row.get("variant")
+    seed = row.get("seed")
+    if round_name not in rounds:
+        return None
+    if not isinstance(task, str) or not task or not isinstance(variant, str) or not variant:
+        return None
+    if not isinstance(seed, int) or isinstance(seed, bool):
+        return None
+    return round_name, task, variant, seed
 
 
-def _dedup_batch_last_wins(
-    rows: list[Any], rounds: tuple[str, ...]
+_RowKey = tuple[Any, ...]
+
+
+def _dedup_batch_last_wins_by_key(
+    rows: list[Any], key_fn: Callable[[Any], _RowKey | None]
 ) -> tuple[list[dict[str, Any]], int, int]:
-    """Resolve one extracted batch to last-N-wins per ``(round, seed)``.
+    """Resolve one extracted batch to last-N-wins per ``key_fn(row)``.
 
-    Spec §6: "extraction is last-N-wins per (round, seed)". Returns
-    ``(deduped_rows, rows_skipped_invalid, rows_deduped_in_batch)``: a
-    shape-invalid row (see ``_valid_hetero36_key``) never participates --
-    it's dropped and counted rather than crashing or silently entering
-    the ledger under a garbage key. Valid rows are folded into a dict
-    keyed by ``(round, seed)`` IN LOG ORDER: a plain ``dict``'s iteration
-    order is the position of a key's FIRST occurrence, but assigning to
-    an already-present key still overwrites its value -- so
-    ``dict.values()`` afterward yields exactly one row per key, in
-    first-occurrence order, holding each key's LAST-seen row.
-    ``rows_deduped_in_batch`` counts every row that LOST that
-    overwrite (one less than the number of rows sharing a key) -- without
-    it, a losing row would vanish from the sidecar's accounting: the
-    caller's ``len(rows) == appended + skipped_duplicate + skipped_invalid
-    + deduped_in_batch`` reconciliation depends on this count existing.
+    Generic core shared by every job mode's dedup path -- hetero36's
+    ``(round, seed)`` key and the benchmarks round's four-field
+    ``(round, task, variant, seed)`` key are both call sites (see
+    ``_valid_hetero36_key``/``_valid_benchmarks_key``), parameterized here
+    rather than duplicated per mode. Spec §6: "extraction is last-N-wins
+    per <key>". Returns ``(deduped_rows, rows_skipped_invalid,
+    rows_deduped_in_batch)``: a shape-invalid row (``key_fn`` returns
+    ``None``) never participates -- it's dropped and counted rather than
+    crashing or silently entering the ledger under a garbage key. Valid
+    rows are folded into a dict keyed by ``key_fn(row)`` IN LOG ORDER: a
+    plain ``dict``'s iteration order is the position of a key's FIRST
+    occurrence, but assigning to an already-present key still overwrites
+    its value -- so ``dict.values()`` afterward yields exactly one row per
+    key, in first-occurrence order, holding each key's LAST-seen row.
+    ``rows_deduped_in_batch`` counts every row that LOST that overwrite
+    (one less than the number of rows sharing a key) -- without it, a
+    losing row would vanish from the sidecar's accounting: the caller's
+    ``len(rows) == appended + skipped_duplicate + skipped_invalid +
+    deduped_in_batch`` reconciliation depends on this count existing.
     """
-    by_key: dict[tuple[str, int], dict[str, Any]] = {}
+    by_key: dict[_RowKey, dict[str, Any]] = {}
     skipped_invalid = 0
     deduped_in_batch = 0
     for row in rows:
-        key = _valid_hetero36_key(row, rounds)
+        key = key_fn(row)
         if key is None:
             skipped_invalid += 1
             continue
@@ -498,6 +590,39 @@ def _dedup_batch_last_wins(
     return list(by_key.values()), skipped_invalid, deduped_in_batch
 
 
+def _existing_keys_by_key(
+    ledger_path: Path, key_fn: Callable[[Any], _RowKey | None]
+) -> set[_RowKey]:
+    """Keys already present in the local ledger, per ``key_fn``.
+
+    Generic core shared by every job mode's dedup path -- see
+    ``_dedup_batch_last_wins_by_key``'s docstring for why this is
+    parameterized rather than hardcoded to one mode's key shape. Guarded
+    per-line parse (a malformed ledger line is skipped, never raised)
+    mirrors the extraction contract this module already applies to job
+    logs; shape-invalid lines (non-dict JSON, or a dict for which
+    ``key_fn`` returns ``None``) are skipped the same way -- a garbage line
+    already in the ledger must never crash every future run that reads it
+    back. A ledger that doesn't exist yet (fresh checkout, or a
+    ``tmp_path`` fixture in tests) is treated as "no existing rows".
+    """
+    keys: set[_RowKey] = set()
+    if not ledger_path.exists():
+        return keys
+    for line in ledger_path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        key = key_fn(row)
+        if key is not None:
+            keys.add(key)
+    return keys
+
+
 class _AppendResult(NamedTuple):
     appended: int
     skipped_duplicate: int
@@ -505,28 +630,33 @@ class _AppendResult(NamedTuple):
     deduped_in_batch: int
 
 
-def _append_new_rows(ledger_path: Path, rows: list[Any], rounds: tuple[str, ...]) -> _AppendResult:
-    """Append ``rows`` whose ``(round, seed)`` isn't already in the ledger.
+def _append_rows_by_key(
+    ledger_path: Path, rows: list[Any], key_fn: Callable[[Any], _RowKey | None]
+) -> _AppendResult:
+    """Append ``rows`` whose ``key_fn(row)`` isn't already in the ledger.
 
-    Shape-invalid rows (see ``_valid_hetero36_key``) are dropped and
-    counted rather than appended or crashing the batch. The surviving
-    batch is first resolved last-N-wins per ``(round, seed)`` (spec §6,
-    see ``_dedup_batch_last_wins``); only then is each remaining row
-    checked against the ledger's existing keys for ``rounds`` -- a key
-    already present in the ledger still skips unconditionally, keeping
-    retries idempotent. Log order (of the deduped batch) is preserved in
-    both the returned counts and the appended lines. The four returned
-    counts reconcile exactly against ``len(rows)``: every input row is
-    either appended, skipped as an existing-ledger duplicate, skipped as
-    shape-invalid, or deduped away by a later same-batch occurrence.
+    Generic core shared by every job mode's dedup-append path -- see
+    ``_dedup_batch_last_wins_by_key``'s docstring for why this is
+    parameterized. Shape-invalid rows (``key_fn`` returns ``None``) are
+    dropped and counted rather than appended or crashing the batch. The
+    surviving batch is first resolved last-N-wins per key (spec §6, see
+    ``_dedup_batch_last_wins_by_key``); only then is each remaining row
+    checked against the ledger's existing keys -- a key already present in
+    the ledger still skips unconditionally, keeping retries idempotent.
+    Log order (of the deduped batch) is preserved in both the returned
+    counts and the appended lines. The four returned counts reconcile
+    exactly against ``len(rows)``: every input row is either appended,
+    skipped as an existing-ledger duplicate, skipped as shape-invalid, or
+    deduped away by a later same-batch occurrence.
     """
-    batch, skipped_invalid, deduped_in_batch = _dedup_batch_last_wins(rows, rounds)
-    existing = _existing_round_seed_pairs(ledger_path, rounds)
+    batch, skipped_invalid, deduped_in_batch = _dedup_batch_last_wins_by_key(rows, key_fn)
+    existing = _existing_keys_by_key(ledger_path, key_fn)
     appended_lines: list[str] = []
     appended = 0
     skipped_duplicate = 0
     for row in batch:
-        key = (row["round"], row["seed"])
+        key = key_fn(row)
+        assert key is not None  # batch already filtered by _dedup_batch_last_wins_by_key
         if key in existing:
             skipped_duplicate += 1
             continue
@@ -538,6 +668,27 @@ def _append_new_rows(ledger_path: Path, rows: list[Any], rounds: tuple[str, ...]
             for line in appended_lines:
                 f.write(line + "\n")
     return _AppendResult(appended, skipped_duplicate, skipped_invalid, deduped_in_batch)
+
+
+def _append_new_rows(ledger_path: Path, rows: list[Any], rounds: tuple[str, ...]) -> _AppendResult:
+    """Append ``rows`` whose ``(round, seed)`` isn't already in the ledger.
+
+    Thin wrapper over ``_append_rows_by_key`` binding hetero36's
+    ``(round, seed)`` key (see ``_valid_hetero36_key``).
+    """
+    return _append_rows_by_key(ledger_path, rows, lambda row: _valid_hetero36_key(row, rounds))
+
+
+def _append_benchmarks_rows(
+    ledger_path: Path, rows: list[Any], rounds: tuple[str, ...]
+) -> _AppendResult:
+    """Append ``rows`` whose ``(round, task, variant, seed)`` isn't already
+    in the ledger.
+
+    Thin wrapper over ``_append_rows_by_key`` binding the benchmarks
+    round's four-field key (see ``_valid_benchmarks_key``).
+    """
+    return _append_rows_by_key(ledger_path, rows, lambda row: _valid_benchmarks_key(row, rounds))
 
 
 def _build_hetero36_sidecar(
@@ -645,6 +796,169 @@ def _finish_hetero36(job: Any, ok: bool) -> int:
     return 0 if ok else 1
 
 
+def _build_benchmarks_sidecar(
+    env: dict[str, Any],
+    task: str,
+    rows: list[Any],
+    result: _AppendResult,
+) -> dict[str, Any]:
+    """Assemble one task's ``bench_<task>_env.json`` sidecar payload (spec §6).
+
+    ``rows`` is already this task's bucket (see ``_finish_benchmarks``), not
+    the full job's extracted batch -- so every count here is scoped to
+    ``task``, and ``rows_extracted == rows_appended + rows_skipped_duplicate
+    + rows_skipped_invalid + rows_deduped_in_batch`` reconciles per file,
+    mirroring ``_build_hetero36_sidecar``'s reconciliation invariant.
+
+    ``per_variant_seed_wall_secs`` is keyed ``{variant: {seed: secs}}``,
+    NOT ``{round: {seed: secs}}`` like ``_build_hetero36_sidecar`` -- one
+    task's rows span up to five arms (variants) at the same seed, and a
+    task's round tag is fixed (one round per task), so keying by round
+    first would collide every arm sharing a seed onto the same sub-map.
+    Keying by variant first is the direct fix; seed alone was never a
+    unique key here the way it was for hetero36 (there, one round already
+    implied exactly one arm). A shape-invalid row (see
+    ``_valid_benchmarks_key``) or one missing ``secs`` is skipped from this
+    map rather than raising.
+    """
+    per_variant_seed_wall_secs: dict[str, dict[str, float]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        variant = row.get("variant")
+        seed = row.get("seed")
+        secs = row.get("secs")
+        if not isinstance(variant, str) or not isinstance(seed, int) or isinstance(seed, bool):
+            continue
+        if secs is None:
+            continue
+        per_variant_seed_wall_secs.setdefault(variant, {})[str(seed)] = secs
+    return {
+        "env": env,
+        "task": task,
+        "rows_extracted": len(rows),
+        "rows_appended": result.appended,
+        "rows_skipped_duplicate": result.skipped_duplicate,
+        "rows_skipped_invalid": result.skipped_invalid,
+        "rows_deduped_in_batch": result.deduped_in_batch,
+        "per_variant_seed_wall_secs": per_variant_seed_wall_secs,
+    }
+
+
+def _bench_sidecar_path(task: str) -> Path:
+    return _DELTA_PROBE_OUT_DIR / f"bench_{task}_env.json"
+
+
+def _row_task(row: Any) -> str | None:
+    """The row's ``task`` bucket key, or ``None`` if it can't be attributed.
+
+    The single guard every task-bucketing site in ``_finish_benchmarks``
+    shares (the ``tasks_present`` set, the ``unattributed`` list, and each
+    task's own row bucket) -- ``row`` must be a ``dict`` and its ``task``
+    field a non-empty string (an empty string would otherwise route to a
+    malformed ``bench__env.json`` sidecar path). Deriving this once and
+    reusing it everywhere, rather than re-deriving the same guard per call
+    site, is what keeps the three sites from drifting out of sync -- an
+    earlier version re-derived an ``isinstance(row, dict)``-less filter for
+    the per-task row bucket and crashed with ``AttributeError`` on a
+    non-dict ``MINGRU_LAB_ROW`` payload (quality review REQUIRED FIX 1).
+    """
+    if not isinstance(row, dict):
+        return None
+    task = row.get("task")
+    return task if isinstance(task, str) and task else None
+
+
+def _finish_benchmarks(job: Any, ok: bool) -> int:
+    """Post-``job.wait()`` handling for ``--job benchmarks``.
+
+    Fetches the job's logs (best-effort -- see ``_fetch_job_logs``),
+    extracts every ``MINGRU_LAB_ROW`` line (guarded, malformed lines
+    skipped -- see ``_extract_all``) and the single ``MINGRU_LAB_ENV`` line
+    (guarded, last-wins -- see ``_extract_last``). Either rows entirely
+    absent or the env line missing/malformed is a clear error exit with
+    NOTHING appended or written -- both checks run before any ledger
+    mutation or sidecar write, mirroring ``_finish_hetero36``'s contract.
+
+    Unlike ``_finish_hetero36``, one job covers every task/arm/seed the
+    campaign was given, and this round's dedup key is the four-field
+    ``(round, task, variant, seed)`` (spec section 6) rather than
+    ``(round, seed)`` -- a task's five arms and many seeds share one round
+    tag, so ``variant`` (the arm) must be in the key. Rows are bucketed by
+    their own ``task`` field via ``_row_task`` (a row that isn't a dict, or
+    is a dict with no non-empty string ``task``, can't be attributed to any
+    task; it's dropped with a stderr warning, never appended anywhere --
+    see the module docstring's "benchmarks" job-mode section). Each task's
+    bucket is independently
+    dedup-appended to the ledger (see ``_append_benchmarks_rows``) and
+    written to its own ``experiments/bench/bench_<task>_env.json`` sidecar
+    (one per task present in the parsed rows), since dedup keys never cross
+    task boundaries (each round tag names exactly one task) -- resolving
+    per-task bucket is equivalent to one global pass over all rows, up to
+    ordering. Each task's OWN row order is preserved (log order within the
+    bucket), but the ledger's cross-task ordering is bucket order, not the
+    original interleaved log order -- spec section 4 states merges across
+    tasks are order-independent (tasks may even run as separate parallel
+    jobs), so only membership and per-task relative order are guaranteed,
+    unlike ``_finish_hetero36``'s single round-agnostic global pass.
+    """
+    logs, exc = _fetch_job_logs(job)
+    if exc is not None:
+        print(f"error: could not fetch logs: {exc}", file=sys.stderr)
+        return 1
+    assert logs is not None  # guaranteed by _fetch_job_logs's exc is None contract
+
+    rows = _extract_all(_BENCHMARKS_ROW_PREFIX, logs)
+    if not rows:
+        print(
+            "error: no well-formed MINGRU_LAB_ROW lines found in job logs -- "
+            "not appending or writing a sidecar. Log tail:\n" + "\n".join(logs.splitlines()[-40:]),
+            file=sys.stderr,
+        )
+        return 1
+
+    env = _extract_last(_BENCHMARKS_ENV_PREFIX, logs)
+    if env is None:
+        print(
+            "error: no well-formed MINGRU_LAB_ENV line found in job logs -- "
+            "not appending or writing a sidecar. Log tail:\n" + "\n".join(logs.splitlines()[-40:]),
+            file=sys.stderr,
+        )
+        return 1
+
+    tasks_present = sorted({t for row in rows if (t := _row_task(row)) is not None})
+    unattributed = [row for row in rows if _row_task(row) is None]
+    if unattributed:
+        print(
+            f"warning: {len(unattributed)} MINGRU_LAB_ROW row(s) had no attributable "
+            "non-empty string 'task' field (non-dict payload, or a dict with a "
+            "missing/empty 'task') -- skipped entirely, not appended to any task's "
+            "ledger rows or sidecar",
+            file=sys.stderr,
+        )
+
+    _DELTA_PROBE_OUT_DIR.mkdir(parents=True, exist_ok=True)
+    for task in tasks_present:
+        task_rows = [row for row in rows if _row_task(row) == task]
+        result = _append_benchmarks_rows(_LEDGER_PATH, task_rows, _BENCHMARKS_ROUNDS)
+        if result.skipped_invalid:
+            print(
+                f"warning: task {task}: skipped {result.skipped_invalid} shape-invalid "
+                "MINGRU_LAB_ROW row(s) (unrecognized round, non-string variant, or "
+                "non-int seed) -- not appended to the ledger",
+                file=sys.stderr,
+            )
+        sidecar = _build_benchmarks_sidecar(env, task, task_rows, result)
+        sidecar_path = _bench_sidecar_path(task)
+        sidecar_path.write_text(json.dumps(sidecar, indent=2) + "\n")
+        print(
+            f"[{task}] appended {result.appended} new row(s), skipped "
+            f"{result.skipped_duplicate} duplicate(s), {result.skipped_invalid} invalid, "
+            f"and {result.deduped_in_batch} intra-batch duplicate(s); wrote {sidecar_path}"
+        )
+    return 0 if ok else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -665,12 +979,35 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument(
         "--job",
-        choices=["check", "delta-probe", "hetero36"],
+        choices=["check", "delta-probe", "hetero36", "benchmarks"],
         default="check",
         help="job mode: 'check' (default, existing behavior unchanged), "
-        "'delta-probe' (Task 6 CUDA fusion-headroom probe), or 'hetero36' "
-        "(Task 3 GPU 36-seed round campaign) -- see the module docstring's "
+        "'delta-probe' (Task 6 CUDA fusion-headroom probe), 'hetero36' "
+        "(Task 3 GPU 36-seed round campaign), or 'benchmarks' (Task 6 "
+        "accepted-benchmark validation round) -- see the module docstring's "
         "'Job modes' section",
+    )
+    ap.add_argument(
+        "--tasks",
+        nargs="+",
+        default=None,
+        help="'benchmarks' job mode only: task subset passthrough to "
+        "gpu_benchmark_campaign.py's --tasks (default: its own default, all four)",
+    )
+    ap.add_argument(
+        "--arms",
+        nargs="+",
+        default=None,
+        help="'benchmarks' job mode only: arm subset passthrough to "
+        "gpu_benchmark_campaign.py's --arms (default: its own default, all five)",
+    )
+    ap.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=None,
+        help="'benchmarks' job mode only: seed subset passthrough to "
+        "gpu_benchmark_campaign.py's --seeds (default: each task's own seed-matrix size)",
     )
     args = ap.parse_args()
 
@@ -682,6 +1019,9 @@ def main() -> int:
     elif args.job == "hetero36":
         command = build_hetero36_command(repo, ref)
         job_name_prefix = _HETERO36_JOB_NAME
+    elif args.job == "benchmarks":
+        command = build_benchmarks_command(repo, ref, args.tasks, args.arms, args.seeds)
+        job_name_prefix = _BENCHMARKS_JOB_NAME
     else:
         command = build_command(repo, ref, args.bench)
         job_name_prefix = JOB_NAME
@@ -778,6 +1118,8 @@ def main() -> int:
         return _finish_delta_probe(job, ok)
     if args.job == "hetero36":
         return _finish_hetero36(job, ok)
+    if args.job == "benchmarks":
+        return _finish_benchmarks(job, ok)
     if not ok:
         logs, exc = _fetch_job_logs(job)
         if exc is not None:
