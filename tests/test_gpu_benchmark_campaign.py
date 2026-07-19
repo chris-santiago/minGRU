@@ -12,11 +12,14 @@ Split into two groups, mirroring ``test_gpu_hetero_campaign.py``:
   ``_resolve_eval_every``'s steps-override shrink, the ``_run_arm_kwargs``
   namespace ``benchmark_lab.run_arm`` consumes (``dry_run`` always
   ``True``), and ``_run_selftest_gate``'s failure paths (non-zero exit,
-  ``TimeoutExpired``, ``OSError``) via a monkeypatched
-  ``subprocess.run`` -- these never reach ``_run_selftest_gate`` through the
-  end-to-end tests below (``--device cpu`` skips pre-flight entirely;
-  ``--device cuda`` trips the CUDA assert before the selftest gate on this
-  CUDA-less test machine), so they need direct unit coverage.
+  ``TimeoutExpired``, ``OSError``) plus its ``MINGRU_SCAN``-stripping
+  environment fix (the production job exports ``MINGRU_SCAN=triton``
+  job-wide; the selftest subprocess must not inherit it -- see
+  ``_run_selftest_gate``'s docstring) via a monkeypatched ``subprocess.run``
+  -- these never reach ``_run_selftest_gate`` through the end-to-end tests
+  below (``--device cpu`` skips pre-flight entirely; ``--device cuda`` trips
+  the CUDA assert before the selftest gate on this CUDA-less test machine),
+  so they need direct unit coverage.
 - End-to-end subprocess checks per the task's stated verification: a tiny
   ``--device cpu`` smoke run emits a valid ``MINGRU_LAB_ROW`` line and never
   touches ``experiments/lab_results.jsonl``, and the default (``--device
@@ -29,6 +32,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -182,6 +186,28 @@ def test_run_selftest_gate_raises_clean_systemexit_on_oserror(monkeypatch):
     message = str(excinfo.value)
     assert "pre-flight FAILED" in message
     assert "could not be launched" in message
+
+
+def test_run_selftest_gate_strips_mingru_scan_from_subprocess_env_only(monkeypatch):
+    # Real-world bug (L4 pilot job mingru-gpu-benchmarks-9610d4d): the
+    # production job exports MINGRU_SCAN=triton job-wide, and the selftest's
+    # tiny models run on CPU -- inheriting that export made the CPU tensors
+    # hit the Triton dispatch, which fails loud per the MINGRU_SCAN
+    # contract, tripping this gate on an otherwise-healthy lab.
+    monkeypatch.setenv("MINGRU_SCAN", "triton")
+    monkeypatch.setenv("MINGRU_BENCHMARK_CAMPAIGN_TEST_VAR", "kept")
+    captured_env: dict[str, str] = {}
+
+    def _fake_run(*args, **kwargs):
+        captured_env.update(kwargs["env"])
+        return _FakeCompletedProcess(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(gpu_benchmark_campaign.subprocess, "run", _fake_run)
+    _run_selftest_gate()
+
+    assert "MINGRU_SCAN" not in captured_env
+    assert os.environ["MINGRU_SCAN"] == "triton"  # parent process env untouched
+    assert captured_env.get("MINGRU_BENCHMARK_CAMPAIGN_TEST_VAR") == "kept"
 
 
 # --- end-to-end: CPU smoke + CUDA-less fail-fast ---------------------------

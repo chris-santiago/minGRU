@@ -36,7 +36,12 @@ Pre-flight (fail-loud, before seed 0, ``--device cuda`` only)
    section 10). Run once, unconditionally, regardless of the invocation's
    ``--tasks``/``--arms`` subset -- it is a single wiring gate over the
    whole lab, not a per-arm engagement probe like the hetero round's
-   compile/triton gates.
+   compile/triton gates. This gate always runs its tiny models on CPU (a
+   backend-independent sanity check) with ``MINGRU_SCAN`` explicitly
+   unset in the subprocess's environment, regardless of what the parent
+   job process has it set to (see ``_run_selftest_gate``'s docstring) --
+   the production job exports ``MINGRU_SCAN=triton`` job-wide for the
+   real evidence runs, and that export must not reach this CPU-only gate.
 
 On ``--device cpu`` (smoke only) every pre-flight gate above is skipped --
 mirrors ``gpu_hetero_campaign.py``'s convention -- and no ``MINGRU_LAB_ENV``
@@ -81,6 +86,7 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
 import platform
 import subprocess
 import sys
@@ -206,7 +212,26 @@ def _run_selftest_gate() -> None:
     invocation (``OSError``) is caught and re-raised as the same clean
     ``SystemExit`` shape every other pre-flight gate in this module uses,
     rather than letting a raw subprocess exception traceback escape.
+
+    The selftest is a backend-independent CPU sanity gate -- it builds and
+    trains tiny models on ``device="cpu"`` regardless of what device this
+    campaign is targeting. The production job exports ``MINGRU_SCAN=triton``
+    job-wide (so the campaign's real evidence runs dispatch to the Triton
+    kernel), but that export must not reach this subprocess: the Triton
+    dispatch path fails loud on a CPU tensor (`"Pointer argument ... cannot
+    be accessed from Triton (cpu tensor?)"`), which would trip this gate on
+    a perfectly healthy lab. The subprocess therefore runs with a copy of
+    the parent environment with ``MINGRU_SCAN`` removed (not set to a
+    value -- unsetting it is the neutral state, letting the packaged
+    dispatch fall back to its own ``auto`` default, which never engages
+    Triton on CPU per the ``MINGRU_SCAN`` contract). The campaign's own
+    evidence-bearing seed runs (``run_campaign``'s calls to
+    ``benchmark_lab.run_arm``) are unaffected -- they run in-process, not
+    through this subprocess, and correctly inherit the job's
+    ``MINGRU_SCAN=triton`` export untouched.
     """
+    selftest_env = os.environ.copy()
+    selftest_env.pop("MINGRU_SCAN", None)
     try:
         result = subprocess.run(
             [sys.executable, str(_BENCHMARK_LAB_PATH), "--selftest"],
@@ -214,6 +239,7 @@ def _run_selftest_gate() -> None:
             capture_output=True,
             text=True,
             timeout=120,
+            env=selftest_env,
         )
     except subprocess.TimeoutExpired as exc:
         raise SystemExit(
