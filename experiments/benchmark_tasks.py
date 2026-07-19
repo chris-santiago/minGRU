@@ -599,3 +599,129 @@ class PsMNISTLoader:
 
     def test(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
         yield from _ordered_batches(self._test_x, self._test_y, self.batch_size)
+
+
+PSMNIST_PERMUTATION_SEED = 20260719  # spec §4: one fixed permutation, identical across every arm and seed this round; recorded in each row's `config`.
+
+
+def make_psmnist_loader(batch_size: int) -> PsMNISTLoader:
+    """`PsMNISTLoader` factory keyed only by `batch_size` (the lab driver's
+    "wiring site", quality-review carry-over from Task 2: `PsMNISTLoader`
+    owns its own `batch_size` with no enforced link to a `TaskSpec.budget`'s
+    `batch_size` -- this factory lets the driver construct the loader AFTER
+    resolving CLI budget overrides, then assert the two values match, rather
+    than baking a batch size into `PSMNIST_TASK` at import time).
+
+    `PSMNIST_TASK.data` holds this factory (not a `Loader` instance and not
+    the `make(batch, T, gen)` generator shape every other task's `data`
+    uses) -- the one documented exception the module docstring already
+    calls out for psMNIST; the driver's `loss_mode == "last_step"` dispatch
+    is what knows to call it this way.
+    """
+    return PsMNISTLoader(permutation_seed=PSMNIST_PERMUTATION_SEED, batch_size=batch_size)
+
+
+# ------------------------------------------------------- canonical TaskSpecs
+# Concrete TaskSpec singletons for the four benchmark-round tasks (spec §4
+# Global Constraints; landed here per the orchestrator's Task 4 brief, since
+# Tasks 1-2 deliberately shipped the TaskSpec *contract* only -- see their
+# reports: "S5's training-step budget is explicitly not yet determined...
+# Concrete S5_TASK/MQAR_TASK TaskSpec singletons... are left for whichever
+# task owns the pilot/lab-driver work").
+#
+# Fields FROZEN by the round's Global Constraints (fit_metric,
+# fit_threshold, fit_direction, robustness, eval_protocol, seeds) are the
+# real, binding values -- not placeholders. `Budget` values are NOT all
+# frozen yet: spec §4's pilot-calibration paragraph names exactly three
+# quantities still pending a pilot run before any seed matrix -- "a pilot
+# ... fixes the S5 and psMNIST training budgets and the pendulum tau" --
+# so `S5_TASK.budget.steps`, `PSMNIST_TASK.budget.epochs`, and
+# `PENDULUM_TASK.fit_threshold` (tau) below are PILOT-PLACEHOLDER values:
+# reasonable starting points (S5's mirrors probes.py's historical
+# MAX_STEPS=1600 default; psMNIST's is a conservative epoch count for a
+# 50k-row set; tau is chosen below the "predict the noisy observation
+# verbatim" baseline MSE so the threshold demands real denoising), each
+# easily overridden from the lab driver's CLI (`--steps`/`--epochs`/
+# `--fit-threshold` are NOT how tau is overridden -- tau is a TaskSpec
+# field, not a Budget field; a pilot script overrides it by constructing
+# its own `TaskSpec` via `dataclasses.replace(PENDULUM_TASK, ...)` rather
+# than through the lab driver's CLI) -- never treated as frozen until the
+# pilot task records its calibration in the round entries.
+#
+# MQAR's budget is NOT named in spec §4's pilot-calibration list (only S5,
+# psMNIST, and pendulum's tau are) -- its `steps`/`eval_every` below are a
+# committed working default (associative recall at T=64/8-pairs converges
+# quickly at this model scale in the literature this task cites), not a
+# formal pilot-gated placeholder, though still CLI-overridable like every
+# other task's budget.
+
+S5_TASK = TaskSpec(
+    name="s5",
+    loss_mode="dense",
+    data=make_s5,
+    fit_metric="val128",
+    fit_threshold=0.99,
+    fit_direction="ge",
+    robustness=(0.98, 0.99, 0.995),
+    eval_protocol=(EvalConfig(T=256), EvalConfig(T=512), EvalConfig(T=1024)),
+    budget=Budget(lr=3e-3, batch_size=128, steps=1600, eval_every=100),  # PILOT-PLACEHOLDER
+    seeds=36,
+)
+
+MQAR_TASK = TaskSpec(
+    name="mqar",
+    loss_mode="masked_query",
+    data=make_mqar,
+    fit_metric="val_qacc",
+    fit_threshold=0.99,
+    fit_direction="ge",
+    robustness=(0.98, 0.99, 0.995),
+    eval_protocol=(
+        EvalConfig(T=256, num_pairs=16),
+        EvalConfig(T=256, num_pairs=32),
+    ),
+    budget=Budget(lr=3e-3, batch_size=128, steps=1600, eval_every=100),
+    seeds=36,
+)
+
+PSMNIST_TASK = TaskSpec(
+    name="psmnist",
+    loss_mode="last_step",
+    data=make_psmnist_loader,
+    fit_metric="val_acc",
+    fit_threshold=0.90,
+    fit_direction="ge",
+    robustness=(0.88, 0.90, 0.92),
+    eval_protocol=(),  # test-set accuracy reported directly (spec §4); no length/pair-count generalization axis
+    budget=Budget(lr=3e-3, batch_size=128, epochs=10),  # PILOT-PLACEHOLDER
+    seeds=12,
+)
+
+# PILOT-PLACEHOLDER: pure-noise-copy baseline MSE is 2 * PENDULUM_OBS_NOISE_STD**2
+# = 0.005 (predicting the noisy observation `x` verbatim for `y` gives error ==
+# the observation noise on both of the 2 dims); PENDULUM_TAU sits below that so
+# the fit threshold demands genuine denoising, not a no-op copy. Not yet
+# pilot-calibrated (spec §4) -- a later pilot task overrides this field (e.g.
+# via `dataclasses.replace(PENDULUM_TASK, fit_threshold=..., robustness=...)`)
+# and freezes it in the round entries before the pendulum seed matrix runs.
+PENDULUM_TAU = 0.003
+
+PENDULUM_TASK = TaskSpec(
+    name="pendulum",
+    loss_mode="regression",
+    data=make_pendulum,
+    fit_metric="val_mse",
+    fit_threshold=PENDULUM_TAU,
+    fit_direction="le",
+    robustness=(1.25 * PENDULUM_TAU, PENDULUM_TAU, 0.8 * PENDULUM_TAU),
+    eval_protocol=(),  # no post-selection generalization sweep defined by spec §4 beyond the fit metric itself
+    budget=Budget(lr=3e-3, batch_size=128, steps=1600, eval_every=100),
+    seeds=36,
+)
+
+TASKS: dict[str, TaskSpec] = {
+    "s5": S5_TASK,
+    "mqar": MQAR_TASK,
+    "psmnist": PSMNIST_TASK,
+    "pendulum": PENDULUM_TASK,
+}
