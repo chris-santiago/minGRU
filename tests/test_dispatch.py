@@ -17,7 +17,10 @@ Sections
 4. invalid MINGRU_SCAN -- raises ValueError
 5. auto warn-once fallback -- warns exactly once, then returns to eager
 6. DeltaMinGRU dispatch seam -- same auto/eager/triton contract, mirrored
-   for ``_dispatch_delta_scan``/``_delta_scan_should_try``
+   for ``_dispatch_delta_scan``/``_delta_scan_should_try``, plus the ``auto``
+   shape-gate region (``T >= 16 * chunk_size`` AND ``d_k <= 16``): in-region
+   auto engages, out-of-region auto stays eager silently (no warning),
+   triton-mode ignores the region
 7. DeltaMinGRU envelope violations -- each ``_delta_envelope_reason``
    rejection carries a distinct reason string (CPU-testable directly, since
    it takes plain descriptors rather than tensors)
@@ -223,9 +226,9 @@ class TestAutoWarnOnceFallback:
 
 class TestDeltaEagerMode:
     def test_eager_never_tries_the_kernel(self, monkeypatch):
-        """The pre-gate declines even for a CUDA-resident input under eager."""
+        """The pre-gate declines even for an in-region CUDA input under eager."""
         monkeypatch.setenv("MINGRU_SCAN", "eager")
-        assert mg._delta_scan_should_try(True) is False
+        assert mg._delta_scan_should_try(True, T=1024, chunk_size=16, d_k=16) is False
 
     def test_eager_forward_never_imports_triton(self, monkeypatch):
         monkeypatch.setenv("MINGRU_SCAN", "eager")
@@ -240,13 +243,59 @@ class TestDeltaEagerMode:
 class TestDeltaAutoModeCPU:
     def test_auto_default_stays_eager(self):
         # MINGRU_SCAN unset -> defaults to auto; CPU input -> stays eager.
-        assert mg._delta_scan_should_try(False) is False
+        assert mg._delta_scan_should_try(False, T=1024, chunk_size=16, d_k=16) is False
         torch.manual_seed(SEED)
         layer = mg.DeltaMinGRU(input_size=6, hidden_size=8, n_heads=2, nh=1)
         x = torch.randn(2, 5, 6)
         y = layer(x)
         assert y.shape == (2, 5, 8)
         assert _TRITON_MODULE not in sys.modules
+
+
+class TestDeltaAutoRegionGate:
+    """The ``auto`` shape-gate: engage only in the measured win region.
+
+    ``auto`` engages the DeltaMinGRU kernel only when ``T >= 16 * chunk_size``
+    AND ``d_k <= 16`` (the L4 win region; see ``_delta_scan_should_try`` and
+    experiments/bench/gpu_delta_probe.md). Out-of-region ``auto`` stays eager
+    SILENTLY -- that is the designed default, not a degradation, so no fallback
+    warning fires. Explicit ``triton`` skips the region gate entirely. The
+    gate is unit-testable on CPU because ``_delta_scan_should_try`` takes
+    ``is_cuda`` as a plain bool -- passing ``True`` simulates a CUDA input
+    without a device (the same stand-in trick the warn-once tests use for
+    ``_FakeCudaTensor``).
+    """
+
+    def test_in_region_auto_engages(self, monkeypatch):
+        # Boundary of both conditions: T == 16 * chunk_size, d_k == 16.
+        monkeypatch.setenv("MINGRU_SCAN", "auto")
+        assert mg._delta_scan_should_try(True, T=16 * 16, chunk_size=16, d_k=16) is True
+
+    def test_out_of_region_short_sequence_stays_eager_silently(self, monkeypatch):
+        monkeypatch.setenv("MINGRU_SCAN", "auto")
+        with warnings.catch_warnings(record=True) as records:
+            warnings.simplefilter("always")
+            # T one below the 16-chunk floor -> out of region.
+            engaged = mg._delta_scan_should_try(True, T=16 * 16 - 1, chunk_size=16, d_k=16)
+        assert engaged is False
+        assert records == []  # designed default -> no warning
+
+    def test_out_of_region_wide_dk_stays_eager_silently(self, monkeypatch):
+        monkeypatch.setenv("MINGRU_SCAN", "auto")
+        with warnings.catch_warnings(record=True) as records:
+            warnings.simplefilter("always")
+            # Long sequence but d_k above the region cap -> out of region.
+            engaged = mg._delta_scan_should_try(True, T=1024, chunk_size=16, d_k=32)
+        assert engaged is False
+        assert records == []
+
+    def test_triton_mode_ignores_region_full_envelope(self, monkeypatch):
+        """``triton`` drives the full envelope: the region gate is skipped."""
+        monkeypatch.setenv("MINGRU_SCAN", "triton")
+        # An out-of-region shape (short T, wide d_k) still attempts under triton,
+        # regardless of CUDA residency (triton fails loud downstream, never gates).
+        assert mg._delta_scan_should_try(True, T=64, chunk_size=64, d_k=64) is True
+        assert mg._delta_scan_should_try(False, T=64, chunk_size=64, d_k=64) is True
 
 
 class TestDeltaTritonModeCPU:

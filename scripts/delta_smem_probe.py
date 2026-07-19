@@ -1,22 +1,29 @@
-"""One-shot L4 diagnostic: does the fused delta backward engage, per envelope class?
+"""One-shot L4 diagnostic: per-forward-kernel SMEM for the delta path, per class.
 
-Ground-truth instrument for the Task 6b SMEM tuning loop. Three successive
-analytic shared-memory models each missed an envelope class (the compiler's
-operand staging is not reliably predictable from first principles), so this
-probe replaces estimation with measurement: for every envelope class
+Ground-truth instrument for the delta forward-trio SMEM budget. Three
+successive analytic shared-memory models each missed an envelope class (the
+compiler's operand staging is not reliably predictable from first principles),
+so this probe replaces estimation with measurement: for every envelope class
 (d_k x (nh, chunk_size)), it drives ``delta_scan_impl`` forward + backward on
 tiny tensors and reports, per class:
 
-- whether the fused backward ENGAGED or fell back (with the parsed
-  ``Required: <bytes>`` from the OutOfResources message when it didn't), and
+- whether the forward kernels ENGAGED (launched) or the delta path declined /
+  failed (with the parsed ``Required: <bytes>`` from an OutOfResources message
+  when present), and
 - the actual compiled shared-memory size (``metadata.shared``) of every delta
-  kernel newly compiled for that class, straight from the Triton JIT cache.
+  FORWARD kernel newly compiled for that class, straight from the Triton JIT
+  cache.
+
+The backward is now the torch-composed reverse-chunk loop (the fused Triton
+backward was measured 8-12x slower than compile on L4 and reverted -- see the
+``mingru.triton_scans`` module docstring), so this probe covers the forward
+kernels only; "engaged" means the forward launched.
 
 Output is one ``MINGRU_SMEM <json>`` marked line per class plus a final
 ``MINGRU_SMEM_DONE <json>`` summary -- the marked-line transport the repo's
-other job scripts use. OOM fallbacks are the *finding*, not a failure: the
-probe exits 0 unless something unexpected breaks, so one cheap job always
-yields the full table.
+other job scripts use. A declined/failed class is the *finding*, not a
+failure: the probe exits 0 unless something unexpected breaks, so one cheap
+job always yields the full table.
 
 Run inside a Lightning job (foreground-only command chain, no keepalive):
 ``cd /tmp/minGRU && python scripts/delta_smem_probe.py``
@@ -27,7 +34,6 @@ from __future__ import annotations
 import json
 import re
 import sys
-import warnings
 
 sys.path.insert(0, "src")
 
@@ -44,10 +50,6 @@ _KERNELS = (
     "_delta_prepass_kernel",
     "_delta_state_kernel",
     "_delta_readout_kernel",
-    "_delta_bwd_prepass_kernel",
-    "_delta_bwd_state_kernel",
-    "_delta_bwd_grad_a_kernel",
-    "_delta_bwd_grad_b_kernel",
 )
 
 _REQUIRED_RE = re.compile(r"Required: (\d+)")
@@ -109,18 +111,20 @@ def _probe_class(d_k: int, nh: int, chunk_size: int) -> dict:
 
     before = {name: _cache_snapshot(getattr(ts, name)) for name in _KERNELS}
 
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
+    # "engaged" == the forward kernels launched. The delta path raises
+    # ScanFallback (or a kernel launch/compile error) if the forward declines;
+    # the backward is the torch-composed loop and is not probed here.
+    engaged = True
+    fallback_reason = None
+    required = None
+    try:
         y, H_T = ts.delta_scan_impl(Q, K, V, beta, H0, chunk_size=chunk_size)
         (y.square().sum() + H_T.square().sum()).backward()
-    torch.cuda.synchronize()
-
-    fallback = [
-        str(w.message) for w in caught if issubclass(w.category, ts._DeltaBackwardFallbackWarning)
-    ]
-    required = None
-    if fallback:
-        match = _REQUIRED_RE.search(fallback[0])
+        torch.cuda.synchronize()
+    except Exception as exc:  # ScanFallback or a kernel launch/compile failure
+        engaged = False
+        fallback_reason = f"{type(exc).__name__}: {exc}"
+        match = _REQUIRED_RE.search(str(exc))
         required = int(match.group(1)) if match else None
 
     row = {
@@ -129,9 +133,9 @@ def _probe_class(d_k: int, nh: int, chunk_size: int) -> dict:
         "chunk_size": chunk_size,
         "M": nh * chunk_size,
         "T": T,
-        "engaged": not fallback,
+        "engaged": engaged,
         "oom_required_bytes": required,
-        "fallback_reason": fallback[0] if fallback else None,
+        "fallback_reason": fallback_reason,
         "kernel_smem_bytes": {},
     }
     for name in _KERNELS:

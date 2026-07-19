@@ -116,6 +116,27 @@ _warned_scan_fallback = False
 _warned_angle_fallback = False
 _warned_delta_fallback = False
 
+# DeltaMinGRU chunked-WY kernel: the measured win region for `MINGRU_SCAN=auto`.
+# Basis (stated here directly; measured on an NVIDIA L4, fwd+bwd medians,
+# B=128, on this file's shipping configuration -- Triton forward trio +
+# torch-composed backward): the kernel beat eager only at long sequences with
+# narrow head dims (triton/eager 0.61 at T=1024/d_k=16), was >= 1.04x eager on
+# every other probed shape, and exceeded eager's peak memory at the T=64
+# shape. A follow-up experiment that fused the backward into Triton kernels
+# measured 8-12x slower than torch.compile on the same grid (shared-memory
+# tiling destroyed dot efficiency on the 101 KB part) and is reverted in this
+# same change. The per-shape probe artifact
+# (experiments/bench/gpu_delta_probe.{json,md}) is regenerated on this
+# configuration as part of the round's close; until then it holds the interim
+# fused-backward measurements. So `auto` engages the kernel
+# ONLY when the sequence spans at least `_DELTA_AUTO_MIN_T_CHUNKS` chunks AND
+# the head dim `d_k` is at most `_DELTA_AUTO_MAX_DK`; every other in-envelope
+# shape stays eager under `auto` (silently -- that is the designed default, not
+# a degradation). Explicit `MINGRU_SCAN=triton` ignores this region and drives
+# the FULL kernel envelope (fail-loud), unchanged.
+_DELTA_AUTO_MIN_T_CHUNKS = 16
+_DELTA_AUTO_MAX_DK = 16
+
 
 def _resolve_scan_mode(is_cuda: bool) -> str | None:
     """Validate ``MINGRU_SCAN`` and apply the eager/CPU-``auto`` short-circuit.
@@ -410,7 +431,7 @@ def _dispatch_angle_scan(
     return None
 
 
-def _delta_scan_should_try(is_cuda: bool) -> bool:
+def _delta_scan_should_try(is_cuda: bool, *, T: int, chunk_size: int, d_k: int) -> bool:
     """Cheap pre-check: should the DeltaMinGRU chunked-WY kernel be attempted?
 
     Thin wrapper over ``_resolve_scan_mode`` -- returns ``False`` (run the
@@ -425,10 +446,28 @@ def _delta_scan_should_try(is_cuda: bool) -> bool:
     optimization for the CPU/eager path, not a correctness dependency
     ``_dispatch_delta_scan`` relies on).
 
+    Region gate (``auto`` only): even on CUDA, ``auto`` engages the kernel
+    ONLY inside the measured win region -- the sequence spans at least
+    ``_DELTA_AUTO_MIN_T_CHUNKS`` chunks (``T >= _DELTA_AUTO_MIN_T_CHUNKS *
+    chunk_size``) AND ``d_k <= _DELTA_AUTO_MAX_DK`` (see those constants'
+    comment and experiments/bench/gpu_delta_probe.md). An out-of-region
+    ``auto`` call returns ``False`` here, so it pays no layout assembly and
+    fires NO fallback warning: staying eager is the designed default for
+    those shapes, not a degradation (``_dispatch_delta_scan`` reserves its
+    warn-once for genuine CUDA-``auto`` declines -- unavailability or
+    out-of-ENVELOPE). Explicit ``MINGRU_SCAN=triton`` skips this region gate
+    entirely and drives the full envelope, fail-loud, unchanged.
+
     Parameters
     ----------
     is_cuda : bool
         Whether the mixer's input is CUDA-resident.
+    T : int
+        Sequence length of the input.
+    chunk_size : int
+        The mixer's UT-transform chunk size (``self.chunk_size``).
+    d_k : int
+        The mixer's per-head key/query dimension (``self.d_k``).
 
     Returns
     -------
@@ -440,7 +479,15 @@ def _delta_scan_should_try(is_cuda: bool) -> bool:
     ValueError
         If ``MINGRU_SCAN`` is not one of ``auto``/``eager``/``triton``.
     """
-    return _resolve_scan_mode(is_cuda) is not None
+    mode = _resolve_scan_mode(is_cuda)
+    if mode is None:
+        return False  # eager, or auto with CPU inputs (silent, import-free)
+    if mode == "auto" and not (
+        T >= _DELTA_AUTO_MIN_T_CHUNKS * chunk_size and d_k <= _DELTA_AUTO_MAX_DK
+    ):
+        # Out-of-region auto: designed-default eager, no assembly, no warning.
+        return False
+    return True
 
 
 def _dispatch_delta_scan(
@@ -3130,18 +3177,21 @@ class DeltaMinGRU(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """CUDA chunked-WY fast path for ``forward`` (returns ``None`` off-path).
 
-        On CUDA under ``MINGRU_SCAN=auto``/``triton`` and inside the
-        kernel's shape envelope, this assembles the same ``q``/``ks``/
-        ``vs``/``betas`` heads ``_coeffs`` produces and routes them through
-        the Triton chunked-WY kernel via ``_dispatch_delta_scan``, which
-        owns the permute into/out of the kernel's spec-section-6 layout. On
-        CPU, under ``eager``, or when the kernel declines (out-of-envelope
-        or unavailable under ``auto``), this returns ``None`` -- without
-        importing ``triton_scans`` at all on the CPU/eager path (mirrors
-        ``_angle_scan_should_try``'s gate), or after a warn-once fallback on
-        the CUDA ``auto`` path -- so ``forward`` runs its unchanged
-        ``_forward_chunked`` eager path, byte-identical to the recorded
-        eager evidence path in both cases.
+        On CUDA under ``MINGRU_SCAN=triton`` (full kernel envelope) or under
+        ``MINGRU_SCAN=auto`` inside the measured win region (long sequences,
+        narrow ``d_k`` -- see ``_delta_scan_should_try``), this assembles the
+        same ``q``/``ks``/``vs``/``betas`` heads ``_coeffs`` produces and
+        routes them through the Triton chunked-WY kernel via
+        ``_dispatch_delta_scan``, which owns the permute into/out of the
+        kernel's spec-section-6 layout. On CPU, under ``eager``, for an
+        out-of-region ``auto`` shape, or when the kernel declines
+        (out-of-envelope or unavailable under ``auto``), this returns
+        ``None`` -- without importing ``triton_scans`` at all on the
+        CPU/eager/out-of-region path (mirrors ``_angle_scan_should_try``'s
+        gate), or after a warn-once fallback on an in-region CUDA ``auto``
+        decline -- so ``forward`` runs its unchanged ``_forward_chunked``
+        eager path, byte-identical to the recorded eager evidence path in
+        every case.
 
         Parameters
         ----------
@@ -3160,7 +3210,9 @@ class DeltaMinGRU(nn.Module):
             d_v)``) if the kernel ran; ``None`` to fall through to
             ``_forward_chunked``.
         """
-        if not _delta_scan_should_try(x.is_cuda):
+        if not _delta_scan_should_try(
+            x.is_cuda, T=x.shape[1], chunk_size=self.chunk_size, d_k=self.d_k
+        ):
             return None
         q, ks, vs, betas = self._coeffs(x)
         return _dispatch_delta_scan(q, ks, vs, betas, H, chunk_size=self.chunk_size)
