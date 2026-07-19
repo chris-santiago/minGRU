@@ -2677,12 +2677,30 @@ if _HAS_TRITON:
         dKK = dT * beta_tile[None, :] * strict  # (BLOCK_M, BLOCK_M)
         dbetaa_local = tl.sum(dT * KK * strict, axis=0)  # (BLOCK_M,)
 
+        # dV = G, stored early (before the dKa loop below) and barriered so the
+        # loop can reload 16-wide d_v slices of G from global instead of
+        # staging the full (BLOCK_M, BLOCK_V) G as a -G Hc^T dot operand. That
+        # full-width G, resident alongside the (M, M) dKK the loop also needs,
+        # was the measured d_k=64 SMEM overrun (dKK 65536 + G 32768 + a K slice
+        # co-staged in one program). tl.debug_barrier() is required: Triton
+        # does not order a global-memory read-after-write across threads
+        # within one program, only program order within a single thread, so
+        # the store must be visible to every thread before any thread reloads.
+        tl.store(
+            dV_ptr + V_base + m[:, None] * d_v + vv[None, :],
+            G,
+            mask=row_valid[:, None] & vcol[None, :],
+        )
+        tl.debug_barrier()
+
         # dK solve-derived terms = -G Hc^T + dKK K + dKK^T K, output-blocked over
         # d_k into 16-wide column sub-tiles stored straight to global. Output
         # columns are the d_k index, so blocking is exact (columns independent):
-        # -G Hc^T's column kcols is -dot(G, (Hc rows kcols)^T), and dKK K's is
-        # dot(dKK, K[:, kcols]). The (M, M) dKK thus only ever pairs with a
-        # narrow (M, 16) K slice or (16, V) Hc slice -- never a wide operand.
+        # dKK K's column kcols is dot(dKK, K[:, kcols]); -G Hc^T's column kcols
+        # is -dot(G, Hc[kcols, :]^T), further contraction-blocked over d_v below
+        # so G is never a full-width dot operand either. The (M, M) dKK thus
+        # only ever pairs with a narrow (M, 16) K slice, and G only ever pairs
+        # with a narrow (M, 16) reloaded slice of itself -- never a wide operand.
         for kb in tl.static_range(BLOCK_K // 16):
             kcols = kb * 16 + tl.arange(0, 16)
             kcmask = kcols < d_k
@@ -2691,26 +2709,37 @@ if _HAS_TRITON:
                 mask=row_valid[:, None] & kcmask[None, :],
                 other=0.0,
             ).to(tl.float32)  # (BLOCK_M, 16)
-            Hblk = tl.load(
-                Hbound_ptr + Hb_base + kcols[:, None] * d_v + vv[None, :],
-                mask=kcmask[:, None] & vcol[None, :],
-                other=0.0,
-            ).to(tl.float32)  # (16, BLOCK_V) -- Hc rows kcols
             dKablk = tl.dot(dKK, Kblk, input_precision="ieee")  # (BLOCK_M, 16)
             dKablk += tl.dot(tl.trans(dKK), Kblk, input_precision="ieee")
-            dKablk -= tl.dot(G, tl.trans(Hblk), input_precision="ieee")
+
+            # -G Hc^T's column kcols, contraction-blocked over d_v (the free
+            # axis of G / the row axis of Hc^T): each 16-wide d_v sub-block
+            # reloads its slice of G from dV_ptr (written above) and the
+            # matching (kcols, vcols) tile of Hc, and accumulates in registers
+            # -- the identical idiom to the dKK K blocking above, applied to
+            # the contraction dimension instead of the output dimension. Exact
+            # fp32 re-association (contraction split, same class as KK/S/dbU).
+            for vb in tl.static_range(BLOCK_V // 16):
+                vcols = vb * 16 + tl.arange(0, 16)
+                vcm = vcols < d_v
+                Gblk = tl.load(
+                    dV_ptr + V_base + m[:, None] * d_v + vcols[None, :],
+                    mask=row_valid[:, None] & vcm[None, :],
+                    other=0.0,
+                ).to(tl.float32)  # (BLOCK_M, 16)
+                Hcblk = tl.load(
+                    Hbound_ptr + Hb_base + kcols[:, None] * d_v + vcols[None, :],
+                    mask=kcmask[:, None] & vcm[None, :],
+                    other=0.0,
+                ).to(tl.float32)  # (16, 16) -- Hc[kcols, vcols]
+                dKablk -= tl.dot(Gblk, tl.trans(Hcblk), input_precision="ieee")
+
             tl.store(
                 dKa_ptr + K_base + m[:, None] * d_k + kcols[None, :],
                 dKablk,
                 mask=row_valid[:, None] & kcmask[None, :],
             )
 
-        # dV = G; dbeta T-build term.
-        tl.store(
-            dV_ptr + V_base + m[:, None] * d_v + vv[None, :],
-            G,
-            mask=row_valid[:, None] & vcol[None, :],
-        )
         tl.store(
             dbetaa_ptr + beta_base + m,
             dbetaa_local,
