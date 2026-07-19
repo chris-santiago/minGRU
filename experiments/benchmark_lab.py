@@ -18,8 +18,24 @@ Models are built through the packaged mixer registry path
 pattern): `ARM_REGISTRY` fixes the five arm configs from the round's
 Global Constraints (`log`, `signed`, `rotation`, `givens` at
 block_size=8/rounds=3, `delta` at its promoted native-state default
-nh=2/n_heads=4/d_k=16/d_v=16), d_model=64, 2 pre-norm blocks. No new
-mixer code -- every arm is an existing packaged class, called through
+nh=2/n_heads=4/d_k=16/d_v=16), d_model=64, 2 pre-norm blocks, plus a sixth
+arm, `rotation-hetero`, added by amendment at the evidence-phase gate
+(`.claude/output/intent/2026-07-19-benchmark-round-intent.md`, Amendments):
+`rotation`'s pure 2-block stack is `MinGRUStack`'s documented STE-
+compounding broken baseline (more than one `"rotation"` block always
+warns once at construction, unconditional on `snap` -- see
+`MinGRUStack`'s docstring); the round runs it as-is AND adds
+`rotation-hetero` -- one `"rotation"` block (default snap grid) composed
+with one `"signed"` block, mirroring `probes.py`'s `"minGRU-hetero-rs"`
+row -- this repo's evidenced fix for rotation-stack STE compounding
+(not a snap on/off comparison against `rotation`: both arms' rotation
+block uses the same default snap grid; the fix is the composition, not
+the snap setting), which avoids the multi-rotation warning (a single
+`"rotation"` entry in a mixed stack doesn't warn). See `ARM_REGISTRY`'s
+own comment for the full rationale, including why a same-type second
+reading was tried and rejected (byte-identical to `rotation`, caught by
+`tests/test_report_benchmarks.py`'s distinct-param-count invariant). No
+new mixer code -- every arm is an existing packaged class, called through
 `MinGRUStack`'s `mixer=`/`mixer_kwargs=` contract.
 
 Usage:
@@ -91,11 +107,47 @@ RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lab_results.
 # Registry keys -> (MinGRUStack mixer name, mixer_kwargs) -- the five arm
 # configs fixed by the round's Global Constraints (probes.py's
 # MIXER_REGISTRY/build() pattern, generalized to this round's five packaged
-# mixers instead of probes.py's historical model names).
-ARM_REGISTRY: dict[str, tuple[str, dict]] = {
+# mixers instead of probes.py's historical model names), plus the amended
+# sixth arm below. mixer is a `str` (one type, every block, flat kwargs)
+# for five of the six arms; `rotation-hetero` is the one `list[str]` arm
+# (per-block mixer types, kwargs keyed by type name or `None` -- see
+# `MinGRUStack`'s own docstring for this schema).
+#
+# rotation-hetero: a single "rotation" block (RotationMinGRU's own default
+# snap grid, (2, 3, 4, 6) -- the same default the plain "rotation" arm's
+# blocks already use) composed with a single "signed" block (decoupled
+# tanh default -- same config as this round's own "signed" arm), mirroring
+# probes.py's "minGRU-hetero-rs" MIXER_REGISTRY row exactly
+# (`(["rotation", "signed"], None)`). This is NOT a snap on/off comparison
+# against "rotation" -- both arms' rotation block snaps identically by
+# default; the difference is the composition. It is this repo's evidenced
+# fix for the rotation-stack STE-compounding problem: a homogeneous
+# 2-block "rotation" stack (this round's plain "rotation" arm, unchanged,
+# run "as is") is `MinGRUStack`'s documented broken baseline (more than
+# one "rotation" block always warns, unconditional on `snap` -- see its
+# docstring); pairing rotation-hetero with a SECOND identical rotation
+# block instead of "signed" would be architecturally byte-identical to
+# "rotation" (same param count, same per-seed training trajectory, zero
+# new information for real GPU spend -- caught by
+# tests/test_report_benchmarks.py's "every arm's param count is distinct"
+# invariant when first tried). Composing with "signed" instead: (a) is a
+# genuinely different, non-duplicate construction (different param count,
+# different weights); (b) avoids `MinGRUStack`'s multi-rotation
+# UserWarning (a single "rotation" entry in a mixed stack does not warn --
+# see its docstring), unlike "rotation" itself, which retains the warning
+# as the documented, unmitigated STE-compounding broken baseline. Not
+# added to DECAY_CAPABLE_ARMS below: probes.py has no established
+# hetero-mixer + decay row to mirror (its hetero-sr/-rs rows only ever run
+# on S3/S3-hier, never the timestamped tasks), so inventing a decay split
+# across two mixer types for the pendulum task would be new, unauthorized
+# design -- rotation-hetero is therefore treated like "delta" on pendulum:
+# dt reaches it only via the log1p(dt) feature-concat channel, never
+# mechanically.
+ARM_REGISTRY: dict[str, tuple[str | list[str], dict | None]] = {
     "log": ("log", {}),
     "signed": ("signed", {}),
     "rotation": ("rotation", {}),
+    "rotation-hetero": (["rotation", "signed"], None),
     "givens": ("givens", {"block_size": 8, "rounds": 3}),
     "delta": ("delta", {"nh": 2, "n_heads": 4, "d_k": 16, "d_v": 16}),
 }
@@ -104,7 +156,10 @@ ARM_REGISTRY: dict[str, tuple[str, dict]] = {
 # "learnable"/"fixed" and a delta_t argument). DeltaMinGRU is deliberately
 # excluded: its constructor rejects any decay is not None (frozen contract,
 # see its class docstring) -- pendulum's dt reaches it only via the
-# feature-concat channel below, never mechanically.
+# feature-concat channel below, never mechanically. rotation-hetero is
+# excluded for the same reason (see ARM_REGISTRY's comment): no
+# established repo precedent for splitting decay across a hetero
+# rotation+signed stack, so this round doesn't invent one.
 DECAY_CAPABLE_ARMS = {"log", "signed", "rotation", "givens"}
 
 
@@ -119,7 +174,7 @@ class TokenSequenceModel(nn.Module):
         self,
         vocab: int,
         n_cls: int,
-        mixer: str,
+        mixer: str | list[str],
         mixer_kwargs: dict,
         n_layers: int = N_LAYERS,
         d_model: int = D_MODEL,
@@ -147,7 +202,7 @@ class FeatureSequenceModel(nn.Module):
         self,
         input_size: int,
         n_out: int,
-        mixer: str,
+        mixer: str | list[str],
         mixer_kwargs: dict,
         n_layers: int = N_LAYERS,
         d_model: int = D_MODEL,
@@ -184,11 +239,18 @@ def _model_shape(task_name: str) -> tuple[int, int]:
 
 def build_model(task: TaskSpec, arm: str) -> nn.Module:
     """Construct `arm`'s model for `task` via `ARM_REGISTRY` (spec §6
-    arm configs) and `task.loss_mode` (spec §6 batch contracts)."""
+    arm configs) and `task.loss_mode` (spec §6 batch contracts).
+
+    `arm_kwargs` is `None` for `rotation-hetero` (the one list-mixer arm --
+    `MinGRUStack`'s own convention for "no per-type overrides", see its
+    docstring); every other arm's `arm_kwargs` is a flat dict, possibly
+    empty. `dict(x) if x else {}` normalizes both to a real dict here
+    (mirroring `MinGRUBlock.__init__`'s own `mixer_kwargs` normalization)
+    so downstream code never juggles `None`."""
     if arm not in ARM_REGISTRY:
         raise ValueError(f"unknown arm {arm!r}; expected one of {sorted(ARM_REGISTRY)}")
     mixer, arm_kwargs = ARM_REGISTRY[arm]
-    mixer_kwargs = dict(arm_kwargs)
+    mixer_kwargs = dict(arm_kwargs) if arm_kwargs else {}
     in_dim, out_dim = _model_shape(task.name)
     if task.loss_mode in ("dense", "masked_query"):
         return TokenSequenceModel(in_dim, out_dim, mixer, mixer_kwargs)
@@ -791,7 +853,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--selftest", action="store_true", help="tiny model, few steps, all four tasks; exits after")
     p.add_argument("--round", help="ledger round tag, e.g. bench-s5-01")
     p.add_argument("--task", choices=sorted(TASKS), help="s5 | mqar | psmnist | pendulum")
-    p.add_argument("--model", choices=sorted(ARM_REGISTRY), help="log | signed | rotation | givens | delta")
+    p.add_argument(
+        "--model",
+        choices=sorted(ARM_REGISTRY),
+        help="log | signed | rotation | rotation-hetero | givens | delta",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--lr", type=float, default=None, help="override TaskSpec.budget.lr")
     p.add_argument("--batch-size", type=int, default=None, help="override TaskSpec.budget.batch_size")

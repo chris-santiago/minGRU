@@ -18,18 +18,29 @@ Sections
    and the task's fit-metric key inside `ckpt`, for all four tasks.
 4. Ledger dedup -- a duplicate (round, task, variant, seed) is not
    appended twice.
-5. Model construction -- `build_model` wires each of the five arms
+5. Model construction -- `build_model` wires each of the six arms
    through `MinGRUStack` with the registry's mixer/mixer_kwargs, and the
    pendulum task's decay wiring matches `DECAY_CAPABLE_ARMS`.
 6. Checkpoint-required guard -- `run_arm` raises rather than assembling a
    row around the sentinel metric when no checkpoint was ever selected
    (step-based: `eval_every` never divides a step in `[1, steps]`;
    epoch-based: `epochs=0`).
+7. `rotation-hetero` arm (evidence-phase-gate amendment) -- registered as a
+   `["rotation", "signed"]` hetero stack (mirroring probes.py's
+   `minGRU-hetero-rs`), this repo's evidenced fix for rotation-stack STE
+   compounding (not a snap on/off comparison -- both arms' rotation block
+   snaps identically by default). It avoids `MinGRUStack`'s multi-rotation
+   `UserWarning` (unlike `rotation`, unchanged, which still emits it),
+   excludes pendulum decay wiring (mirrors `delta`'s feature-channel-only
+   treatment), and has a param count distinct from `rotation`'s -- see
+   `ARM_REGISTRY`'s comment in `benchmark_lab.py` for the full rationale,
+   including the same-type reading that was tried and rejected.
 """
 
 from __future__ import annotations
 
 import json
+import warnings
 from dataclasses import replace
 
 import pytest
@@ -357,6 +368,73 @@ def test_run_arm_raises_on_epoch_based_task_with_zero_epochs():
             device="cpu",
             dry_run=True,
         )
+
+
+# ----------------------------------------------- 7. rotation-hetero arm (amendment)
+def test_rotation_hetero_arm_registered_as_rotation_signed_hetero_stack():
+    """`rotation-hetero` (evidence-phase-gate amendment, sixth arm) is a
+    single `"rotation"` block (default snap grid) composed with a single
+    `"signed"` block, `mixer_kwargs=None` -- byte-identical to probes.py's
+    `MIXER_REGISTRY["minGRU-hetero-rs"]`, this repo's evidenced fix for
+    rotation-stack STE compounding. A same-type second `"rotation"`
+    reading was tried first and rejected: it would be architecturally
+    identical to the existing `rotation` arm (same param count, same
+    per-seed training trajectory -- RotationMinGRU's `snap` is a
+    registered buffer, not a parameter, and `mixer_kwargs={}` already
+    resolves to the class's own default snap grid), caught by
+    `tests/test_report_benchmarks.py`'s "every arm's param count is
+    distinct" invariant. See `ARM_REGISTRY`'s comment in
+    `benchmark_lab.py` for the full rationale."""
+    assert "rotation-hetero" in ARM_REGISTRY
+    mixer, kwargs = ARM_REGISTRY["rotation-hetero"]
+    assert mixer == ["rotation", "signed"]
+    assert kwargs is None
+
+
+def test_rotation_hetero_does_not_emit_the_multi_rotation_warning_unlike_rotation():
+    """`rotation` (unchanged, run "as is") builds a 2-block, single-mixer-
+    type `"rotation"` stack -- `MinGRUStack`'s multi-rotation `UserWarning`
+    fires unconditionally on rotation-block COUNT
+    (`mixer_list.count("rotation") > 1`), so it warns every construction.
+    `rotation-hetero`'s hetero stack has only ONE `"rotation"` entry
+    (mixed with `"signed"`), and a single `"rotation"` entry in a mixed
+    stack does not warn (see `MinGRUStack`'s docstring) -- this is the
+    concrete, checkable difference between the documented broken baseline
+    and this repo's evidenced fix for it."""
+    task = TASKS["s5"]
+    with pytest.warns(UserWarning, match="more than one 'rotation' block"):
+        build_model(task, "rotation")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        build_model(task, "rotation-hetero")
+
+
+def test_rotation_hetero_pendulum_wiring_matches_delta_feature_channel_only():
+    """`rotation-hetero` is deliberately excluded from `DECAY_CAPABLE_ARMS`
+    (no established repo precedent for splitting decay across a hetero
+    rotation+signed stack -- see `ARM_REGISTRY`'s comment): on the
+    pendulum task it must reach `dt` only via the `log1p(dt)` feature-
+    concat channel, the same treatment `delta` gets, never mechanically
+    through the stack's decay path."""
+    assert "rotation-hetero" not in DECAY_CAPABLE_ARMS
+    task = TASKS["pendulum"]
+    model = build_model(task, "rotation-hetero")
+    for block in model.stack.blocks:
+        assert block.mingru.decay is None
+
+
+def test_rotation_and_rotation_hetero_have_distinct_param_counts():
+    """Direct local pin of the same invariant
+    `tests/test_report_benchmarks.py::test_param_counts_are_positive_and_vary_by_task_and_arm`
+    checks at the report layer: the two rotation-family arms must build
+    genuinely different models, not the same architecture under two
+    names."""
+    task = TASKS["s5"]
+    rotation_params = sum(p.numel() for p in build_model(task, "rotation").parameters())
+    rotation_hetero_params = sum(
+        p.numel() for p in build_model(task, "rotation-hetero").parameters()
+    )
+    assert rotation_params != rotation_hetero_params
 
 
 # ------------------------------------------------------ TaskSpec singletons

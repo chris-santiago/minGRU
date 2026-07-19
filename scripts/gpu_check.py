@@ -80,18 +80,25 @@ Job modes (``--job``, default ``check``, existing invocations unaffected):
 
 ``benchmarks`` (accepted-benchmark validation round, Task 6, consumes Task 5)
   Runs ``scripts/gpu_benchmark_campaign.py`` instead: the four-task x
-  five-arm benchmark validation round (S5, MQAR, psMNIST, pendulum -- see
+  six-arm benchmark validation round (S5, MQAR, psMNIST, pendulum -- see
   ``.claude/output/specs/2026-07-19-benchmark-round-design.md`` sections 4
-  and 6). Same clone/checkout/triton-install preamble as ``hetero36``, plus
-  a ``torchvision`` install (psMNIST downloads MNIST inside the job -- see
-  ``build_benchmarks_command``). ``--tasks``/``--arms``/``--seeds`` pass
-  through to the campaign script's own CLI when given (default: its own
-  defaults, every task/arm/seed); the production command NEVER passes
-  ``--steps`` -- that flag is a local-smoke-only override that shrinks the
-  campaign's eval cadence, not a production budget knob (spec section 7:
-  "no per-arm tuning"; the committed ``TaskSpec`` budgets are frozen).
-  Foreground-only, no-keepalive command chain -- see
-  ``build_delta_probe_command``'s docstring for why.
+  and 6, plus the amended sixth ``rotation-hetero`` arm recorded in the
+  intent ledger's Amendments). Same clone/checkout/triton-install preamble
+  as ``hetero36``, plus a ``torchvision`` install (psMNIST downloads MNIST
+  inside the job -- see ``build_benchmarks_command``) and an
+  ``export MINGRU_SCAN=triton`` ahead of the campaign invocation (evidence-
+  phase-gate amendment, "Triton everywhere" -- every seed matrix in this
+  round runs under a uniform Triton scan backend on L4; the
+  ``MINGRU_SCAN`` contract itself is unchanged, so a task/arm combination
+  with no Triton path fails loud rather than downgrading silently).
+  ``--tasks``/``--arms``/``--seeds`` pass through to the campaign script's
+  own CLI when given (default: its own defaults, every task/arm/seed); the
+  production command NEVER passes ``--steps`` -- that flag is a
+  local-smoke-only override that shrinks the campaign's eval cadence, not
+  a production budget knob (spec section 7: "no per-arm tuning"; the
+  committed ``TaskSpec`` budgets are frozen). Foreground-only,
+  no-keepalive command chain -- see ``build_delta_probe_command``'s
+  docstring for why.
 
   After the job completes, this script fetches its logs, extracts every
   ``MINGRU_LAB_ROW`` line (guarded parse, malformed lines skipped -- see
@@ -100,7 +107,7 @@ Job modes (``--job``, default ``check``, existing invocations unaffected):
   env line missing/malformed is a clear error exit with nothing appended or
   written, mirroring ``hetero36``'s contract. Unlike ``hetero36``, this
   round's dedup key is the four-field ``(round, task, variant, seed)``
-  (spec section 6's marker-line protocol) -- a task's five arms and 36 (or
+  (spec section 6's marker-line protocol) -- a task's arms and 36 (or
   12, psMNIST) seeds all share one round tag, so ``variant`` (the arm) is
   load-bearing in the key. Rows are bucketed by their own ``task`` field
   (dict rows only, non-empty string ``task`` only -- a row that isn't a
@@ -276,9 +283,25 @@ def build_benchmarks_command(
     only, no keepalive -- see ``build_delta_probe_command``'s docstring for
     why a backgrounded loop outlives a studio-mode job's command chain and
     keeps it billing.
+
+    Exports ``MINGRU_SCAN=triton`` ahead of the campaign invocation (user
+    decision at the evidence-phase gate, recorded in the intent ledger's
+    Amendments -- "Triton everywhere"): every seed matrix in this round
+    runs under a uniform Triton scan backend on L4, and every ledger row
+    this campaign emits records that backend in its own ``config.scan``
+    field (``benchmark_lab.run_arm`` reads ``MINGRU_SCAN`` from the
+    process environment). This is a job-command-only default -- local/
+    campaign-script defaults are untouched (``MINGRU_SCAN`` unset locally
+    still resolves to the scan dispatcher's own ``auto`` default). The
+    ``MINGRU_SCAN`` contract itself is unchanged here: ``triton`` fails
+    loud with a reason rather than silently downgrading (see
+    ``src/mingru/triton_scans.py``), so a task/arm combination this round
+    turns out to have no Triton path for is a clear in-job failure, not a
+    silent fallback.
     """
     steps = _job_preamble_steps(repo, ref)
     steps.append("pip install --no-cache-dir torchvision")
+    steps.append("export MINGRU_SCAN=triton")
     command = "cd /tmp/minGRU && python scripts/gpu_benchmark_campaign.py"
     if tasks:
         command += " --tasks " + " ".join(tasks)
@@ -525,7 +548,7 @@ def _valid_benchmarks_key(row: Any, rounds: tuple[str, ...]) -> tuple[str, str, 
     """Return ``row``'s ``(round, task, variant, seed)`` key if shape-valid, else ``None``.
 
     Sibling to ``_valid_hetero36_key`` for the benchmarks round's four-field
-    dedup key (spec section 6's marker-line protocol): a task's five arms
+    dedup key (spec section 6's marker-line protocol): a task's arms
     and many seeds all share one round tag, so ``variant`` (the arm) must
     be part of the key or two different arms at the same seed would
     collide. Same guard shape as ``_valid_hetero36_key``: ``row`` must be a
@@ -812,7 +835,7 @@ def _build_benchmarks_sidecar(
 
     ``per_variant_seed_wall_secs`` is keyed ``{variant: {seed: secs}}``,
     NOT ``{round: {seed: secs}}`` like ``_build_hetero36_sidecar`` -- one
-    task's rows span up to five arms (variants) at the same seed, and a
+    task's rows span multiple arms (variants) at the same seed, and a
     task's round tag is fixed (one round per task), so keying by round
     first would collide every arm sharing a seed onto the same sub-map.
     Keying by variant first is the direct fix; seed alone was never a
@@ -883,7 +906,7 @@ def _finish_benchmarks(job: Any, ok: bool) -> int:
     Unlike ``_finish_hetero36``, one job covers every task/arm/seed the
     campaign was given, and this round's dedup key is the four-field
     ``(round, task, variant, seed)`` (spec section 6) rather than
-    ``(round, seed)`` -- a task's five arms and many seeds share one round
+    ``(round, seed)`` -- a task's arms and many seeds share one round
     tag, so ``variant`` (the arm) must be in the key. Rows are bucketed by
     their own ``task`` field via ``_row_task`` (a row that isn't a dict, or
     is a dict with no non-empty string ``task``, can't be attributed to any
@@ -999,7 +1022,7 @@ def main() -> int:
         nargs="+",
         default=None,
         help="'benchmarks' job mode only: arm subset passthrough to "
-        "gpu_benchmark_campaign.py's --arms (default: its own default, all five)",
+        "gpu_benchmark_campaign.py's --arms (default: its own default, every arm)",
     )
     ap.add_argument(
         "--seeds",

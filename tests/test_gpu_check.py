@@ -44,7 +44,7 @@ constants -- the real ``experiments/lab_results.jsonl`` and
 The ``benchmarks`` tests (Task 6) cover the accepted-benchmark validation
 round's submitter path: ``_valid_benchmarks_key`` (the four-field
 ``(round, task, variant, seed)`` sibling of ``_valid_hetero36_key`` --
-``variant`` is load-bearing here since a task's five arms share one round
+``variant`` is load-bearing here since a task's arms share one round
 tag), ``_append_benchmarks_rows`` (same shape-guarded dedup contract as
 ``_append_new_rows``, now over the four-field key -- pinning that two arms
 at the same seed are NOT deduped against each other), ``_build_benchmarks_
@@ -56,6 +56,15 @@ I/O targets ``tmp_path`` fixtures via ``monkeypatch`` on the module's
 ``_LEDGER_PATH``/``_DELTA_PROBE_OUT_DIR`` constants -- the real
 ``experiments/lab_results.jsonl`` and ``experiments/bench/bench_*_env.json``
 files are never touched.
+
+The ``build_benchmarks_command`` tests (Task 8b, evidence-phase-gate
+amendment) pin the job command chain itself: ``export MINGRU_SCAN=triton``
+must appear ahead of the campaign invocation ("Triton everywhere" --
+intent ledger Amendments), ``--steps`` must never be passed (production
+budgets are the committed ``TaskSpec`` values), the chain stays a single
+foreground ``&&``-joined string, and ``--tasks``/``--arms``/``--seeds``
+passthrough is unaffected by the new export step. String-only assertions
+against the built command -- no subprocess, no ``lightning_sdk``.
 """
 
 from __future__ import annotations
@@ -79,6 +88,7 @@ _extract_all = gpu_check._extract_all
 _ROW_PREFIX = gpu_check._HETERO36_ROW_PREFIX
 _ENV_PREFIX = gpu_check._HETERO36_ENV_PREFIX
 _ROUNDS = gpu_check._HETERO36_ROUNDS
+build_benchmarks_command = gpu_check.build_benchmarks_command
 
 
 def test_no_matching_line_returns_none():
@@ -777,6 +787,48 @@ def _bench_row(round_name: str, task: str, variant: str, seed: int, secs: float 
         "ckpt": {"step": 3000, "val128": 1.0},
         "config": {"device": "cuda", "torch": "2.8.0"},
     }
+
+
+# --------------------------------------------- build_benchmarks_command
+# Evidence-phase-gate amendment ("Triton everywhere" -- intent ledger
+# Amendments): every seed matrix in this round runs under a uniform
+# MINGRU_SCAN=triton backend on L4, exported ahead of the campaign
+# invocation in the job command chain built here.
+def test_build_benchmarks_command_exports_mingru_scan_triton():
+    command = build_benchmarks_command("git@example.com/repo.git", "deadbeef", None, None, None)
+    assert "export MINGRU_SCAN=triton" in command
+    # The export must precede the campaign invocation it's meant to cover,
+    # not merely appear somewhere in the command chain.
+    assert command.index("export MINGRU_SCAN=triton") < command.index(
+        "python scripts/gpu_benchmark_campaign.py"
+    )
+
+
+def test_build_benchmarks_command_never_passes_steps():
+    # Production budgets are the committed TaskSpec values (spec section 7:
+    # "no per-arm tuning") -- --steps is a local-smoke-only override this
+    # job command must never pass, amendment or not.
+    command = build_benchmarks_command("git@example.com/repo.git", "deadbeef", None, None, None)
+    assert "--steps" not in command
+
+
+def test_build_benchmarks_command_still_single_foreground_chain():
+    # Job command chains are foreground-only (no backgrounded keepalive) --
+    # a single `&&`-joined string, unchanged by the new export step.
+    command = build_benchmarks_command("git@example.com/repo.git", "deadbeef", None, None, None)
+    assert "&" not in command.replace("&&", "")
+    assert "set -eux" in command
+
+
+def test_build_benchmarks_command_passthrough_args_unaffected_by_triton_export():
+    command = build_benchmarks_command(
+        "git@example.com/repo.git", "deadbeef", ["s5"], ["log", "rotation-hetero"], [0, 1]
+    )
+    assert "export MINGRU_SCAN=triton" in command
+    assert "--tasks s5" in command
+    assert "--arms log rotation-hetero" in command
+    assert "--seeds 0 1" in command
+    assert "--steps" not in command
 
 
 def test_valid_benchmarks_key_accepts_well_formed_row():
