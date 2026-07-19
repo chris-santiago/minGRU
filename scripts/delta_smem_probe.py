@@ -46,7 +46,8 @@ _KERNELS = (
     "_delta_readout_kernel",
     "_delta_bwd_prepass_kernel",
     "_delta_bwd_state_kernel",
-    "_delta_bwd_grad_kernel",
+    "_delta_bwd_grad_a_kernel",
+    "_delta_bwd_grad_b_kernel",
 )
 
 _REQUIRED_RE = re.compile(r"Required: (\d+)")
