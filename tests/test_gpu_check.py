@@ -836,6 +836,22 @@ def test_valid_benchmarks_key_accepts_well_formed_row():
     assert gpu_check._valid_benchmarks_key(row, _BENCH_ROUNDS) == (_BENCH_ROUNDS[0], "s5", "log", 0)
 
 
+def test_benchmarks_rounds_accepts_both_pilot_and_current_generations():
+    """`_BENCHMARKS_ROUNDS` must accept BOTH the frozen `-01` pilot tags
+    (old pilot job logs/sidecars must stay parseable) and the current `-02`
+    tags this module reads from `experiments.benchmark_tasks
+    .BENCH_ROUND_TAGS` (pre-matrix technical review, item 1)."""
+    from experiments.benchmark_tasks import BENCH_ROUND_TAGS
+
+    pilot_tags = ("bench-s5-01", "bench-mqar-01", "bench-psmnist-01", "bench-pendulum-01")
+    for tag in pilot_tags:
+        assert tag in _BENCH_ROUNDS
+    for tag in BENCH_ROUND_TAGS.values():
+        assert tag in _BENCH_ROUNDS
+    # No accidental collision between the two generations.
+    assert len(_BENCH_ROUNDS) == len(pilot_tags) + len(BENCH_ROUND_TAGS)
+
+
 def test_valid_benchmarks_key_rejects_non_dict_payload():
     assert gpu_check._valid_benchmarks_key([1, 2, 3], _BENCH_ROUNDS) is None
 

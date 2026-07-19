@@ -220,9 +220,103 @@ def test_row_schema_has_required_keys_and_fit_metric(task_name):
     missing = [k for k in REQUIRED_ROW_KEYS if k not in row]
     assert not missing, f"row missing required key(s) {missing}"
     assert task.fit_metric in row["ckpt"], f"ckpt missing fit-metric key {task.fit_metric!r}"
+    # Honest fit metric (item 5): the selection-time value is kept
+    # alongside the re-evaluated fit-metric value, under a distinct key, for
+    # every task/loss-mode -- never silently dropped.
+    selection_key = f"selection_{task.fit_metric}"
+    assert selection_key in row["ckpt"], f"ckpt missing selection key {selection_key!r}"
     assert row["task"] == task_name
     assert row["variant"] == "log"
     assert row["layers"] == 2
+
+
+def test_psmnist_fit_metric_equals_selection_value_deterministic_val_split():
+    """psMNIST's `val()` iterates in a fixed, non-shuffled order (no seed to
+    vary) -- re-evaluating the selected checkpoint on it must reproduce the
+    selection-time value exactly, not merely approximately."""
+    tiny_tasks = _tiny_task_overrides()
+    row = run_arm(
+        round_tag="test-psmnist-fit-metric",
+        task=tiny_tasks["psmnist"],
+        arm="log",
+        seed=0,
+        device="cpu",
+        dry_run=True,
+    )
+    assert row["ckpt"]["val_acc"] == row["ckpt"]["selection_val_acc"]
+
+
+def test_step_based_fit_metric_reeval_uses_fit_eval_seed(monkeypatch):
+    """The step-based honest-fit-metric re-eval (item 5, "kill the
+    winner's curse") must call `_eval_generator_task` with
+    `seed=FIT_EVAL_SEED` -- distinct from the checkpoint-selection loop's
+    `CKPT_EVAL_SEED` and the generalization sweep's `FINAL_EVAL_SEED` --
+    verified by spying on every call the whole `run_arm` invocation makes,
+    not just asserting the resulting row shape."""
+    import experiments.benchmark_lab as lab
+
+    seen_seeds = []
+    real_eval = lab._eval_generator_task
+
+    def _spy(*args, **kwargs):
+        seen_seeds.append(kwargs.get("seed"))
+        return real_eval(*args, **kwargs)
+
+    monkeypatch.setattr(lab, "_eval_generator_task", _spy)
+    tiny_tasks = _tiny_task_overrides()
+    lab.run_arm(
+        round_tag="test-fit-eval-seed",
+        task=tiny_tasks["s5"],
+        arm="log",
+        seed=0,
+        device="cpu",
+        dry_run=True,
+    )
+
+    assert lab.FIT_EVAL_SEED in seen_seeds
+    assert lab.CKPT_EVAL_SEED in seen_seeds  # the checkpoint-selection loop still runs
+    assert lab.FINAL_EVAL_SEED in seen_seeds  # the generalization sweep still runs
+
+
+def test_eval_seeds_are_mutually_distinct_and_outside_the_run_seed_range():
+    """CKPT_EVAL_SEED/FINAL_EVAL_SEED/FIT_EVAL_SEED must never collide with
+    each other or with any run seed in the largest seed matrix (0..35) --
+    the pre-matrix technical review's item 6 (the previous 4/5 pair
+    coincided with run seeds 4/5's `torch.manual_seed` init stream)."""
+    import experiments.benchmark_lab as lab
+
+    seeds = {lab.CKPT_EVAL_SEED, lab.FINAL_EVAL_SEED, lab.FIT_EVAL_SEED}
+    assert len(seeds) == 3, "the three eval seeds must be pairwise distinct"
+    max_run_seed = max(task.seeds for task in TASKS.values()) - 1
+    for s in seeds:
+        assert s > max_run_seed, f"eval seed {s} falls inside the run-seed range"
+
+
+def test_pendulum_row_config_carries_tau():
+    """Pendulum rows' `config` must carry the TaskSpec's own `fit_threshold`
+    (tau) directly (item 3) -- a later edit to `PENDULUM_TAU` must never be
+    able to silently re-judge an already-landed row against a different
+    threshold than the one it actually ran under."""
+    tiny_tasks = _tiny_task_overrides()
+    task = tiny_tasks["pendulum"]
+    row = run_arm(
+        round_tag="test-pendulum-tau", task=task, arm="log", seed=0, device="cpu", dry_run=True
+    )
+    assert row["config"]["tau"] == task.fit_threshold
+
+
+def test_non_pendulum_rows_have_no_tau_in_config():
+    tiny_tasks = _tiny_task_overrides()
+    for name in ("s5", "mqar", "psmnist"):
+        row = run_arm(
+            round_tag="test-no-tau",
+            task=tiny_tasks[name],
+            arm="log",
+            seed=0,
+            device="cpu",
+            dry_run=True,
+        )
+        assert "tau" not in row["config"], f"{name}: config must not carry a tau field"
 
 
 def test_row_schema_dry_run_does_not_append(tmp_path, monkeypatch):

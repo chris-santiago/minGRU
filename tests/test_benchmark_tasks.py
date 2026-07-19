@@ -294,6 +294,51 @@ def test_make_mqar_rejects_span_exceeding_T():
         make_mqar(4, 20, gen, num_pairs=8)  # needs 24 > 20
 
 
+def test_make_mqar_filler_never_holds_a_key_range_token():
+    """Filler positions -- everything outside the presentation key slots
+    (`[0, 2*num_pairs)` even indices) and the query block
+    (`[T - num_pairs, T)`) -- must never hold a key-range token
+    (`[0, MQAR_KEY_VOCAB)`); equivalently, key-range tokens appear only in
+    the presentation block and the query block. Pre-matrix technical-review
+    fix: filler previously drew from the full combined vocab, fabricating
+    spurious key-value bindings whose density scaled with `T` (a confound
+    on the capacity-generalization claim)."""
+    gen = torch.Generator().manual_seed(SEED)
+    num_pairs = MQAR_TRAIN_PAIRS
+    T = 64
+    x, _, _ = make_mqar(16, T, gen, num_pairs=num_pairs)
+
+    allowed_key_positions = torch.zeros(T, dtype=torch.bool)
+    allowed_key_positions[0 : 2 * num_pairs : 2] = True  # presentation key slots
+    allowed_key_positions[T - num_pairs : T] = True  # query block
+    disallowed_positions = ~allowed_key_positions
+
+    is_key_range = x < MQAR_KEY_VOCAB
+    assert not is_key_range[:, disallowed_positions].any(), (
+        "a filler (or presentation-value) position holds a key-range token"
+    )
+    # Every disallowed position -- filler plus the presentation's value
+    # slots -- must land in the value range.
+    is_value_range = (x >= MQAR_KEY_VOCAB) & (x < MQAR_KEY_VOCAB + MQAR_VALUE_VOCAB)
+    assert is_value_range[:, disallowed_positions].all()
+
+
+def test_make_mqar_filler_beyond_presentation_and_query_stays_in_value_range():
+    """At a larger T (eval-style gap between presentation and query, unlike
+    the tight T=3*num_pairs training config), the wide filler gap in the
+    middle must still never carry a key-range token."""
+    gen = torch.Generator().manual_seed(SEED)
+    num_pairs = 8
+    T = 256
+    x, _, mask = make_mqar(8, T, gen, num_pairs=num_pairs)
+    presentation_end = 2 * num_pairs
+    query_start = T - num_pairs
+    filler = x[:, presentation_end:query_start]
+    assert filler.min().item() >= MQAR_KEY_VOCAB
+    assert filler.max().item() < MQAR_KEY_VOCAB + MQAR_VALUE_VOCAB
+    assert mask[:, presentation_end:query_start].logical_not().all()  # sanity: filler is unmasked
+
+
 def test_make_mqar_seeded_reproducibility():
     gen1 = torch.Generator().manual_seed(SEED)
     x1, y1, m1 = make_mqar(8, 64, gen1)

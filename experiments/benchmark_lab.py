@@ -15,8 +15,8 @@ contract, since this round's four tasks span four different label shapes
 
 Models are built through the packaged mixer registry path
 (`min_gru.MinGRUStack`, mirroring `probes.py`'s `build()`/`MIXER_REGISTRY`
-pattern): `ARM_REGISTRY` fixes the five arm configs from the round's
-Global Constraints (`log`, `signed`, `rotation`, `givens` at
+pattern): `ARM_REGISTRY` fixes the registered arms' configs -- five from
+the round's Global Constraints (`log`, `signed`, `rotation`, `givens` at
 block_size=8/rounds=3, `delta` at its promoted native-state default
 nh=2/n_heads=4/d_k=16/d_v=16), d_model=64, 2 pre-norm blocks, plus a sixth
 arm, `rotation-hetero`, added by amendment at the evidence-phase gate
@@ -40,7 +40,7 @@ new mixer code -- every arm is an existing packaged class, called through
 
 Usage:
   uv run python experiments/benchmark_lab.py \
-      --round bench-s5-01 --task s5 --model log --seed 0
+      --round bench-s5-02 --task s5 --model log --seed 0
   uv run python experiments/benchmark_lab.py --selftest
 
 `--selftest` runs a tiny (few-step, small-batch) sweep of all four tasks
@@ -96,18 +96,30 @@ S5_CKPT_T = 128  # S5 checkpoint-selection length (spec §4), distinct from trai
 
 # Fixed eval seeds, independent of --seed (probes.py/hetero_lab.py convention:
 # only the training stream and model init vary by seed; every arm's held-out
-# eval draws from the same synthetic distribution).
-CKPT_EVAL_SEED = 5
-FINAL_EVAL_SEED = 4
+# eval draws from the same synthetic distribution). Moved out of the 0..35
+# run-seed range at the pre-matrix technical review (2026-07-19, item 6):
+# the previous values (CKPT_EVAL_SEED=5, FINAL_EVAL_SEED=4) collided with
+# run seeds 4/5's `torch.manual_seed` model-init stream -- a distinct
+# `torch.Generator` object so no actual shared RNG state, but a confusing
+# coincidence that made "seed 5" ambiguous between "run seed 5" and "the
+# fixed checkpoint-eval seed". FIT_EVAL_SEED is new (item 5: the honest
+# fit-metric re-eval draws its own dedicated fixed seed, distinct from both
+# CKPT_EVAL_SEED and FINAL_EVAL_SEED, so no two of the three re-use the
+# same draw). The `-01` pilot population was evaluated under the old
+# 4/5 seeds -- comparability across `-01`/`-02` tags is not claimed
+# (CLAUDE.md: evidence strata are never mixed silently).
+CKPT_EVAL_SEED = 1_000_005
+FINAL_EVAL_SEED = 1_000_004
+FIT_EVAL_SEED = 1_000_006
 CKPT_EVAL_BATCHES = 4
 FINAL_EVAL_BATCHES = 4
 
 RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lab_results.jsonl")
 
-# Registry keys -> (MinGRUStack mixer name, mixer_kwargs) -- the five arm
-# configs fixed by the round's Global Constraints (probes.py's
-# MIXER_REGISTRY/build() pattern, generalized to this round's five packaged
-# mixers instead of probes.py's historical model names), plus the amended
+# Registry keys -> (MinGRUStack mixer name, mixer_kwargs) -- the registered
+# arms' configs (probes.py's MIXER_REGISTRY/build() pattern, generalized to
+# this round's packaged mixers instead of probes.py's historical model
+# names): five fixed by the round's Global Constraints, plus the amended
 # sixth arm below. mixer is a `str` (one type, every block, flat kwargs)
 # for five of the six arms; `rotation-hetero` is the one `list[str]` arm
 # (per-block mixer types, kwargs keyed by type name or `None` -- see
@@ -599,7 +611,7 @@ def run_arm(
     Parameters
     ----------
     round_tag : str
-        Ledger `round` value (e.g. `"bench-s5-01"`).
+        Ledger `round` value (e.g. `"bench-s5-02"`).
     task : TaskSpec
         One of `experiments.benchmark_tasks.TASKS`'s values (or a
         `dataclasses.replace`d variant, e.g. for tests/selftest).
@@ -673,6 +685,18 @@ def run_arm(
         )
         _require_checkpoint(best_state, task.name, f"epochs={effective_epochs}")
         model.load_state_dict(best_state)
+        selection_value = round(best_metric, 4)
+        # Honest fit metric (item 5): re-evaluate the SELECTED checkpoint
+        # once more on the val split for `ckpt[task.fit_metric]` -- `val()`
+        # iterates in a fixed, non-shuffled order (no seed to vary), so this
+        # re-eval is deterministic and equals `selection_value` exactly for
+        # psMNIST; still recorded via the same code path as the step-based
+        # branch below so `ckpt[task.fit_metric]` always means "the selected
+        # checkpoint's held-out metric", not a max-over-selection-evals
+        # statistic, uniformly across all four tasks.
+        fit_metric_value = round(
+            _eval_last_step_loader(forward_model, loader.val(), device=device_obj), 4
+        )
         acc = {"test": round(_eval_last_step_loader(forward_model, loader.test(), device=device_obj), 4)}
         selected_step, ckpt_key = best_epoch, "epoch"
         config_budget = {"lr": effective_lr, "batch_size": effective_batch_size, "epochs": effective_epochs}
@@ -698,6 +722,32 @@ def run_arm(
             best_state, task.name, f"steps={effective_steps}, eval_every={effective_eval_every}"
         )
         model.load_state_dict(best_state)
+        selection_value = round(best_metric, 4)
+        # Honest fit metric (item 5, "kill the winner's curse"): checkpoint
+        # selection above picks the best of <= steps/eval_every evaluations
+        # at CKPT_EVAL_SEED -- a max-over-N (min-over-N for "le" tasks)
+        # selection statistic that is biased relative to the selected
+        # checkpoint's TRUE held-out metric. Re-evaluate the SELECTED
+        # checkpoint exactly ONCE more, at the same checkpoint-selection
+        # configuration (T=ckpt_T, same batch count), on a NEW dedicated
+        # fixed seed (FIT_EVAL_SEED -- distinct from both CKPT_EVAL_SEED and
+        # FINAL_EVAL_SEED, so no two of the three re-use the same draw).
+        # That single fresh evaluation, not the selection-time value, is
+        # what `ckpt[task.fit_metric]` reports; the selection-time value is
+        # kept separately as `ckpt["selection_<metric>"]` for transparency.
+        fit_metric_value = round(
+            _eval_generator_task(
+                task,
+                arm,
+                forward_model,
+                T=ckpt_T,
+                seed=FIT_EVAL_SEED,
+                n_batches=CKPT_EVAL_BATCHES,
+                batch_size=effective_batch_size,
+                device=device_obj,
+            ),
+            4,
+        )
         acc = _run_eval_protocol(
             task, arm, forward_model, device_obj, effective_batch_size, FINAL_EVAL_BATCHES, FINAL_EVAL_SEED
         )
@@ -711,6 +761,12 @@ def run_arm(
         config_extra = {}
 
     config = {"budget": config_budget, **config_extra}
+    if task.name == "pendulum":
+        # Record tau (the TaskSpec's own fit_threshold) directly in the row
+        # (item 3): a later code edit to PENDULUM_TAU must never be able to
+        # silently re-judge already-landed rows against a different
+        # threshold than the one they were actually run/selected under.
+        config["tau"] = task.fit_threshold
     if device_obj.type != "cpu":
         config["device"] = device
         config["torch"] = torch.__version__
@@ -729,7 +785,11 @@ def run_arm(
         "steps": selected_step,  # step index for step-based tasks, epoch index for psMNIST
         "acc": acc,
         "secs": round(time.time() - t0, 1),
-        "ckpt": {ckpt_key: selected_step, task.fit_metric: round(best_metric, 4)},
+        "ckpt": {
+            ckpt_key: selected_step,
+            task.fit_metric: fit_metric_value,
+            f"selection_{task.fit_metric}": selection_value,
+        },
         "config": config,
     }
     print(json.dumps(rec), flush=True)
@@ -851,7 +911,7 @@ def _selftest() -> None:
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--selftest", action="store_true", help="tiny model, few steps, all four tasks; exits after")
-    p.add_argument("--round", help="ledger round tag, e.g. bench-s5-01")
+    p.add_argument("--round", help="ledger round tag, e.g. bench-s5-02")
     p.add_argument("--task", choices=sorted(TASKS), help="s5 | mqar | psmnist | pendulum")
     p.add_argument(
         "--model",

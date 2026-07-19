@@ -246,10 +246,11 @@ make_s5 = make_group_word(S5_COMPOSE)
 # Loss/accuracy apply only at the query positions (masked_query loss mode).
 # Presentation occupies the first `2*num_pairs` positions; the query block
 # occupies the last `num_pairs` positions; everything between is random
-# filler the model must ignore, giving eval configs (T=256, num_pairs in
-# {16, 32}) a much longer presentation-to-query gap than the T=64/8-pair
-# training configuration -- the recall-distance stress the eval protocol is
-# meant to exercise.
+# filler drawn from the value range only (never the key range -- see
+# `make_mqar`'s docstring) that the model must ignore, giving eval configs
+# (T=256, num_pairs in {16, 32}) a much longer presentation-to-query gap
+# than the T=64/8-pair training configuration -- the recall-distance
+# stress the eval protocol is meant to exercise.
 
 MQAR_KEY_VOCAB = 32
 MQAR_VALUE_VOCAB = 32
@@ -275,8 +276,13 @@ def make_mqar(
     positions `[0, 2*num_pairs)`. The query block at positions
     `[T - num_pairs, T)` replays the same keys in an independently permuted
     order, with `y`/`mask` set only there. Positions in between are
-    uniform random filler over the combined vocab (unmasked, so their
-    exact value never affects the task).
+    uniform random filler drawn from the VALUE range only, `[key_vocab,
+    key_vocab + value_vocab)` -- never the key range -- so a filler token
+    can never open a spurious key-value binding (pre-matrix technical
+    review fix: filler previously drew from the full combined vocab,
+    fabricating spurious key-range fillers whose density scaled with `T`
+    -- see `x`'s assignment below). Filler is still unmasked, so its exact
+    value never reaches the loss; only its RANGE is now constrained.
 
     Parameters
     ----------
@@ -315,8 +321,6 @@ def make_mqar(
             f"{needed} positions, exceeding T={T}"
         )
 
-    total_vocab = key_vocab + value_vocab
-
     # Per-row random permutation of key ids (torch.randperm has no batched
     # form under a shared generator): argsort of iid uniform noise gives an
     # independent permutation per row.
@@ -328,7 +332,14 @@ def make_mqar(
     query_keys = torch.gather(keys, 1, query_order)
     query_values = torch.gather(values, 1, query_order)
 
-    x = torch.randint(0, total_vocab, (batch, T), generator=gen)
+    # Filler baseline drawn from the VALUE range only ([key_vocab,
+    # key_vocab + value_vocab)) -- a value token can never open a spurious
+    # key-value binding, unlike drawing from the full combined vocab (the
+    # pre-review behavior this replaces). Presentation/query assignments
+    # below overwrite this baseline at their own positions; every position
+    # this function does NOT explicitly assign a key to therefore stays a
+    # value-range token.
+    x = torch.randint(0, value_vocab, (batch, T), generator=gen) + key_vocab
     y = torch.zeros(batch, T, dtype=torch.long)
     mask = torch.zeros(batch, T, dtype=torch.bool)
 
@@ -631,22 +642,21 @@ def make_psmnist_loader(batch_size: int) -> PsMNISTLoader:
 #
 # Fields FROZEN by the round's Global Constraints (fit_metric,
 # fit_threshold, fit_direction, robustness, eval_protocol, seeds) are the
-# real, binding values -- not placeholders. `Budget` values are NOT all
-# frozen yet: spec §4's pilot-calibration paragraph names exactly three
-# quantities still pending a pilot run before any seed matrix -- "a pilot
-# ... fixes the S5 and psMNIST training budgets and the pendulum tau" --
-# so `S5_TASK.budget.steps`, `PSMNIST_TASK.budget.epochs`, and
-# `PENDULUM_TASK.fit_threshold` (tau) below are PILOT-PLACEHOLDER values:
+# real, binding values -- not placeholders, WITH ONE UPDATE: spec §4's
+# pilot-calibration paragraph originally named three quantities still
+# pending a pilot run before any seed matrix -- "a pilot ... fixes the S5
+# and psMNIST training budgets and the pendulum tau" -- and
+# `PENDULUM_TASK.fit_threshold` (tau) has since been calibrated and FROZEN
+# at the pre-matrix technical review (2026-07-19); see `PENDULUM_TAU`'s own
+# comment below for the calibration and rationale. `Budget` values are NOT
+# all frozen yet: `S5_TASK.budget.steps` and `PSMNIST_TASK.budget.epochs`
+# remain PILOT-PLACEHOLDER round 2 (see each TaskSpec's own comment) --
 # reasonable starting points (S5's mirrors probes.py's historical
-# MAX_STEPS=1600 default; psMNIST's is a conservative epoch count for a
-# 50k-row set; tau is chosen below the "predict the noisy observation
-# verbatim" baseline MSE so the threshold demands real denoising), each
-# easily overridden from the lab driver's CLI (`--steps`/`--epochs`/
-# `--fit-threshold` are NOT how tau is overridden -- tau is a TaskSpec
-# field, not a Budget field; a pilot script overrides it by constructing
-# its own `TaskSpec` via `dataclasses.replace(PENDULUM_TASK, ...)` rather
-# than through the lab driver's CLI) -- never treated as frozen until the
-# pilot task records its calibration in the round entries.
+# MAX_STEPS=1600 default, now probing 8x after round-1 pilot rows sat at
+# chance; psMNIST's is the design spec's ~30-epoch table value), each
+# overridden from the lab driver's CLI (`--steps`/`--epochs`) -- never
+# treated as frozen until a pilot task records their calibration in the
+# round entries.
 #
 # MQAR's budget is NOT named in spec §4's pilot-calibration list (only S5,
 # psMNIST, and pendulum's tau are) -- its `steps`/`eval_every` below are a
@@ -706,14 +716,22 @@ PSMNIST_TASK = TaskSpec(
     seeds=12,
 )
 
-# PILOT-PLACEHOLDER: pure-noise-copy baseline MSE is 2 * PENDULUM_OBS_NOISE_STD**2
-# = 0.005 (predicting the noisy observation `x` verbatim for `y` gives error ==
-# the observation noise on both of the 2 dims); PENDULUM_TAU sits below that so
-# the fit threshold demands genuine denoising, not a no-op copy. Not yet
-# pilot-calibrated (spec §4) -- a later pilot task overrides this field (e.g.
-# via `dataclasses.replace(PENDULUM_TASK, fit_threshold=..., robustness=...)`)
-# and freezes it in the round entries before the pendulum seed matrix runs.
-PENDULUM_TAU = 0.003
+# FROZEN (pre-matrix technical review, 2026-07-19): pure-noise-copy baseline
+# MSE is PENDULUM_OBS_NOISE_STD**2 == 0.05**2 == 0.0025, NOT
+# 2 * PENDULUM_OBS_NOISE_STD**2 -- the driver's regression loss
+# (`benchmark_lab._forward_regression`'s `sq_err.mean()`) is a PER-ELEMENT
+# mean over B*T*2 entries, not a per-position sum over the 2 (sin, cos)
+# dims, so predicting the noisy observation `x` verbatim for `y` gives
+# error == the observation noise at every one of those elements: the
+# copy-baseline MSE is sigma^2, not 2*sigma^2 (an earlier version of this
+# comment computed the wrong baseline). PENDULUM_TAU is calibrated from
+# pilot rows (jobs at 368ce8b, round `bench-pendulum-01`, log arm seeds
+# 0-2, `ckpt.val_mse` mean 0.0009 -- see `experiments/lab_results.jsonl`):
+# 0.0009 * 1.5 slack = 0.00135, rounded up to 0.0014. 0.0014 sits strictly
+# below the 0.0025 copy baseline, so the threshold still demands genuine
+# denoising rather than a no-op copy. Frozen: never overridden by a later
+# pilot task, and no longer a `dataclasses.replace` target.
+PENDULUM_TAU = 0.0014
 
 PENDULUM_TASK = TaskSpec(
     name="pendulum",
@@ -733,4 +751,30 @@ TASKS: dict[str, TaskSpec] = {
     "mqar": MQAR_TASK,
     "psmnist": PSMNIST_TASK,
     "pendulum": PENDULUM_TASK,
+}
+
+# ------------------------------------------------------- ledger round tags
+# Current seed-matrix population's ledger `round` tag per task -- the single
+# source of truth `scripts/gpu_benchmark_campaign.py` (writes these on every
+# emitted row) and `scripts/report_benchmarks.py` (reads rows tagged with
+# these) both bind to directly, rather than each hardcoding its own copy (a
+# pre-matrix technical review found three independently hardcoded copies of
+# this same mapping across campaign/report/`gpu_check.py` -- a sibling-
+# duplication trigger). Bumped `bench-<task>-01` -> `bench-<task>-02` at
+# that same review (2026-07-19): the `-01` tags are now the recorded
+# pilot/calibration population (heterogeneous per-seed training budgets --
+# e.g. `bench-s5-01`'s seed 0 ran at steps=1600 while seed 10 ran at
+# steps=12800, see `experiments/lab_results.jsonl`), so a fresh tag per task
+# keeps the real seed matrices from dedup-colliding with those pilot rows
+# and keeps the report from silently pooling heterogeneous-budget rows into
+# one set of statistics. `scripts/gpu_check.py`'s dedup/finish-handler
+# validation is the one reader that must keep accepting BOTH generations
+# (old pilot job logs/sidecars must stay parseable) -- it hardcodes its own
+# frozen `-01` tuple alongside importing this mapping's values for the
+# current `-02` half; see its own `_BENCHMARKS_ROUNDS` comment.
+BENCH_ROUND_TAGS: dict[str, str] = {
+    "s5": "bench-s5-02",
+    "mqar": "bench-mqar-02",
+    "psmnist": "bench-psmnist-02",
+    "pendulum": "bench-pendulum-02",
 }

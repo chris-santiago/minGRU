@@ -11,17 +11,26 @@ full design.
 Task x arm matrix (spec section 1/6)
 -------------------------------------
 Four tasks (``s5``, ``mqar``, ``psmnist``, ``pendulum``), each run against
-all five packaged-mixer arms (``log``, ``signed``, ``rotation``, ``givens``,
-``delta`` -- ``experiments/benchmark_lab.py``'s ``ARM_REGISTRY``, spec
-section 6 "Arms"). Unlike the GPU 36-seed round's ``gpu_hetero_campaign.py``,
+the registered arms -- ``experiments/benchmark_lab.py``'s ``ARM_REGISTRY``
+(spec section 6 "Arms" fixed ``log``/``signed``/``rotation``/``givens``/
+``delta``; ``rotation-hetero`` was added by amendment, six total). Unlike
+the GPU 36-seed round's ``gpu_hetero_campaign.py``,
 no arm here forces a distinct backend (no per-arm ``MINGRU_SCAN``/
 ``torch.compile`` split) -- every arm of a task runs under the same
 ``--device`` this invocation was given; the round's Global Constraints fix
 the training budget per task, not a per-arm backend.
 
-Round tags (spec's Global Constraints, exact): ``bench-s5-01``,
-``bench-mqar-01``, ``bench-psmnist-01``, ``bench-pendulum-01`` -- one per
-task, independent of which arms that task's cell selects.
+Round tags: ``bench-s5-02``, ``bench-mqar-02``, ``bench-psmnist-02``,
+``bench-pendulum-02`` -- one per task, independent of which arms that
+task's cell selects, read from ``experiments.benchmark_tasks
+.BENCH_ROUND_TAGS`` (the single source of truth this module and
+``scripts/report_benchmarks.py`` both bind to). Bumped from the spec's
+original ``-01`` tags at the pre-matrix technical review (2026-07-19): the
+``-01`` tags are now the recorded pilot/calibration population
+(heterogeneous per-seed training budgets), so the seed matrices land under
+clean ``-02`` tags that can't dedup-collide with pilot rows or get pooled
+into the same statistics by the report -- see ``BENCH_ROUND_TAGS``'s own
+comment for the full rationale.
 
 Pre-flight (fail-loud, before seed 0, ``--device cuda`` only)
 ----------------------------------------------------------------
@@ -99,19 +108,22 @@ from typing import Any
 import torch
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))  # `experiments.*` (namespace package, no __init__.py)
+from experiments.benchmark_tasks import BENCH_ROUND_TAGS  # noqa: E402
+
 _BENCHMARK_LAB_PATH = _REPO_ROOT / "experiments" / "benchmark_lab.py"
 _TORCH_STRATUM_PIN = "2.8."
 _ROW_PREFIX = "MINGRU_LAB_ROW "
 _ENV_PREFIX = "MINGRU_LAB_ENV "
 
-# Round tags, spec's Global Constraints (exact, frozen) -- one per task,
-# independent of which arms a given invocation selects.
-_ROUND_TAGS: dict[str, str] = {
-    "s5": "bench-s5-01",
-    "mqar": "bench-mqar-01",
-    "psmnist": "bench-psmnist-01",
-    "pendulum": "bench-pendulum-01",
-}
+# Round tags: this module owns `_ROUND_TAGS` as its own name (existing
+# convention -- `report_benchmarks.py` binds its own `ROUND_TAGS` name to
+# the same mapping), but both read the single `BENCH_ROUND_TAGS` source of
+# truth in `experiments/benchmark_tasks.py` rather than each hardcoding an
+# independently-editable copy -- see that mapping's own comment for the
+# `-01` -> `-02` bump rationale.
+_ROUND_TAGS: dict[str, str] = BENCH_ROUND_TAGS
 
 
 def _import_benchmark_lab() -> Any:
@@ -367,7 +379,8 @@ def main(argv: list[str] | None = None) -> int:
         nargs="+",
         choices=sorted(benchmark_lab.ARM_REGISTRY),
         default=list(benchmark_lab.ARM_REGISTRY),
-        help="arm subset (default: all five, spec order log/signed/rotation/givens/delta)",
+        help="arm subset (default: all registered arms -- six packaged-mixer arms: "
+        "log/signed/rotation/rotation-hetero/givens/delta)",
     )
     parser.add_argument(
         "--seeds",

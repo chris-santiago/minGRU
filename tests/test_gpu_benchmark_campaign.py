@@ -60,12 +60,20 @@ _run_arm_kwargs = gpu_benchmark_campaign._run_arm_kwargs
 # --- round tags: Global Constraints exactness ------------------------------
 
 
-def test_round_tags_match_global_constraints():
+def test_round_tags_match_current_bench_round_tags():
+    # Bumped -01 -> -02 at the pre-matrix technical review (2026-07-19): the
+    # -01 tags are now the recorded pilot/calibration population. This
+    # module's `_ROUND_TAGS` binds directly to `experiments.benchmark_tasks
+    # .BENCH_ROUND_TAGS`, the single source of truth, so this test also
+    # pins that the two never drift apart.
+    from experiments.benchmark_tasks import BENCH_ROUND_TAGS
+
+    assert _ROUND_TAGS == BENCH_ROUND_TAGS
     assert _ROUND_TAGS == {
-        "s5": "bench-s5-01",
-        "mqar": "bench-mqar-01",
-        "psmnist": "bench-psmnist-01",
-        "pendulum": "bench-pendulum-01",
+        "s5": "bench-s5-02",
+        "mqar": "bench-mqar-02",
+        "psmnist": "bench-psmnist-02",
+        "pendulum": "bench-pendulum-02",
     }
 
 
@@ -125,9 +133,9 @@ def test_run_arm_kwargs_always_dry_run_no_ledger_write_path():
 
 def test_run_arm_kwargs_carries_round_task_arm_seed_device():
     kwargs = _run_arm_kwargs(
-        "bench-s5-01", TASKS["s5"], "givens", seed=7, steps=None, device="cuda"
+        "bench-s5-02", TASKS["s5"], "givens", seed=7, steps=None, device="cuda"
     )
-    assert kwargs["round_tag"] == "bench-s5-01"
+    assert kwargs["round_tag"] == "bench-s5-02"
     assert kwargs["task"] is TASKS["s5"]
     assert kwargs["arm"] == "givens"
     assert kwargs["seed"] == 7
@@ -135,7 +143,7 @@ def test_run_arm_kwargs_carries_round_task_arm_seed_device():
 
 
 def test_run_arm_kwargs_shrinks_eval_every_alongside_steps_override():
-    kwargs = _run_arm_kwargs("bench-s5-01", TASKS["s5"], "log", seed=0, steps=20, device="cpu")
+    kwargs = _run_arm_kwargs("bench-s5-02", TASKS["s5"], "log", seed=0, steps=20, device="cpu")
     assert kwargs["steps"] == 20
     assert kwargs["eval_every"] == 20
 
@@ -246,16 +254,22 @@ def test_cpu_smoke_emits_valid_row_and_touches_no_ledger():
     ]
     assert len(row_lines) == 1, result.stdout
     row = json.loads(row_lines[0][len(gpu_benchmark_campaign._ROW_PREFIX) :])
-    assert row["round"] == "bench-s5-01"
+    assert row["round"] == "bench-s5-02"
     assert row["task"] == "s5"
     assert row["variant"] == "log"
     assert row["seed"] == 0
+
+    # Honest fit metric (item 5): the re-evaluated checkpoint metric and the
+    # (possibly winner's-curse-biased) selection-time value both land in
+    # ckpt, under distinct keys.
+    assert "val128" in row["ckpt"]
+    assert "selection_val128" in row["ckpt"]
 
     # benchmark_lab.run_arm's own bare (unmarked) row print must be
     # suppressed (redirect_stdout around the run_arm call) -- the row's
     # distinctive "round" value should appear exactly once in the whole
     # transcript, not twice (once bare, once MINGRU_LAB_ROW-prefixed).
-    assert result.stdout.count('"round": "bench-s5-01"') == 1, result.stdout
+    assert result.stdout.count('"round": "bench-s5-02"') == 1, result.stdout
 
     # no MINGRU_LAB_ENV line on --device cpu (pre-flight is skipped)
     assert not any(

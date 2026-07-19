@@ -3,15 +3,22 @@
 statistics" / "Reporting", §6 ledger row + stats parameterization
 contracts).
 
-Reads ``experiments/lab_results.jsonl`` for the four bench round tags
-(``bench-s5-01``, ``bench-mqar-01``, ``bench-psmnist-01``,
-``bench-pendulum-01``) and regenerates ``experiments/bench/bench_<task>
-.json``/``.md`` per task, whole, every run -- never hand-edited (module
-docstring convention shared with every other ``experiments/bench/*``
-generator; see ``experiments/index.md``).
+Reads ``experiments/lab_results.jsonl`` for the four current bench round
+tags (``bench-s5-02``, ``bench-mqar-02``, ``bench-psmnist-02``,
+``bench-pendulum-02`` -- read from ``experiments.benchmark_tasks
+.BENCH_ROUND_TAGS``, the single source of truth this module and
+``scripts/gpu_benchmark_campaign.py`` both bind to) and regenerates
+``experiments/bench/bench_<task>.json``/``.md`` per task, whole, every run
+-- never hand-edited (module docstring convention shared with every other
+``experiments/bench/*`` generator; see ``experiments/index.md``). The
+``-01`` tags are the recorded pilot/calibration population (heterogeneous
+per-seed budgets) and are deliberately excluded here -- see
+``BENCH_ROUND_TAGS``'s own comment for the ``-01`` -> ``-02`` bump
+rationale; ``scripts/gpu_check.py`` is the one place that still recognizes
+both generations, for old pilot job logs/sidecars.
 
 Per task, per arm (``experiments.benchmark_lab.ARM_REGISTRY``:
-log/signed/rotation/givens/delta):
+log/signed/rotation/rotation-hetero/givens/delta):
 
 - fit count + threshold-robustness triple, judged on the task's own
   ``fit_metric``/``fit_threshold``/``fit_direction``/``robustness``
@@ -100,18 +107,19 @@ if str(_SCRIPTS_DIR) not in sys.path:
 from _bench_env import git_commit_sha  # noqa: E402
 from _evidence_stats import fisher_exact_two_sided  # noqa: E402
 from experiments.benchmark_lab import ARM_REGISTRY, build_model  # noqa: E402
-from experiments.benchmark_tasks import TASKS, TaskSpec  # noqa: E402
+from experiments.benchmark_tasks import BENCH_ROUND_TAGS, TASKS, TaskSpec  # noqa: E402
 
 _RESULTS = _REPO_ROOT / "experiments" / "lab_results.jsonl"
 _BENCH_DIR = _REPO_ROOT / "experiments" / "bench"
 
-# Round tags fixed by the round's Global Constraints (spec §6/§7).
-ROUND_TAGS: dict[str, str] = {
-    "s5": "bench-s5-01",
-    "mqar": "bench-mqar-01",
-    "psmnist": "bench-psmnist-01",
-    "pendulum": "bench-pendulum-01",
-}
+# Current seed-matrix population's round tags -- this module owns
+# `ROUND_TAGS` as its own name (existing convention -- `gpu_benchmark_
+# campaign.py` binds its own `_ROUND_TAGS` name to the same mapping), but
+# both read the single `BENCH_ROUND_TAGS` source of truth in
+# `experiments/benchmark_tasks.py` rather than each hardcoding an
+# independently-editable copy -- see that mapping's own comment for the
+# `-01` -> `-02` bump rationale.
+ROUND_TAGS: dict[str, str] = BENCH_ROUND_TAGS
 
 # "log as the Fisher reference arm" (spec §4/§8): a family-validation round
 # contrasts every arm against the vanilla minGRU baseline.
@@ -232,6 +240,36 @@ def _missing_seeds(rows: list[dict[str, Any]], seeds_planned: int) -> tuple[list
     return present, missing
 
 
+def _assert_one_row_per_seed(
+    task_name: str, arm: str, rows: list[dict[str, Any]], present: list[int]
+) -> None:
+    """Fail loud when ``rows``' count doesn't match its distinct-seed count
+    (pre-matrix technical review, item 7): a ledger dedup failure or a
+    genuine duplicate seed would silently inflate this arm's Fisher-exact
+    denominator -- ``rep.seeds_present`` feeds ``_fisher_vs_reference``
+    directly (``rep.seeds_present - rep.fits`` is the non-fit count in the
+    2x2 contingency table) -- without ever surfacing as a wrong p-value a
+    reader could catch by inspection. This is a data-integrity check, not a
+    report annotation: it raises rather than rendering a silently-wrong
+    table (CLAUDE.md: "Numbers are transcribed from artifacts... reviewers
+    now check cell-by-cell")."""
+    if len(rows) == len(present):
+        return
+    seed_counts: dict[int, int] = {}
+    for row in rows:
+        seed = row.get("seed")
+        if isinstance(seed, int):
+            seed_counts[seed] = seed_counts.get(seed, 0) + 1
+    duplicates = {seed: n for seed, n in seed_counts.items() if n > 1}
+    raise ValueError(
+        f"{task_name}/{arm}: {len(rows)} row(s) but only {len(present)} distinct "
+        f"seed(s) -- duplicate seed rows would silently inflate the Fisher-exact "
+        f"denominator; duplicate seeds: {duplicates}. Fix the ledger (or the "
+        "upstream dedup path in scripts/gpu_check.py) before regenerating this "
+        "report."
+    )
+
+
 # --------------------------------------------------------------- param counts
 def _arm_param_count(task: TaskSpec, arm: str) -> int:
     """Full per-arm model parameter count for ``task`` (embedding/head +
@@ -279,6 +317,7 @@ def _build_arm_report(task: TaskSpec, arm: str, rows: list[dict[str, Any]]) -> A
     fit_rows = _fit_rows(rows, task.fit_metric, task.fit_threshold, task.fit_direction)
     mean_acc, fit_only_acc = _generalization_tables(rows, fit_rows)
     present, missing = _missing_seeds(rows, task.seeds)
+    _assert_one_row_per_seed(task.name, arm, rows, present)
     return ArmReport(
         arm=arm,
         seeds_present=len(rows),

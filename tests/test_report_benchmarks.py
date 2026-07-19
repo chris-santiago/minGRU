@@ -32,8 +32,9 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
 from experiments.benchmark_lab import ARM_REGISTRY, DECAY_CAPABLE_ARMS
-from experiments.benchmark_tasks import TASKS
+from experiments.benchmark_tasks import BENCH_ROUND_TAGS, TASKS
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SCRIPT_PATH = _REPO_ROOT / "scripts" / "report_benchmarks.py"
@@ -94,6 +95,21 @@ def _psmnist_row(seed: int, arm: str, val_acc: float, test_acc: float) -> dict:
         "secs": 40.0,
         "ckpt": {"epoch": 5, "val_acc": val_acc},
         "config": {"budget": {}, "permutation_seed": 20260719},
+    }
+
+
+# ----------------------------------------------------------- 0. round tags
+def test_round_tags_bind_to_the_shared_bench_round_tags_source():
+    # This module owns `ROUND_TAGS` as its own name, but binds it directly
+    # to `experiments.benchmark_tasks.BENCH_ROUND_TAGS` -- the single source
+    # of truth `scripts/gpu_benchmark_campaign.py` also reads -- rather than
+    # hardcoding an independently-editable copy.
+    assert ROUND_TAGS == BENCH_ROUND_TAGS
+    assert ROUND_TAGS == {
+        "s5": "bench-s5-02",
+        "mqar": "bench-mqar-02",
+        "psmnist": "bench-psmnist-02",
+        "pendulum": "bench-pendulum-02",
     }
 
 
@@ -259,6 +275,34 @@ def test_log_arm_itself_is_not_in_fisher_vs_reference():
     rows = [_s5_row(0, "log", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)]
     report = build_task_report("s5", rows)
     assert FISHER_REFERENCE_ARM not in report["fisher_vs_reference"]
+
+
+# --------------------------------------------------- 4b. duplicate-seed guard
+def test_duplicate_seed_rows_raise_instead_of_inflating_fisher_denominator():
+    """Two rows sharing a seed for the same arm (a ledger dedup failure, or
+    a genuine duplicate) must raise rather than silently inflate
+    `seeds_present`/the Fisher-exact denominator (pre-matrix technical
+    review, item 7)."""
+    rows = [
+        _s5_row(0, "log", val128=1.0, t256=1.0, t512=1.0, t1024=1.0),
+        _s5_row(0, "log", val128=0.5, t256=0.5, t512=0.5, t1024=0.5),  # duplicate seed 0
+    ]
+    with pytest.raises(ValueError, match="distinct seed"):
+        build_task_report("s5", rows)
+
+
+def test_distinct_seeds_across_arms_do_not_trip_the_duplicate_guard():
+    """The same seed appearing once for two DIFFERENT arms is not a
+    duplicate (each arm's rows are checked independently) -- a legitimate
+    shape every task's ledger has by construction (every arm shares the
+    seed matrix)."""
+    rows = [
+        _s5_row(0, "log", val128=1.0, t256=1.0, t512=1.0, t1024=1.0),
+        _s5_row(0, "signed", val128=0.5, t256=0.5, t512=0.5, t1024=0.5),
+    ]
+    report = build_task_report("s5", rows)  # must not raise
+    assert report["arms"]["log"]["seeds_present"] == 1
+    assert report["arms"]["signed"]["seeds_present"] == 1
 
 
 # --------------------------------------------------------------- 5. completeness
