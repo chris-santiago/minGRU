@@ -674,9 +674,11 @@ S5_TASK = TaskSpec(
     fit_direction="ge",
     robustness=(0.98, 0.99, 0.995),
     eval_protocol=(EvalConfig(T=256), EvalConfig(T=512), EvalConfig(T=1024)),
-    # PILOT-PLACEHOLDER round 2: all arms (log/givens/delta) sat at chance at the
-    # S3-scale steps=1600 (pilot jobs at 368ce8b, bench-s5-01 rows); probing 8x.
-    budget=Budget(lr=3e-3, batch_size=128, steps=12800, eval_every=100),
+    # FROZEN (pilot-calibrated, user decision 2026-07-19): steps=12800 (8x the
+    # S3-scale 1600). Calibration record (bench-s5-01): all piloted arms
+    # (log/givens/delta) sat at chance at 1600 AND at 12800 (val128 0.017->0.022
+    # vs chance 0.0083) -- the matrix at this budget records an honest
+    # expressivity result in the non-solvable-group regime, not an expected fit.
     seeds=36,
 )
 
@@ -692,9 +694,9 @@ MQAR_TASK = TaskSpec(
         EvalConfig(T=256, num_pairs=16),
         EvalConfig(T=256, num_pairs=32),
     ),
-    # PILOT-PLACEHOLDER round 2: delta reached only 0.21 val_qacc at the working
-    # default steps=1600 (pilot jobs at 368ce8b, bench-mqar-01 rows); probing 8x.
-    budget=Budget(lr=3e-3, batch_size=128, steps=12800, eval_every=100),
+    # FROZEN (pilot-calibrated, user decision 2026-07-19): steps=12800.
+    # Calibration record (bench-mqar-01): delta 0.21 val_qacc at 1600, 0.998+
+    # at 12800 (fits); log at chance at both (no recall mechanism).
     seeds=36,
 )
 
@@ -707,11 +709,12 @@ PSMNIST_TASK = TaskSpec(
     fit_direction="ge",
     robustness=(0.88, 0.90, 0.92),
     eval_protocol=(),  # test-set accuracy reported directly (spec §4); no length/pair-count generalization axis
-    # PILOT-PLACEHOLDER round 2: log reached 0.73-0.78 val_acc still climbing at
-    # epochs=10 (pilot jobs at 368ce8b, bench-psmnist-01 rows); probing the spec
-    # 4 table's ~30 epochs. lr corrected 3e-3 -> 1e-3: the design spec's 2
-    # training-config table fixes psMNIST at Adam 1e-3 (the earlier 3e-3 was a
-    # provisional-default deviation caught from the pilot rows' config).
+    # FROZEN (pilot-calibrated, user decision 2026-07-19): epochs=30, lr=1e-3
+    # (the design spec's training-config table; the earlier 3e-3 provisional
+    # default was a deviation caught from pilot rows). Calibration record
+    # (bench-psmnist-01): log 0.73-0.78 at 10 epochs climbing; at 30 epochs
+    # log ~0.80 (plateau), delta straddles the 0.90 bar (val 0.898/0.907) --
+    # the plan-frozen threshold discriminates arms at this budget.
     budget=Budget(lr=1e-3, batch_size=128, epochs=30),
     seeds=12,
 )
