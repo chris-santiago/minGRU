@@ -29,7 +29,7 @@ Project rules for Claude sessions. These extend `~/.claude/CLAUDE.md`; project-s
 
 ## GPU jobs (Lightning AI)
 
-- Credentials live in `.claude/settings.local.json` `env` block — NOT auto-loaded; export explicitly before `scripts/gpu_check.py`.
+- Credentials live in `.claude/settings.local.json` `env` block and load into the session environment at startup. If `LIGHTNING_API_KEY` is missing (e.g. creds were added mid-session), export the env block explicitly before `scripts/gpu_check.py`.
 - Job modes: `--job check` (parity suite), `--job delta-probe`, `--job hetero36`; `--machine` overrides L4.
 - Job command chains are **foreground-only — never background a keepalive** (a backgrounded loop outlives the command, hangs `job.wait()`, and bills). The 10-minute idle shutdown applies to interactive studios only.
 - Recovery for a stuck job: `lightning_sdk.Job(name, teamspace=..., org=...)` → `.stop()` → `.logs`.
