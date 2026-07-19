@@ -679,6 +679,7 @@ S5_TASK = TaskSpec(
     # (log/givens/delta) sat at chance at 1600 AND at 12800 (val128 0.017->0.022
     # vs chance 0.0083) -- the matrix at this budget records an honest
     # expressivity result in the non-solvable-group regime, not an expected fit.
+    budget=Budget(lr=3e-3, batch_size=128, steps=12800, eval_every=100),
     seeds=36,
 )
 
@@ -697,6 +698,7 @@ MQAR_TASK = TaskSpec(
     # FROZEN (pilot-calibrated, user decision 2026-07-19): steps=12800.
     # Calibration record (bench-mqar-01): delta 0.21 val_qacc at 1600, 0.998+
     # at 12800 (fits); log at chance at both (no recall mechanism).
+    budget=Budget(lr=3e-3, batch_size=128, steps=12800, eval_every=100),
     seeds=36,
 )
 
