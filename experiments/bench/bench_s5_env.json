@@ -1,0 +1,30 @@
+{
+  "env": {
+    "torch": "2.8.0+cu128",
+    "cuda_device_name": "NVIDIA L4",
+    "device_capability": [
+      8,
+      9
+    ],
+    "triton": "3.4.0",
+    "platform": "Linux-6.8.0-1058-gcp-x86_64-with-glibc2.39",
+    "timestamp": "2026-07-19T20:25:35.866171+00:00",
+    "git_commit": "09804b0fe0c5e1acc83828206fe832fc11aae941"
+  },
+  "task": "s5",
+  "rows_extracted": 4,
+  "rows_appended": 4,
+  "rows_skipped_duplicate": 0,
+  "rows_skipped_invalid": 0,
+  "rows_deduped_in_batch": 0,
+  "per_variant_seed_wall_secs": {
+    "givens": {
+      "10": 127.9,
+      "11": 121.1
+    },
+    "delta": {
+      "10": 277.1,
+      "11": 265.3
+    }
+  }
+}
