@@ -2,6 +2,8 @@
 
 This guide runs the Triton scan benchmarks from a repo checkout and reproduces the committed speedup and memory artifacts. It assumes a CUDA GPU (the timing and memory runs need one) and a checkout of the repository, not a `pip install`.
 
+For the accepted-benchmark task results — the mixer family's fit rates on S5, MQAR, psMNIST, and the pendulum control — see the [Benchmark validation](../explanation/benchmark-validation.md) page. This guide covers the scan-kernel speedup/memory microbenchmarks, a separate set of artifacts.
+
 ## The driver
 
 `scripts/bench_scans.py` has three independent modes; pass at least one:

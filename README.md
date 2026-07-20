@@ -46,6 +46,24 @@ An optional Triton backend supplies fused forward+backward GPU kernels for all f
 
 The win is concentrated in the matrix/block ops. Measured on an NVIDIA L4 (torch 2.8.0+cu128, Triton 3.4.0), forward+backward the Triton kernels run 39x–168x faster than eager on `matrix_scan`/`matrix_affine_scan`, and the angle-fused `GivensMinGRU` backward cuts peak memory from 395 MB to 38 MB. The log-space `parallel_scan_log` is the exception. Its recompute-in-backward kernel is 0.70x–0.80x *slower* than eager forward+backward, so eager stays the right default for the baseline `MinGRU`/`SignedMinGRU` mixers. All 590 CPU-vs-GPU parity checks pass. `DeltaMinGRU`'s chunked-WY `forward` is not one of these scan ops: it has its own Triton kernel (forward trio + torch-composed backward, gated separately), but `torch.compile` — not this kernel — is the recommended CUDA path for `mixer="delta"`. A GPU probe found `torch.compile` recovers 68–89% of the available fusion headroom, while the kernel runs 1.85x–3.79x slower than compile on every probed shape; under `MINGRU_SCAN=auto` the kernel therefore engages only in a narrow measured win region (long sequences, narrow head dims), where it beats eager and saves ~3x memory, and stays eager everywhere else (see "Givens variant," below). Kernel design and the full benchmark tables are in the [Triton scan kernels explanation](https://chris-santiago.github.io/minGRU/explanation/triton-scans/) and `experiments/bench/` (`scan_bench.md`, `scan_memory.md`, `scan_parity.md`).
 
+## Benchmark validation
+
+The mixer family is validated on four accepted public benchmarks — S5 symmetric-group word problems, MQAR (multi-query associative recall), psMNIST (permuted-pixel MNIST), and an irregular-timestep pendulum-regression control — with a depth-matched classical `nn.GRU` control anchoring every comparison. This is a validation round, not a leaderboard entry. Cells are the fit count at each task's fixed bar (S5/MQAR/pendulum $n=36$, psMNIST $n=12$); on the generator tasks a "fit" is trainability at the bar, not length generalization. All numbers are the **L4 stratum** (NVIDIA L4, torch 2.8.0+cu128, Triton 3.4.0, `MINGRU_SCAN=triton`), never mixed with the CPU (torch 2.5.1) rows elsewhere in this README.
+
+| arm | S5 (`val128` $\ge 0.99$) | MQAR (`val_qacc` $\ge 0.99$) | psMNIST (`val_acc` $\ge 0.90$) | pendulum (`val_mse` $\le 0.0014$) |
+|---|---|---|---|---|
+| log | 0/36 | 0/36 | 0/12 | 36/36 |
+| signed | 0/36 | 0/36 | 0/12 | 36/36 |
+| rotation | 0/36 | 0/36 | 0/12 | 36/36 |
+| rotation-hetero | 0/36 | 0/36 | 0/12 | 36/36 |
+| givens | 0/36 | 0/36 | 0/12 | 36/36 |
+| delta | 0/36 | 36/36 | 10/12 | 36/36 |
+| signed-givens | 1/36 | 0/36 | 0/12 | 36/36 |
+| signed-delta | 0/36 | 36/36 | 12/12 | 36/36 |
+| gru | 0/36 | 0/36 | 3/12 | 36/36 |
+
+The read is a two-dial mechanism story: delta is the broadly dominant workhorse (associative recall, accumulation ordering, and — at Householder count $nh=4$ in the S5 probe — group composition), while givens is a narrow group-composition specialist (its only matched S5 fit is `signed-givens`, $1/36$). Pendulum is a positive control (all nine arms fit, so the decay channel is not discriminating there). Full per-task tables (raw and fit-only generalization, Fisher contrasts, the S5 $nh$ probe, and the hidden-256 gru-large grounding reference) are on the docs site's [Benchmark validation](https://chris-santiago.github.io/minGRU/explanation/benchmark-validation/) page, with the round-by-round ledger in `experiments/EXPERIMENTS.md`.
+
 ## What this shows
 
 Two word-problem tasks probe exactly the gaps above (full task/eval setup

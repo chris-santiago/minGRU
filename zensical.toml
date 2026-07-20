@@ -48,6 +48,7 @@ nav = [
         { "Overview"                    = "explanation/index.md" },
         { "Expressivity and the ladder" = "explanation/expressivity-ladder.md" },
         { "Givens & Delta deep dive"    = "explanation/givens-delta.md" },
+        { "Benchmark validation"        = "explanation/benchmark-validation.md" },
         { "Triton scan kernels"         = "explanation/triton-scans.md" },
     ] },
 

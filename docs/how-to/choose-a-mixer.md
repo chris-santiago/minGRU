@@ -14,6 +14,19 @@ Ask what the running state has to *do*, then read across:
 | Compose a non-commutative op that must first be extracted, state free to grow | `SignedMinGRU` → `DeltaMinGRU` (native state) | `["signed", "delta"]` | S3-hier fit 12/12 (CPU) / 35/36 (GPU) |
 | Compose a non-commutative op that must first be extracted, state must stay small | `SignedMinGRU` → `GivensMinGRU` | `["signed", "givens"]` | S3-hier fit 8/12 (CPU) / 25/36 (GPU) |
 
+### Mechanism-match by task structure
+
+A broader accepted-benchmark round (MQAR, psMNIST, S5, and a Pendulum control) ran on the same L4 stratum as the Givens-vs-delta comparison below (torch 2.8.0+cu128, triton 3.4.0). It maps task structure onto the mechanism that actually fits it:
+
+| Task structure | Best mechanism | L4 evidence (this round) |
+|---|---|---|
+| Associative recall (key→value) | delta family | MQAR: only `delta`/`signed-delta` fit ($36/36$); every non-delta arm $0/36$ |
+| Order-sensitive accumulation | delta family | psMNIST: `signed-delta` $12/12$ (best), `delta` $10/12$; `givens` $0/12$ (worst, raw $\approx 0.29$) |
+| Group composition (permutations) | givens OR delta at $nh \ge k-1$ | S5: `signed-givens` $1/36$ (continuous coupled-8D rotation+sign); `signed-delta-nh4` $7/36$ (Householder threshold — a 5-cycle needs 4 reflections; matched `nh=2` was $0/36$) |
+| (Control) irregular-time regression | not discriminating | Pendulum: all nine arms fit, including `gru` |
+
+On these public tasks, delta is the broadly dominant mechanism (recall, accumulation, and groups at `nh=4`); givens remains the narrow group-composition specialist. This is the same two-dial story as [the two-axis guidance](#the-two-axis-guidance) below, not "delta beats givens everywhere" — the earlier `S3-hier` round, where givens won at matched state (table above), still stands for that task. The full per-task fit matrices, raw and fit-only generalization, and the S5 `nh` probe are on the [Benchmark validation](../explanation/benchmark-validation.md) page.
+
 ## The two-axis guidance
 
 `GivensMinGRU` and `DeltaMinGRU` both compose a non-commutative operation above a `SignedMinGRU` extractor, and the choice between them is no longer a single winner — it is conditioned on two axes: **how much per-token state your deployment can afford**, and **how far past training length it needs to extrapolate**. This is the section other pages point to when they need the full picture; the per-mixer sections below stay focused on usage.
@@ -77,6 +90,18 @@ model = MinGRUStack(
 ```
 
 At its native ($16\times$-larger) state, `DeltaMinGRU` fits `S3-hier` on $12/12$ CPU seeds and $35/36$ GPU seeds — the most reliable composer measured on either stratum. On CPU it is also the cheap path: under the pinned bench (`experiments/bench/delta_paths.md`; torch 2.5.1), one uncontended forward+backward step at $B{=}128$, $T{=}64$ costs $0.0577$s against $0.9493$s for the eager `GivensMinGRU` scan — roughly $16\times$ cheaper — and stays roughly $16\times$ cheaper at $T{=}1024$ ($1.4541$s against $24.9996$s); its cost and memory stay nearly flat as state grows (`experiments/bench/scaling_frontier.md`). **On GPU this cost gap disappears**: per-seed training wall time is parity with `GivensMinGRU`'s Triton scan path ($\approx 15$–$18$s for all arms), because `GivensMinGRU`'s Triton scan removes the CPU-side gap, not because delta got slower. Choose delta for reliability and state economics on GPU, not for speed.
+
+### The three dials
+
+`DeltaMinGRU`'s capacity knobs are the state size, the Householder count, and the kernel tile — only the first two change what it can represent:
+
+| Dial | Controls | Default | Turn it up when | Evidence |
+| --- | --- | --- | --- | --- |
+| State size ($n_{\text{heads}} \cdot d_k \cdot d_v$) | recall / associative capacity | promoted native | recall saturates (high-load recall) | MQAR: only delta-family fits |
+| `nh` (Householder count / DeltaProduct order) | group-composition reach; a $k$-cycle needs $k-1$ reflections | `nh=2` | the task needs high-order permutations | S5: nh2 $0/36$ → nh4 $7/36$ |
+| `chunk_size` | nothing capability-wise — kernel WY tile; output/gradient-invariant | `64` (`32` when $nh \cdot \text{chunk\_size} > 128$) | never for accuracy; only to fit the triton micro-step envelope | probe nh3/nh4 ran at `chunk_size=32`, math-identical |
+
+The third row is load-bearing: `chunk_size` is not an expressivity knob, only the chunked-WY tile size (output and gradients are invariant to it). That is why the S5 `nh` probe above could run its `nh3`/`nh4` arms at `chunk_size=32`: to fit the $nh \cdot \text{chunk\_size} \le 128$ envelope, not because those arms needed a smaller state — the nh3/nh4 result is not confounded by that choice.
 
 ### GPU execution path for `mixer="delta"`
 
