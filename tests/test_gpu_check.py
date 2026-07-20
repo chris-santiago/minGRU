@@ -72,6 +72,12 @@ A later amendment (2026-07-20 entry, S5-only probe round) adds
 finish handler must accept probe rows and dedup them by the same
 four-field key as matrix rows, without touching the matrix accounting
 already pinned above.
+
+A further amendment (2026-07-20, "gru-large grounding reference") adds
+``BENCH_REF_ROUND_TAGS``'s single ``bench-psmnist-ref-01`` tag to
+``_BENCHMARKS_ROUNDS`` the same way -- the finish handler must accept
+reference rows too, again without touching the matrix or probe
+accounting.
 """
 
 from __future__ import annotations
@@ -856,9 +862,19 @@ def test_benchmarks_rounds_accepts_both_pilot_and_current_generations():
     for tag in BENCH_ROUND_TAGS.values():
         assert tag in _BENCH_ROUNDS
     # No accidental collision between the two generations (the S5-only
-    # probe round is a third, separately-counted generation -- see
-    # test_benchmarks_rounds_also_accepts_the_probe_round below).
-    assert len(_BENCH_ROUNDS) == len(pilot_tags) + len(BENCH_ROUND_TAGS) + 1
+    # probe round and the psMNIST-only ref round are two further,
+    # separately-counted generations -- see
+    # test_benchmarks_rounds_also_accepts_the_probe_round and
+    # test_benchmarks_rounds_also_accepts_the_ref_round below).
+    from experiments.benchmark_tasks import BENCH_PROBE_ROUND_TAGS, BENCH_REF_ROUND_TAGS
+
+    n_generations = (
+        len(pilot_tags)
+        + len(BENCH_ROUND_TAGS)
+        + len(BENCH_PROBE_ROUND_TAGS)
+        + len(BENCH_REF_ROUND_TAGS)
+    )
+    assert len(_BENCH_ROUNDS) == n_generations
 
 
 def test_benchmarks_rounds_also_accepts_the_probe_round():
@@ -871,6 +887,19 @@ def test_benchmarks_rounds_also_accepts_the_probe_round():
 
     assert BENCH_PROBE_ROUND_TAGS == {"s5": "bench-s5-probe-01"}
     for tag in BENCH_PROBE_ROUND_TAGS.values():
+        assert tag in _BENCH_ROUNDS
+
+
+def test_benchmarks_rounds_also_accepts_the_ref_round():
+    """`_BENCHMARKS_ROUNDS` must additionally accept the psMNIST-only
+    reference round tag (`experiments.benchmark_tasks.BENCH_REF_ROUND_TAGS`,
+    "gru-large grounding reference" amendment) -- the finish handler must
+    recognize `gru-large` reference rows as this job mode's own data too,
+    alongside the pilot, matrix, and probe generations."""
+    from experiments.benchmark_tasks import BENCH_REF_ROUND_TAGS
+
+    assert BENCH_REF_ROUND_TAGS == {"psmnist": "bench-psmnist-ref-01"}
+    for tag in BENCH_REF_ROUND_TAGS.values():
         assert tag in _BENCH_ROUNDS
 
 

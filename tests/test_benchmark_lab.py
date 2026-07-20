@@ -60,6 +60,16 @@ Sections
     feature-only wiring (no mechanical decay path exists to disable),
     decay exclusion, and a forward+backward gradient-flow smoke per loss
     mode.
+11. `REF_ARMS` (fifth amendment, "gru-large grounding reference" entry) --
+    `gru-large`, a literature-scale (hidden-256, 2-layer) plain `nn.GRU`,
+    registered like `gru` with a sentinel tuple value but deliberately
+    excluded from `MATRIX_ARMS`/`DECAY_CAPABLE_ARMS`: `ARM_REGISTRY ==
+    MATRIX_ARMS | PROBE_ARMS | REF_ARMS`. `build_model` builds it at
+    `GRU_LARGE_D_MODEL` (256) instead of `gru`'s `D_MODEL` (64), and
+    `run_arm` applies `REF_ARM_BUDGETS[("psmnist", "gru-large")]`'s
+    60-epoch override as the resolved default (an explicit `epochs=`
+    argument still wins), leaving `gru`'s and every matched arm's
+    budget resolution untouched.
 """
 
 from __future__ import annotations
@@ -74,8 +84,11 @@ import torch.nn.functional as F
 from experiments.benchmark_lab import (
     ARM_REGISTRY,
     DECAY_CAPABLE_ARMS,
+    GRU_LARGE_D_MODEL,
     MATRIX_ARMS,
     PROBE_ARMS,
+    REF_ARM_BUDGETS,
+    REF_ARMS,
     FeatureSequenceModel,
     GRUFeatureSequenceModel,
     GRUTokenSequenceModel,
@@ -87,6 +100,7 @@ from experiments.benchmark_lab import (
     _forward_regression,
     _model_layers,
     _row_exists,
+    _SyntheticPsMNISTLoader,
     _tiny_task_overrides,
     build_model,
     run_arm,
@@ -427,7 +441,7 @@ def test_build_model_feature_sequence_last_step_shapes(arm):
     assert out.shape == (2, 12, 10)
 
 
-@pytest.mark.parametrize("arm", sorted(set(ARM_REGISTRY) - {"gru"}))
+@pytest.mark.parametrize("arm", sorted(set(ARM_REGISTRY) - {"gru", "gru-large"}))
 def test_build_model_pendulum_decay_wiring_matches_decay_capable_arms(arm):
     task = TASKS["pendulum"]
     model = build_model(task, arm)
@@ -679,7 +693,9 @@ def test_all_matrix_arms_have_distinct_param_counts():
 # ------------------------------------------------ 9. PROBE_ARMS (3rd amendment)
 def test_matrix_and_probe_arms_are_disjoint_and_union_to_arm_registry():
     assert set(MATRIX_ARMS) & set(PROBE_ARMS) == set()
-    assert set(ARM_REGISTRY) == set(MATRIX_ARMS) | set(PROBE_ARMS)
+    assert set(MATRIX_ARMS) & set(REF_ARMS) == set()
+    assert set(PROBE_ARMS) & set(REF_ARMS) == set()
+    assert set(ARM_REGISTRY) == set(MATRIX_ARMS) | set(PROBE_ARMS) | set(REF_ARMS)
     assert len(MATRIX_ARMS) == 9  # eight MinGRUStack mixer arms + gru
     assert len(PROBE_ARMS) == 3
 
@@ -732,11 +748,18 @@ def test_signed_delta_nh_probe_arms_registered_with_raised_nh(arm, expected_nh):
     """`signed-delta-nh3`/`signed-delta-nh4` are the `signed-delta` stack
     with the delta block's Householder-product count `nh` raised from
     this round's matrix value (2) to 3/4 -- `n_heads`/`d_k`/`d_v` unchanged
-    from the matrix `delta`/`signed-delta` arms' own kwargs."""
+    from the matrix `delta`/`signed-delta` arms' own kwargs. `chunk_size=32`
+    (vs the default 64) keeps `nh * chunk_size` within the delta Triton
+    kernel's `_DELTA_MAX_MICROSTEPS`=128 envelope (nh=3 -> 96, nh=4 -> 128);
+    chunk_size is an exact chunked-WY tiling parameter, not an expressivity
+    change."""
     assert arm in PROBE_ARMS
     mixer, kwargs = PROBE_ARMS[arm]
     assert mixer == ["signed", "delta"]
-    assert kwargs == {"delta": {"nh": expected_nh, "n_heads": 4, "d_k": 16, "d_v": 16}}
+    assert kwargs == {
+        "delta": {"nh": expected_nh, "n_heads": 4, "d_k": 16, "d_v": 16, "chunk_size": 32}
+    }
+    assert expected_nh * kwargs["delta"]["chunk_size"] <= 128
 
 
 @pytest.mark.parametrize("arm,expected_nh", [("signed-delta-nh3", 3), ("signed-delta-nh4", 4)])
@@ -750,6 +773,10 @@ def test_signed_delta_nh_probe_arms_block_composition_matches_registered_nh(arm,
     assert delta_block.mingru.n_heads == 4
     assert delta_block.mingru.d_k == 16
     assert delta_block.mingru.d_v == 16
+    # chunk_size=32 must reach the built DeltaMinGRU (the attribute this
+    # probe's kernel-envelope fix changed) and keep nh*chunk_size <= 128.
+    assert delta_block.mingru.chunk_size == 32
+    assert expected_nh * delta_block.mingru.chunk_size <= 128
 
 
 def test_signed_delta_nh_probe_arms_have_distinct_param_counts():
@@ -951,6 +978,207 @@ def test_gru_forward_backward_smoke_regression_pendulum():
     dt[:, 0] = 0.0
     y = torch.randn(3, 8, 2)
     loss, _, _ = _forward_regression(model, x, dt, y, "gru")
+    loss.backward()
+    _assert_gradients_flow(model)
+
+
+# --------------------------------------- 11. REF_ARMS (5th amendment: gru-large)
+def test_gru_large_registered_as_sentinel_tuple_in_ref_arms():
+    """`gru-large` (Amendments, 2026-07-20 "gru-large grounding reference"
+    entry) is registered in `REF_ARMS` with a SENTINEL tuple value -- same
+    never-destructured convention as `MATRIX_ARMS["gru"]`."""
+    assert "gru-large" in REF_ARMS
+    assert "gru-large" in ARM_REGISTRY
+    mixer, kwargs = REF_ARMS["gru-large"]
+    assert mixer == "gru-large"
+    assert kwargs is None
+
+
+def test_gru_large_excluded_from_matrix_arms_and_decay_capable_arms():
+    """`gru-large` is an explicitly NON-matched reference: it must never
+    join `MATRIX_ARMS` (so `scripts/report_benchmarks.py`'s `-02`
+    completeness accounting and `scripts/gpu_benchmark_campaign.py`'s
+    default `--arms` never pick it up), and -- like `gru` -- it has no
+    decay/`delta_t` mechanism to enable, so it is excluded from
+    `DECAY_CAPABLE_ARMS` too."""
+    assert "gru-large" not in MATRIX_ARMS
+    assert "gru-large" not in DECAY_CAPABLE_ARMS
+
+
+@pytest.mark.parametrize("task_name", ["s5", "mqar"])
+def test_build_model_gru_large_token_sequence_hidden_256_two_layers(task_name):
+    """`gru-large` on the two token-input tasks: a 2-layer `nn.GRU` at
+    `GRU_LARGE_D_MODEL` (256) -- embedding, GRU hidden state, and head
+    input all at 256, distinct from the matched `gru` arm's 64."""
+    task = TASKS[task_name]
+    model = build_model(task, "gru-large")
+    assert isinstance(model, GRUTokenSequenceModel)
+    assert model.rnn.num_layers == 2
+    assert model.emb.embedding_dim == GRU_LARGE_D_MODEL == 256
+    assert model.rnn.hidden_size == GRU_LARGE_D_MODEL
+    assert model.head.in_features == GRU_LARGE_D_MODEL
+    vocab, n_cls = model.emb.num_embeddings, model.head.out_features
+    x = torch.randint(0, vocab, (2, 9))
+    out = model(x)
+    assert out.shape == (2, 9, n_cls)
+
+
+def test_build_model_gru_large_feature_sequence_last_step_hidden_256():
+    """`gru-large` on psMNIST (last_step): a 2-layer `nn.GRU` at
+    `GRU_LARGE_D_MODEL` over the scalar pixel-stream input -- no
+    `log1p(dt)` feature (psMNIST has no `dt`), matching `gru`'s input
+    shape but with a distinct (256, not 64) hidden width."""
+    task = TASKS["psmnist"]
+    model = build_model(task, "gru-large")
+    assert isinstance(model, GRUFeatureSequenceModel)
+    assert model.rnn.num_layers == 2
+    assert model.rnn.input_size == 1
+    assert model.rnn.hidden_size == GRU_LARGE_D_MODEL == 256
+    x = torch.rand(2, 12, 1)
+    out = model(x)
+    assert out.shape == (2, 12, 10)
+    loss, correct, total = _forward_last_step(model, x, torch.zeros(2, dtype=torch.long))
+    assert torch.isfinite(loss)
+    assert total == 2
+
+
+def test_build_model_gru_large_regression_gets_dt_as_feature_not_mechanical_decay():
+    """`gru-large` on pendulum (regression): `input_size` is `in_dim + 1`
+    (the `log1p(dt)` fairness-rule feature), same treatment as `gru` --
+    the only difference is the 256 hidden width."""
+    task = TASKS["pendulum"]
+    model = build_model(task, "gru-large")
+    assert isinstance(model, GRUFeatureSequenceModel)
+    assert model.rnn.input_size == 3  # 2 state dims + 1 log1p(dt) feature
+    assert model.rnn.hidden_size == GRU_LARGE_D_MODEL
+    x = torch.randn(2, 8, 2)
+    dt = torch.rand(2, 8).clamp(min=0.01)
+    dt[:, 0] = 0.0
+    y = torch.randn(2, 8, 2)
+    loss, sq_err_sum, count = _forward_regression(model, x, dt, y, "gru-large")
+    assert torch.isfinite(loss)
+    assert count == y.numel()
+
+
+def test_gru_and_gru_large_have_distinct_param_counts_and_hidden_widths():
+    """`gru` (hidden 64) and `gru-large` (hidden 256) must build genuinely
+    different models, not two names for the same construction -- both a
+    shape check (hidden width) and a params check (the S3+ "distinct
+    param counts" invariant this round's other arm pairs are held to)."""
+    task = TASKS["psmnist"]
+    gru_model = build_model(task, "gru")
+    gru_large_model = build_model(task, "gru-large")
+    assert gru_model.rnn.hidden_size == 64
+    assert gru_large_model.rnn.hidden_size == 256
+    gru_params = sum(p.numel() for p in gru_model.parameters())
+    gru_large_params = sum(p.numel() for p in gru_large_model.parameters())
+    assert gru_params != gru_large_params
+
+
+def test_gru_large_row_layers_field_reports_two():
+    """`run_arm`'s `"layers"` field must read `model.rnn.num_layers` for
+    `gru-large` too (it has no `.stack` attribute, same as `gru`)."""
+    tiny_tasks = _tiny_task_overrides()
+    row = run_arm(
+        round_tag="test-gru-large-layers",
+        task=tiny_tasks["s5"],
+        arm="gru-large",
+        seed=0,
+        device="cpu",
+        dry_run=True,
+    )
+    assert row["layers"] == 2
+    assert _model_layers(build_model(TASKS["s5"], "gru-large")) == 2
+
+
+def _psmnist_task_with_synthetic_loader() -> TaskSpec:
+    """The REAL psMNIST `TaskSpec` (`Budget.epochs=30`, the matched value
+    `REF_ARM_BUDGETS` must override for `gru-large`) with its `data`
+    swapped for the synthetic stand-in loader (module docstring: "may use
+    synthetic stand-in batches ... to avoid download") -- everything else
+    (budget, fit_metric, thresholds) stays the real, un-tiny-ified
+    `TaskSpec`, unlike `_tiny_task_overrides`'s own psmnist entry, which
+    also shrinks `Budget.epochs` to 1 and would mask this override."""
+    return replace(
+        TASKS["psmnist"],
+        data=lambda batch_size: _SyntheticPsMNISTLoader(batch_size),
+        budget=replace(TASKS["psmnist"].budget, batch_size=8),
+    )
+
+
+def test_ref_arm_budget_override_psmnist_gru_large_runs_60_epochs():
+    """`REF_ARM_BUDGETS[("psmnist", "gru-large")]` (60 epochs, lr=1e-3) is
+    the resolved DEFAULT `run_arm` applies for `gru-large` on psMNIST when
+    no explicit `epochs=`/`lr=` argument is given -- the matched arms'
+    frozen 30-epoch budget is a different (task, arm) key and must stay
+    untouched (see the sibling test below)."""
+    assert REF_ARM_BUDGETS[("psmnist", "gru-large")] == {"epochs": 60, "lr": 1e-3}
+    row = run_arm(
+        round_tag="test-ref-budget",
+        task=_psmnist_task_with_synthetic_loader(),
+        arm="gru-large",
+        seed=0,
+        device="cpu",
+        dry_run=True,
+    )
+    assert row["config"]["budget"]["epochs"] == 60
+    assert row["config"]["budget"]["lr"] == 1e-3
+
+
+def test_ref_arm_budget_override_leaves_matched_gru_untouched():
+    """The SAME `(task.name, arm)` budget-resolution code path must leave
+    the matched `gru` arm's frozen 30-epoch budget exactly as it was
+    before `REF_ARM_BUDGETS` existed -- `gru` has no entry in that dict."""
+    row = run_arm(
+        round_tag="test-matched-budget",
+        task=_psmnist_task_with_synthetic_loader(),
+        arm="gru",
+        seed=0,
+        device="cpu",
+        dry_run=True,
+    )
+    assert row["config"]["budget"]["epochs"] == 30
+    assert row["config"]["budget"]["lr"] == 1e-3
+
+
+def test_gru_large_forward_backward_smoke_dense_s5():
+    torch.manual_seed(0)
+    model = build_model(TASKS["s5"], "gru-large")
+    x = torch.randint(0, 120, (3, 10))
+    y = torch.randint(0, 120, (3, 10))
+    loss, _, _ = _forward_dense(model, x, y)
+    loss.backward()
+    _assert_gradients_flow(model)
+
+
+def test_gru_large_forward_backward_smoke_masked_query_mqar():
+    torch.manual_seed(0)
+    model = build_model(TASKS["mqar"], "gru-large")
+    gen = torch.Generator().manual_seed(1)
+    x, y, mask = make_mqar(3, 32, gen, num_pairs=4)
+    loss, _, _ = _forward_masked_query(model, x, y, mask)
+    loss.backward()
+    _assert_gradients_flow(model)
+
+
+def test_gru_large_forward_backward_smoke_last_step_psmnist():
+    torch.manual_seed(0)
+    model = build_model(TASKS["psmnist"], "gru-large")
+    x = torch.rand(3, 10, 1)
+    y = torch.randint(0, 10, (3,))
+    loss, _, _ = _forward_last_step(model, x, y)
+    loss.backward()
+    _assert_gradients_flow(model)
+
+
+def test_gru_large_forward_backward_smoke_regression_pendulum():
+    torch.manual_seed(0)
+    model = build_model(TASKS["pendulum"], "gru-large")
+    x = torch.randn(3, 8, 2)
+    dt = torch.rand(3, 8).clamp(min=0.01)
+    dt[:, 0] = 0.0
+    y = torch.randn(3, 8, 2)
+    loss, _, _ = _forward_regression(model, x, dt, y, "gru-large")
     loss.backward()
     _assert_gradients_flow(model)
 

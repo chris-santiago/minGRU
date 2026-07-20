@@ -804,3 +804,23 @@ BENCH_ROUND_TAGS: dict[str, str] = {
 BENCH_PROBE_ROUND_TAGS: dict[str, str] = {
     "s5": "bench-s5-probe-01",
 }
+
+# Reference round tags (Amendments, `.claude/output/intent/2026-07-19-
+# benchmark-round-intent.md`, 2026-07-20 "gru-large grounding reference"
+# entry): a literature-scale `gru-large` arm (hidden-256, 2-layer `nn.GRU`,
+# `experiments.benchmark_lab.REF_ARMS`) that validates the GRU code path and
+# grounds the family's absolute numbers -- explicitly NOT a matched
+# competitor, so its rows must never land under `BENCH_ROUND_TAGS` (the
+# matched `-02` tag every `MATRIX_ARMS` seed uses). Same distinct-tag
+# convention as `BENCH_PROBE_ROUND_TAGS` above (own source-of-truth mapping,
+# `scripts/gpu_benchmark_campaign.py`'s round-tag resolution fails loud for
+# any `(task, ref arm)` pair with no entry here rather than silently falling
+# back to the matched tag). Only `"psmnist"` has an entry: this round only
+# runs `gru-large` on psMNIST (the task whose matched `gru` control landed
+# below the literature vanilla-GRU band); a ref arm requested against any
+# other task has no round tag to write under. `scripts/gpu_check.py`'s
+# `_BENCHMARKS_ROUNDS` unions these values in alongside the pilot, matrix,
+# and probe tags so the finish handler accepts reference rows too.
+BENCH_REF_ROUND_TAGS: dict[str, str] = {
+    "psmnist": "bench-psmnist-ref-01",
+}

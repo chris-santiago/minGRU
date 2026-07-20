@@ -29,6 +29,12 @@ Sections
    classical control arm added by a fourth amendment), and rows carrying
    either the probe round tag or a probe-only variant never surface in a
    `-02` report.
+9. `REF_ARMS` grounding reference (`gru-large`, fifth amendment) -- a
+   distinct `build_ref_task_report`/`render_ref_markdown`/
+   `write_ref_reports` path writing `bench_<task>_ref.{json,md}`, never
+   the matched `bench_<task>.{json,md}` pair; no Fisher-vs-`log` section;
+   rows carrying either the ref round tag or a ref-only variant never
+   surface in a `-02` report, mirroring section 8's probe regression.
 """
 
 from __future__ import annotations
@@ -39,8 +45,19 @@ import sys
 from pathlib import Path
 
 import pytest
-from experiments.benchmark_lab import ARM_REGISTRY, DECAY_CAPABLE_ARMS, MATRIX_ARMS, PROBE_ARMS
-from experiments.benchmark_tasks import BENCH_PROBE_ROUND_TAGS, BENCH_ROUND_TAGS, TASKS
+from experiments.benchmark_lab import (
+    ARM_REGISTRY,
+    DECAY_CAPABLE_ARMS,
+    MATRIX_ARMS,
+    PROBE_ARMS,
+    REF_ARMS,
+)
+from experiments.benchmark_tasks import (
+    BENCH_PROBE_ROUND_TAGS,
+    BENCH_REF_ROUND_TAGS,
+    BENCH_ROUND_TAGS,
+    TASKS,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SCRIPT_PATH = _REPO_ROOT / "scripts" / "report_benchmarks.py"
@@ -51,10 +68,14 @@ sys.modules.setdefault("report_benchmarks", report_benchmarks)
 _spec.loader.exec_module(report_benchmarks)
 
 ROUND_TAGS = report_benchmarks.ROUND_TAGS
+REF_ROUND_TAGS = report_benchmarks.REF_ROUND_TAGS
 FISHER_REFERENCE_ARM = report_benchmarks.FISHER_REFERENCE_ARM
 build_task_report = report_benchmarks.build_task_report
+build_ref_task_report = report_benchmarks.build_ref_task_report
 render_markdown = report_benchmarks.render_markdown
+render_ref_markdown = report_benchmarks.render_ref_markdown
 write_reports = report_benchmarks.write_reports
+write_ref_reports = report_benchmarks.write_ref_reports
 main = report_benchmarks.main
 _load_all_rows = report_benchmarks._load_all_rows
 
@@ -437,10 +458,13 @@ def test_matrix_arms_planned_set_is_exactly_the_nine_matrix_arms():
         "gru",
     }
     assert len(MATRIX_ARMS) == 9
-    # PROBE_ARMS is disjoint and joins ARM_REGISTRY, but never MATRIX_ARMS.
+    # PROBE_ARMS and REF_ARMS are each disjoint from MATRIX_ARMS (and from
+    # each other) and join ARM_REGISTRY, but never MATRIX_ARMS.
     assert set(PROBE_ARMS) & set(MATRIX_ARMS) == set()
-    assert set(ARM_REGISTRY) == set(MATRIX_ARMS) | set(PROBE_ARMS)
-    assert len(ARM_REGISTRY) == 12
+    assert set(REF_ARMS) & set(MATRIX_ARMS) == set()
+    assert set(ARM_REGISTRY) == set(MATRIX_ARMS) | set(PROBE_ARMS) | set(REF_ARMS)
+    assert len(REF_ARMS) == 1
+    assert len(ARM_REGISTRY) == 13
 
 
 def test_probe_round_rows_never_appear_in_a_minus02_matrix_report():
@@ -474,3 +498,113 @@ def test_unrecognized_probe_variant_under_the_matrix_round_tag_is_silently_dropp
     assert set(report["arms"]) == set(MATRIX_ARMS)
     assert "signed-delta-nh3" not in report["arms"]
     assert report["arms"]["log"]["seeds_present"] == 1
+
+
+# --------------------------- 9. REF_ARMS grounding reference (gru-large) --
+# (psMNIST-only reference round, REF_ARMS -- Amendments, 2026-07-20
+# "gru-large grounding reference" entry): a literature-scale gru-large arm,
+# reported through a DISTINCT build_ref_task_report/render_ref_markdown/
+# write_ref_reports path -- bench_<task>_ref.{json,md}, never the matched
+# bench_<task>.{json,md} pair -- so the matched -02 accounting stays
+# byte-identical regardless of whether REF_ARMS rows exist.
+def test_ref_round_tags_match_bench_ref_round_tags():
+    assert REF_ROUND_TAGS == BENCH_REF_ROUND_TAGS
+    assert REF_ROUND_TAGS == {"psmnist": "bench-psmnist-ref-01"}
+
+
+def test_gru_large_ref_row_never_appears_in_a_minus02_matrix_report():
+    """A row tagged under the reference round (`BENCH_REF_ROUND_TAGS
+    ["psmnist"]`) with the `gru-large` variant must never surface in the
+    `-02` matrix report: `_rows_for_task` filters by round tag FIRST (the
+    ref tag never equals `ROUND_TAGS["psmnist"]`), so the row is dropped
+    before variant matching is even attempted -- mirroring the probe-round
+    regression test above."""
+    ref_row = _psmnist_row(0, "gru-large", val_acc=0.93, test_acc=0.92)
+    ref_row["round"] = BENCH_REF_ROUND_TAGS["psmnist"]
+    matrix_row = _psmnist_row(0, "log", val_acc=0.8, test_acc=0.78)
+
+    report = build_task_report("psmnist", [ref_row, matrix_row])
+
+    assert set(report["arms"]) == set(MATRIX_ARMS)
+    assert "gru-large" not in report["arms"]
+    assert report["arms"]["log"]["seeds_present"] == 1
+
+
+def test_unrecognized_ref_variant_under_the_matrix_round_tag_is_silently_dropped():
+    """A row that somehow carried the MATRIX `-02` round tag but the
+    ref-only `gru-large` variant (never emitted by the campaign --
+    `REF_ARMS` always writes under the distinct ref tag) is still silently
+    dropped -- must not crash the report or fabricate a tenth arm column."""
+    stray_row = _psmnist_row(0, "gru-large", val_acc=0.93, test_acc=0.92)
+    matrix_row = _psmnist_row(0, "log", val_acc=0.8, test_acc=0.78)
+
+    report = build_task_report("psmnist", [stray_row, matrix_row])
+
+    assert set(report["arms"]) == set(MATRIX_ARMS)
+    assert "gru-large" not in report["arms"]
+    assert report["arms"]["log"]["seeds_present"] == 1
+
+
+def test_build_ref_task_report_reads_only_the_ref_round_and_ref_arms():
+    """`build_ref_task_report` is the mirror image of the regression tests
+    above: a matched `-02` row for `gru-large` (wrong round) and a matched
+    `log` row under the ref tag (wrong arm) must both be excluded from the
+    reference report -- only a `gru-large` row under the ref tag counts."""
+    wrong_round = _psmnist_row(0, "gru-large", val_acc=0.93, test_acc=0.92)  # matched -02 tag
+    wrong_arm = _psmnist_row(1, "log", val_acc=0.8, test_acc=0.78)
+    wrong_arm["round"] = BENCH_REF_ROUND_TAGS["psmnist"]
+    real_ref_row = _psmnist_row(2, "gru-large", val_acc=0.93, test_acc=0.92)
+    real_ref_row["round"] = BENCH_REF_ROUND_TAGS["psmnist"]
+
+    report = build_ref_task_report("psmnist", [wrong_round, wrong_arm, real_ref_row])
+
+    assert set(report["arms"]) == set(REF_ARMS)
+    assert report["arms"]["gru-large"]["seeds_present"] == 1
+    assert report["arms"]["gru-large"]["present_seeds"] == [2]
+
+
+def test_build_ref_task_report_has_no_fisher_section():
+    """Deliberately no Fisher-vs-`log` comparison in the reference report
+    (`build_ref_task_report`'s docstring): a ref arm's rows run under a
+    distinct training budget from the matched population `log`'s fit rate
+    is computed under, so comparing them would silently mix two strata."""
+    report = build_ref_task_report("psmnist", [])
+    assert "fisher_vs_reference" not in report
+    assert "fisher_reference_arm" not in report
+    assert report["reference"] is True
+
+
+def test_build_ref_task_report_raises_for_a_task_with_no_ref_round_tag():
+    for task_name in ("s5", "mqar", "pendulum"):
+        with pytest.raises(ValueError, match="no REF_ARMS round tag"):
+            build_ref_task_report(task_name, [])
+
+
+def test_render_ref_markdown_labels_reference_and_omits_fisher_section():
+    report = build_ref_task_report("psmnist", [])
+    md = render_ref_markdown(report)
+    assert "REFERENCE arm(s)" in md
+    assert "NOT part of the matched" in md
+    assert "gru-large" in md
+    assert "Fisher exact" not in md
+    assert "0 rows found for arm `gru-large`" in md
+
+
+def test_write_ref_reports_writes_distinct_filenames_from_the_matched_pair(tmp_path):
+    """`write_ref_reports` must write `bench_<task>_ref.{json,md}` --
+    distinct filenames from `write_reports`'s `bench_<task>.{json,md}` --
+    so calling it never touches (or collides with) the matched output."""
+    ref_row = _psmnist_row(0, "gru-large", val_acc=0.93, test_acc=0.92)
+    ref_row["round"] = BENCH_REF_ROUND_TAGS["psmnist"]
+
+    matched_reports = write_reports([], tmp_path)
+    ref_reports = write_ref_reports([ref_row], tmp_path)
+
+    assert set(ref_reports) == set(REF_ROUND_TAGS)
+    assert (tmp_path / "bench_psmnist_ref.json").exists()
+    assert (tmp_path / "bench_psmnist_ref.md").exists()
+    # The matched files are untouched by the ref write (still 0-row, since
+    # matched_reports was built from an empty ledger).
+    on_disk_matched = json.loads((tmp_path / "bench_psmnist.json").read_text())
+    assert on_disk_matched == matched_reports["psmnist"]
+    assert on_disk_matched["arms"]["log"]["seeds_present"] == 0

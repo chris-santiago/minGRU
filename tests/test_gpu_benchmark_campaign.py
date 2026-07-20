@@ -31,6 +31,11 @@ Split into two groups, mirroring ``test_gpu_hetero_campaign.py``:
   three probe arms emit rows tagged ``bench-s5-probe-01``, never
   ``bench-s5-02``. These import torch (via the subprocess) and are slower,
   so they're kept to a small, fixed number of cases.
+
+``_round_tag_for_arm``'s probe routing above also covers the ``gru-large``
+reference arm's routing to ``bench-psmnist-ref-01`` (``REF_ARMS``,
+``BENCH_REF_ROUND_TAGS`` -- Amendments, 2026-07-20 "gru-large grounding
+reference" entry), same pattern as the S5-only probe round.
 """
 
 from __future__ import annotations
@@ -43,7 +48,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from experiments.benchmark_lab import ARM_REGISTRY, MATRIX_ARMS, PROBE_ARMS
+from experiments.benchmark_lab import ARM_REGISTRY, MATRIX_ARMS, PROBE_ARMS, REF_ARMS
 from experiments.benchmark_tasks import TASKS
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -57,6 +62,7 @@ _spec.loader.exec_module(gpu_benchmark_campaign)
 
 _ROUND_TAGS = gpu_benchmark_campaign._ROUND_TAGS
 _PROBE_ROUND_TAGS = gpu_benchmark_campaign._PROBE_ROUND_TAGS
+_REF_ROUND_TAGS = gpu_benchmark_campaign._REF_ROUND_TAGS
 _resolve_seeds = gpu_benchmark_campaign._resolve_seeds
 _resolve_eval_every = gpu_benchmark_campaign._resolve_eval_every
 _round_tag_for_arm = gpu_benchmark_campaign._round_tag_for_arm
@@ -100,13 +106,13 @@ def test_probe_round_tags_match_bench_probe_round_tags():
 
 @pytest.mark.parametrize("arm", sorted(PROBE_ARMS))
 def test_round_tag_for_arm_routes_probe_arms_to_the_probe_tag(arm):
-    assert _round_tag_for_arm("s5", arm, PROBE_ARMS) == "bench-s5-probe-01"
+    assert _round_tag_for_arm("s5", arm, PROBE_ARMS, REF_ARMS) == "bench-s5-probe-01"
 
 
 @pytest.mark.parametrize("arm", sorted(MATRIX_ARMS))
 def test_round_tag_for_arm_routes_matrix_arms_to_the_matrix_tag(arm):
     for task_name in TASKS:
-        assert _round_tag_for_arm(task_name, arm, PROBE_ARMS) == _ROUND_TAGS[task_name]
+        assert _round_tag_for_arm(task_name, arm, PROBE_ARMS, REF_ARMS) == _ROUND_TAGS[task_name]
 
 
 def test_round_tag_for_arm_raises_for_probe_arm_on_a_task_with_no_probe_tag():
@@ -115,7 +121,31 @@ def test_round_tag_for_arm_raises_for_probe_arm_on_a_task_with_no_probe_tag():
     # than silently falling back to that task's matrix tag.
     for task_name in ("mqar", "psmnist", "pendulum"):
         with pytest.raises(ValueError, match="no round tag"):
-            _round_tag_for_arm(task_name, "rotation-hetero-k5", PROBE_ARMS)
+            _round_tag_for_arm(task_name, "rotation-hetero-k5", PROBE_ARMS, REF_ARMS)
+
+
+# --- ref round tags + _round_tag_for_arm: gru-large reference routing ------
+
+
+def test_ref_round_tags_match_bench_ref_round_tags():
+    from experiments.benchmark_tasks import BENCH_REF_ROUND_TAGS
+
+    assert _REF_ROUND_TAGS == BENCH_REF_ROUND_TAGS
+    assert _REF_ROUND_TAGS == {"psmnist": "bench-psmnist-ref-01"}
+
+
+@pytest.mark.parametrize("arm", sorted(REF_ARMS))
+def test_round_tag_for_arm_routes_ref_arms_to_the_ref_tag(arm):
+    assert _round_tag_for_arm("psmnist", arm, PROBE_ARMS, REF_ARMS) == "bench-psmnist-ref-01"
+
+
+def test_round_tag_for_arm_raises_for_ref_arm_on_a_task_with_no_ref_tag():
+    # The reference round is psMNIST-only (BENCH_REF_ROUND_TAGS has one
+    # entry) -- a ref arm requested against any other task must fail loud
+    # rather than silently falling back to that task's matrix tag.
+    for task_name in ("s5", "mqar", "pendulum"):
+        with pytest.raises(ValueError, match="no round tag"):
+            _round_tag_for_arm(task_name, "gru-large", PROBE_ARMS, REF_ARMS)
 
 
 # --- _resolve_seeds: per-task default vs. override -------------------------
@@ -191,12 +221,13 @@ def test_run_arm_kwargs_shrinks_eval_every_alongside_steps_override():
 def test_main_default_arms_is_matrix_arms_only(monkeypatch):
     """Confirms `scripts/gpu_benchmark_campaign.py`'s `--arms` default
     (`list(benchmark_lab.MATRIX_ARMS)`, module docstring's Task x arm
-    matrix section) resolves to exactly the eight matrix arms -- including
-    `signed-givens`/`signed-delta` -- with no per-task arm scoping: every
-    task runs the same arm list. The three `PROBE_ARMS` must NOT be in the
-    default (probe arms run only when named explicitly via `--arms`).
-    Captures the arguments `main` actually passes to `run_campaign` rather
-    than asserting on argparse internals directly."""
+    matrix section) resolves to exactly the nine matrix arms -- including
+    `signed-givens`/`signed-delta`/`gru` -- with no per-task arm scoping:
+    every task runs the same arm list. Neither the three `PROBE_ARMS` nor
+    the `REF_ARMS` grounding reference (`gru-large`) must be in the default
+    (both run only when named explicitly via `--arms`). Captures the
+    arguments `main` actually passes to `run_campaign` rather than
+    asserting on argparse internals directly."""
     captured: dict = {}
 
     def _fake_run_campaign(tasks, arms, seeds, steps, device):
@@ -211,6 +242,8 @@ def test_main_default_arms_is_matrix_arms_only(monkeypatch):
     assert "signed-givens" in captured["arms"]
     assert "signed-delta" in captured["arms"]
     for arm in PROBE_ARMS:
+        assert arm not in captured["arms"]
+    for arm in REF_ARMS:
         assert arm not in captured["arms"]
 
 
@@ -239,6 +272,23 @@ def test_main_arms_choices_still_include_probe_arms_for_explicit_selection(monke
     )
 
     assert set(captured["arms"]) == set(PROBE_ARMS)
+
+
+def test_main_arms_choices_still_include_ref_arms_for_explicit_selection(monkeypatch):
+    """Same as the probe-arm test above, for the `REF_ARMS` grounding
+    reference (`gru-large`): excluded from the default `--arms` list but
+    explicitly selectable -- `choices=sorted(ARM_REGISTRY)` covers matrix
+    union probe union ref."""
+    captured: dict = {}
+
+    def _fake_run_campaign(tasks, arms, seeds, steps, device):
+        captured["arms"] = arms
+        return None
+
+    monkeypatch.setattr(gpu_benchmark_campaign, "run_campaign", _fake_run_campaign)
+    gpu_benchmark_campaign.main(["--tasks", "psmnist", "--arms", "gru-large", "--seeds", "0"])
+
+    assert set(captured["arms"]) == set(REF_ARMS)
 
 
 # --- _run_selftest_gate: failure paths raise a clean SystemExit -----------

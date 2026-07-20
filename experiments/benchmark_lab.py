@@ -92,6 +92,30 @@ exactly like the other eight arms. Excluded from `DECAY_CAPABLE_ARMS`
 mechanism at all, so pendulum's `dt` reaches it only via the `log1p(dt)`
 feature-concat channel, the same treatment `delta`/the hetero arms get.
 
+A fifth amendment (same intent-ledger file, 2026-07-20 "gru-large grounding
+reference" entry) added `REF_ARMS`, currently just `gru-large`: a
+literature-scale (hidden-256, 2-layer) `nn.GRU`, run ONLY as an explicitly
+NON-matched reference -- never a `MATRIX_ARMS` member, never
+`DECAY_CAPABLE_ARMS`. The matched `gru` control (hidden 64, this round's
+frozen 30-epoch psMNIST budget) landed ~0.89 on psMNIST, below the
+literature vanilla-GRU band (~92-94% at hidden 256); `gru-large` exists to
+(a) validate the GRU code path itself (a hidden-256 GRU should reach
+~0.92-0.94 on psMNIST -- if it also stalls near 0.89, the path is buggy,
+not the capacity), and (b) ground this round's family results against a
+literature-scale classical baseline. `ARM_REGISTRY` is now `MATRIX_ARMS`
+unioned with `PROBE_ARMS` AND `REF_ARMS` (build_model/CLI lookup only --
+`scripts/report_benchmarks.py`'s `-02` completeness accounting and
+`scripts/gpu_benchmark_campaign.py`'s default `--arms` both still read
+`MATRIX_ARMS` only, exactly as they already exclude `PROBE_ARMS`). Unlike
+`gru`, `gru-large` also runs at a distinct per-arm training budget
+(`REF_ARM_BUDGETS`, `psmnist` -> 60 epochs instead of the matched arms'
+frozen 30) -- ref arms are explicitly non-matched, so a different budget is
+the documented exception, not a violation of "no per-arm tuning" (spec §7,
+which governs the MATRIX population). `gru-large` writes under its own
+round tag (`experiments.benchmark_tasks.BENCH_REF_ROUND_TAGS`), never the
+matrix `-02` tag or the S5 probe tag -- see `REF_ARMS`'s own comment for
+the construction rationale.
+
 Usage:
   uv run python experiments/benchmark_lab.py \
       --round bench-s5-02 --task s5 --model log --seed 0
@@ -145,6 +169,7 @@ from min_gru import MinGRUStack
 
 D_MODEL = 64
 N_LAYERS = 2
+GRU_LARGE_D_MODEL = 256  # literature-scale reference hidden width (REF_ARMS's `gru-large`)
 TRAIN_T = 64  # S5/MQAR/pendulum training sequence length (spec §4: "Train at T=64")
 S5_CKPT_T = 128  # S5 checkpoint-selection length (spec §4), distinct from train (64) and gen (256/512/1024)
 
@@ -308,26 +333,80 @@ MATRIX_ARMS: dict[str, tuple[str | list[str], dict | None]] = {
 # truth. `nh` IS a real constructor-time shape parameter (more Householder
 # reflections per delta step), so these two arms DO have distinct param
 # counts from `signed-delta` and from each other.
+#   chunk_size=32 (vs DeltaMinGRU's default 64): the shipped delta Triton
+# kernel enforces `nh * chunk_size <= _DELTA_MAX_MICROSTEPS` (=128,
+# `triton_scans.py`). At the default chunk_size=64, nh=3 (192) and nh=4
+# (256) exceed the envelope and the kernel fails loud (MINGRU_SCAN=triton
+# contract) -- a real GPU failure observed on job mingru-gpu-benchmarks-
+# 7cfda8b. chunk_size=32 keeps nh=3 (96) and nh=4 (128) within the
+# envelope. chunk_size is the chunked-WY UT-transform tile size, an exact
+# reformulation of the identical delta recurrence -- it changes kernel
+# tiling only, never the computed result or the expressivity these arms
+# probe. (The matrix `signed-delta` arm keeps chunk_size=64: nh=2 -> 128,
+# on the envelope edge, which the kernel allows.)
 PROBE_ARMS: dict[str, tuple[str | list[str], dict | None]] = {
     "rotation-hetero-k5": (["rotation", "signed"], {"rotation": {"snap": (2, 3, 4, 5, 6)}}),
     "signed-delta-nh3": (
         ["signed", "delta"],
-        {"delta": {"nh": 3, "n_heads": 4, "d_k": 16, "d_v": 16}},
+        {"delta": {"nh": 3, "n_heads": 4, "d_k": 16, "d_v": 16, "chunk_size": 32}},
     ),
     "signed-delta-nh4": (
         ["signed", "delta"],
-        {"delta": {"nh": 4, "n_heads": 4, "d_k": 16, "d_v": 16}},
+        {"delta": {"nh": 4, "n_heads": 4, "d_k": 16, "d_v": 16, "chunk_size": 32}},
     ),
+}
+
+# Reference arms (fifth amendment, module docstring's "gru-large grounding
+# reference" paragraph): a literature-scale (hidden-256, 2-layer) plain
+# `nn.GRU`, run ONLY as an explicitly NON-matched reference -- validates the
+# `gru` control's code path (a hidden-256 GRU should reach ~0.92-0.94 on
+# psMNIST; if it also stalls near 0.89 the path itself is buggy, not merely
+# under-capacity) and grounds the round's family results against a
+# literature-scale classical baseline. Sentinel tuple value, identical
+# convention to `MATRIX_ARMS["gru"]` (never destructured -- `build_model`
+# special-cases `arm in ("gru", "gru-large")` before it ever unpacks
+# `ARM_REGISTRY[arm]`'s value): the tuple exists only so `"gru-large"`
+# satisfies `ARM_REGISTRY` dict membership, which is what makes it show up
+# automatically in the CLI's `--model` choices. Deliberately excluded from
+# `MATRIX_ARMS` (so `scripts/report_benchmarks.py`'s `-02` completeness
+# accounting and `scripts/gpu_benchmark_campaign.py`'s default `--arms`
+# never pick it up) and from `DECAY_CAPABLE_ARMS` below (plain `nn.GRU` has
+# no decay/`delta_t` mechanism, same rationale as `gru`).
+REF_ARMS: dict[str, tuple[str | list[str], dict | None]] = {
+    "gru-large": ("gru-large", None),
+}
+
+# Per-(task, ref arm) training-budget overrides (fifth amendment): ref arms
+# are explicitly non-matched, so a distinct budget from the matched arms'
+# frozen `TaskSpec.budget` is the documented exception here, not a "no
+# per-arm tuning" violation (spec §7 governs the MATRIX population, not
+# REF_ARMS). `run_arm` applies an entry here as the resolved DEFAULT for
+# `lr`/`epochs` -- an explicit caller-supplied `lr=`/`epochs=` argument
+# still overrides it, exactly like `task.budget`'s own fields are resolved
+# for every other arm; a `(task_name, arm)` pair with no entry here falls
+# back to the matched `TaskSpec.budget` untouched, so an arm run against a
+# task with no override behaves identically to the matrix population.
+# `gru-large` on `psmnist` -> 60 epochs (vs the matched arms' frozen 30);
+# `lr` is unchanged from the matched budget (1e-3) but stated explicitly
+# here so this dict is the complete, self-documenting record of what
+# `gru-large`'s psMNIST run actually used, not just what differs.
+REF_ARM_BUDGETS: dict[tuple[str, str], dict[str, float | int]] = {
+    ("psmnist", "gru-large"): {"epochs": 60, "lr": 1e-3},
 }
 
 # The build_model/CLI lookup: matrix arms (the clean nine-arm seed-matrix
 # population, `scripts/report_benchmarks.py`'s `-02` completeness accounting
-# reads `MATRIX_ARMS` directly, never this union) union probe arms. Keeping
-# this as one dict (rather than two independent registries `build_model`
-# would have to check in turn) means every existing single-lookup call site
-# below (`build_model`, the CLI's `--model`/`--arms` choices) transparently
-# resolves both arm families with no dispatch change.
-ARM_REGISTRY: dict[str, tuple[str | list[str], dict | None]] = {**MATRIX_ARMS, **PROBE_ARMS}
+# reads `MATRIX_ARMS` directly, never this union) union probe arms union ref
+# arms. Keeping this as one dict (rather than three independent registries
+# `build_model` would have to check in turn) means every existing
+# single-lookup call site below (`build_model`, the CLI's `--model`/`--arms`
+# choices) transparently resolves all three arm families with no dispatch
+# change.
+ARM_REGISTRY: dict[str, tuple[str | list[str], dict | None]] = {
+    **MATRIX_ARMS,
+    **PROBE_ARMS,
+    **REF_ARMS,
+}
 
 # Arms whose packaged mixer class mixes in DecayMixin (accepts decay=
 # "learnable"/"fixed" and a delta_t argument). DeltaMinGRU is deliberately
@@ -347,6 +426,9 @@ ARM_REGISTRY: dict[str, tuple[str | list[str], dict | None]] = {**MATRIX_ARMS, *
 # decay/delta_t mechanism to enable in the first place, not merely one
 # this round declines to wire up. Pendulum's dt reaches it only via the
 # log1p(dt) feature-concat channel, same as every other excluded arm here.
+# gru-large (REF_ARMS, fifth amendment) is excluded for the identical
+# reason as gru -- also a plain nn.GRU, just at a literature-scale hidden
+# width instead of the depth-matched one.
 DECAY_CAPABLE_ARMS = {"log", "signed", "rotation", "givens"}
 
 
@@ -406,21 +488,28 @@ class FeatureSequenceModel(nn.Module):
 
 
 class GRUTokenSequenceModel(nn.Module):
-    """`gru` arm counterpart to `TokenSequenceModel` (dense/masked_query
-    tasks: S5, MQAR): int token ids -> embedding -> a depth-matched
-    (default `N_LAYERS=2`) plain `nn.GRU` -> per-position logits over
-    `n_cls` classes -- the classical external control this round's other
-    eight arms (all `MinGRUStack` mixers) are anchored against (see the
-    module docstring's fourth-amendment paragraph). Ported from
-    `probes.py`'s `GRUTagger` cell pattern (`nn.GRU(D_MODEL, D_MODEL,
-    num_layers=n_layers, batch_first=True)`), generalized to this round's
-    `vocab`/`n_cls` per-task shapes.
+    """`gru`/`gru-large` arm counterpart to `TokenSequenceModel`
+    (dense/masked_query tasks: S5, MQAR): int token ids -> embedding -> a
+    plain `nn.GRU` -> per-position logits over `n_cls` classes -- the
+    classical external control this round's other eight arms (all
+    `MinGRUStack` mixers) are anchored against (see the module docstring's
+    fourth-amendment paragraph). Ported from `probes.py`'s `GRUTagger` cell
+    pattern (`nn.GRU(D_MODEL, D_MODEL, num_layers=n_layers,
+    batch_first=True)`), generalized to this round's `vocab`/`n_cls`
+    per-task shapes.
+
+    `d_model` sizes the embedding, the `nn.GRU` hidden state, AND the head
+    input uniformly (all three always match -- there is no separate
+    embedding-vs-hidden width here): `build_model` passes `D_MODEL` (64,
+    depth-matched) for `gru`, `GRU_LARGE_D_MODEL` (256, literature scale)
+    for the `REF_ARMS` `gru-large` arm (fifth amendment) -- the same class,
+    parametrized, not a second copy.
 
     `nn.GRU` dispatches to cuDNN internally and never reads `MINGRU_SCAN` --
-    a `gru`-arm run under `MINGRU_SCAN=triton` (the production job's export
-    for the other eight arms' Triton dispatch) is harmless, not a bug: the
-    env var is simply irrelevant to this arm, and no special-casing is
-    needed to keep it that way."""
+    a `gru`/`gru-large`-arm run under `MINGRU_SCAN=triton` (the production
+    job's export for the MinGRUStack arms' Triton dispatch) is harmless,
+    not a bug: the env var is simply irrelevant to this arm, and no
+    special-casing is needed to keep it that way."""
 
     def __init__(
         self,
@@ -440,19 +529,23 @@ class GRUTokenSequenceModel(nn.Module):
 
 
 class GRUFeatureSequenceModel(nn.Module):
-    """`gru` arm counterpart to `FeatureSequenceModel` (last_step/regression
-    tasks: psMNIST, pendulum): float features -> a depth-matched plain
-    `nn.GRU` -> per-position outputs.
+    """`gru`/`gru-large` arm counterpart to `FeatureSequenceModel`
+    (last_step/regression tasks: psMNIST, pendulum): float features -> a
+    plain `nn.GRU` -> per-position outputs. `d_model` sizes the `nn.GRU`
+    hidden state AND the head input uniformly -- `build_model` passes
+    `D_MODEL` (64) for `gru`, `GRU_LARGE_D_MODEL` (256) for the `REF_ARMS`
+    `gru-large` arm (fifth amendment); same class, parametrized.
 
     `delta_t` is accepted (not omitted) so this model is a drop-in for the
     same `model(x)` / `model(model_in, delta_t=decay_dt)` call shapes
     `_forward_last_step`/`_forward_regression` already use uniformly across
     every arm -- but it must always be `None` here: plain `nn.GRU` has no
-    decay/dt mechanism, and `gru` is excluded from `DECAY_CAPABLE_ARMS`, so
-    `_forward_regression`'s `decay_dt = dt if arm in DECAY_CAPABLE_ARMS else
-    None` never passes this model anything else. Pendulum's `dt` reaches it
-    only through the `log1p(dt)` feature `build_model` concatenates onto
-    the input, exactly like `delta`/the hetero arms."""
+    decay/dt mechanism, and neither `gru` nor `gru-large` is in
+    `DECAY_CAPABLE_ARMS`, so `_forward_regression`'s `decay_dt = dt if arm
+    in DECAY_CAPABLE_ARMS else None` never passes this model anything else.
+    Pendulum's `dt` reaches it only through the `log1p(dt)` feature
+    `build_model` concatenates onto the input, exactly like `delta`/the
+    hetero arms."""
 
     def __init__(
         self,
@@ -468,8 +561,8 @@ class GRUFeatureSequenceModel(nn.Module):
     def forward(self, x: torch.Tensor, delta_t: torch.Tensor | None = None) -> torch.Tensor:
         assert delta_t is None, (
             "GRUFeatureSequenceModel has no delta_t/decay path (plain nn.GRU) -- "
-            "gru is excluded from DECAY_CAPABLE_ARMS, so this must never be called "
-            "with a non-None delta_t"
+            "neither gru nor gru-large is in DECAY_CAPABLE_ARMS, so this must never "
+            "be called with a non-None delta_t"
         )
         h, _ = self.rnn(x)
         return self.head(h)
@@ -498,17 +591,22 @@ def build_model(task: TaskSpec, arm: str) -> nn.Module:
     """Construct `arm`'s model for `task` via `ARM_REGISTRY` (spec §6
     arm configs) and `task.loss_mode` (spec §6 batch contracts).
 
-    `arm == "gru"` is a distinct branch, checked first: `gru` is not a
-    `MinGRUStack` mixer (its `ARM_REGISTRY` value is a sentinel tuple, never
-    destructured -- see `MATRIX_ARMS`'s comment), so it builds
-    `GRUTokenSequenceModel`/`GRUFeatureSequenceModel` directly instead of
-    going through the `mixer`/`mixer_kwargs` unpacking every other arm uses.
-    It still satisfies the exact same per-loss_mode shape contract
+    `arm in ("gru", "gru-large")` is a distinct branch, checked first:
+    neither is a `MinGRUStack` mixer (their `ARM_REGISTRY` values are
+    sentinel tuples, never destructured -- see `MATRIX_ARMS`'s/`REF_ARMS`'s
+    comments), so both build `GRUTokenSequenceModel`/
+    `GRUFeatureSequenceModel` directly instead of going through the
+    `mixer`/`mixer_kwargs` unpacking every other arm uses. They still
+    satisfy the exact same per-loss_mode shape contract
     (`_forward_dense`/`_forward_masked_query`/`_forward_last_step`/
     `_forward_regression` never know or care which branch built the model),
-    and gets the same `log1p(dt)` feature-concat treatment on pendulum as
+    and get the same `log1p(dt)` feature-concat treatment on pendulum as
     the other `DECAY_CAPABLE_ARMS`-excluded arms -- just never the
-    mechanical-decay `mixer_kwargs` update, since it has no `mixer_kwargs`.
+    mechanical-decay `mixer_kwargs` update, since neither has
+    `mixer_kwargs`. The only difference between the two is `d_model`:
+    `gru` stays depth-matched at `D_MODEL` (64); `gru-large` builds at
+    `GRU_LARGE_D_MODEL` (256, literature scale) -- both are 2-layer
+    (`N_LAYERS`, unchanged).
 
     `arm_kwargs` is `None` for `rotation-hetero` (the one list-mixer arm --
     `MinGRUStack`'s own convention for "no per-type overrides", see its
@@ -519,13 +617,15 @@ def build_model(task: TaskSpec, arm: str) -> nn.Module:
     if arm not in ARM_REGISTRY:
         raise ValueError(f"unknown arm {arm!r}; expected one of {sorted(ARM_REGISTRY)}")
     in_dim, out_dim = _model_shape(task.name)
-    if arm == "gru":
+    if arm in ("gru", "gru-large"):
+        d_model = GRU_LARGE_D_MODEL if arm == "gru-large" else D_MODEL
         if task.loss_mode in ("dense", "masked_query"):
-            return GRUTokenSequenceModel(in_dim, out_dim)
+            return GRUTokenSequenceModel(in_dim, out_dim, d_model=d_model)
         if task.loss_mode == "last_step":
-            return GRUFeatureSequenceModel(in_dim, out_dim)
+            return GRUFeatureSequenceModel(in_dim, out_dim, d_model=d_model)
         if task.loss_mode == "regression":
-            return GRUFeatureSequenceModel(in_dim + 1, out_dim)  # +1: log1p(dt) feature
+            # +1: log1p(dt) fairness-rule feature (see module docstring)
+            return GRUFeatureSequenceModel(in_dim + 1, out_dim, d_model=d_model)
         raise ValueError(f"unknown loss_mode {task.loss_mode!r}")
     mixer, arm_kwargs = ARM_REGISTRY[arm]
     mixer_kwargs = dict(arm_kwargs) if arm_kwargs else {}
@@ -903,8 +1003,14 @@ def run_arm(
         fixed and independent of this value.
     lr, batch_size, steps, epochs, eval_every : optional
         Override the corresponding `task.budget` field; `None` keeps the
-        `TaskSpec`'s own value. `steps`/`epochs` are ignored for tasks that
-        don't use that field (`task.budget.steps`/`epochs` is `None`).
+        `TaskSpec`'s own value -- EXCEPT for `lr`/`epochs` when `arm` is a
+        `REF_ARMS` member with a `REF_ARM_BUDGETS[(task.name, arm)]` entry
+        (fifth amendment, module docstring): that entry's `lr`/`epochs`
+        become the resolved default instead of `task.budget`'s, still
+        overridable by an explicit non-`None` argument here, exactly like
+        `task.budget`'s own fields are for every other arm. `steps`/`epochs`
+        are ignored for tasks that don't use that field
+        (`task.budget.steps`/`epochs` is `None`).
     train_T : int, optional
         Training sequence length for the three generator-based tasks
         (default `TRAIN_T`); unused for psMNIST. Exposed for tests/
@@ -929,11 +1035,21 @@ def run_arm(
         assert task.budget.steps is not None, f"{task.name}: step-based task must set Budget.steps"
 
     device_obj = _resolve_device(device)
-    effective_lr = task.budget.lr if lr is None else lr
+    # Ref-arm budget override (REF_ARM_BUDGETS, fifth amendment): resolved
+    # BEFORE lr/epochs default to task.budget, so an explicit caller
+    # argument still wins over both; a (task.name, arm) pair with no entry
+    # here (every matched arm, and any ref arm/task pairing this round
+    # doesn't override) falls through to task.budget untouched.
+    ref_budget = REF_ARM_BUDGETS.get((task.name, arm)) if arm in REF_ARMS else None
+    budget_lr = task.budget.lr if ref_budget is None else ref_budget.get("lr", task.budget.lr)
+    budget_epochs = (
+        task.budget.epochs if ref_budget is None else ref_budget.get("epochs", task.budget.epochs)
+    )
+    effective_lr = budget_lr if lr is None else lr
     effective_batch_size = task.budget.batch_size if batch_size is None else batch_size
     effective_steps = None if task.budget.steps is None else (task.budget.steps if steps is None else steps)
     effective_epochs = (
-        None if task.budget.epochs is None else (task.budget.epochs if epochs is None else epochs)
+        None if task.budget.epochs is None else (budget_epochs if epochs is None else epochs)
     )
     effective_eval_every = (
         None
@@ -1198,7 +1314,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="log | signed | rotation | rotation-hetero | givens | delta | "
         "signed-givens | signed-delta | gru (the nine MATRIX_ARMS) | "
         "rotation-hetero-k5 | signed-delta-nh3 | signed-delta-nh4 "
-        "(the three S5-only PROBE_ARMS)",
+        "(the three S5-only PROBE_ARMS) | gru-large (the REF_ARMS "
+        "grounding-only reference, psMNIST only)",
     )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--lr", type=float, default=None, help="override TaskSpec.budget.lr")

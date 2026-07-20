@@ -38,6 +38,16 @@ expansion: no special-casing was needed here, since this module's
 .MATRIX_ARMS``/``.ARM_REGISTRY`` directly rather than hardcoding an arm
 list.
 
+A fifth amendment (2026-07-20, "gru-large grounding reference") added
+``REF_ARMS`` (``gru-large``, a literature-scale hidden-256 2-layer
+``nn.GRU``) -- an explicitly NON-matched reference, selectable via
+``ARM_REGISTRY`` (``MATRIX_ARMS`` union ``PROBE_ARMS`` union ``REF_ARMS``)
+but NOT in the default ``--arms`` list, same convention as ``PROBE_ARMS``:
+a ref arm runs only when named explicitly (e.g. ``--arms gru-large``) and
+writes under its own distinct ledger round tag
+(``experiments.benchmark_tasks.BENCH_REF_ROUND_TAGS``), resolved by
+``_round_tag_for_arm`` alongside probe-arm routing.
+
 Round tags: ``bench-s5-02``, ``bench-mqar-02``, ``bench-psmnist-02``,
 ``bench-pendulum-02`` -- one per task, independent of which MATRIX arms
 that task's cell selects, read from ``experiments.benchmark_tasks
@@ -50,10 +60,12 @@ clean ``-02`` tags that can't dedup-collide with pilot rows or get pooled
 into the same statistics by the report -- see ``BENCH_ROUND_TAGS``'s own
 comment for the full rationale. A probe arm's rows land under a distinct
 tag instead, ``bench-s5-probe-01`` (``experiments.benchmark_tasks
-.BENCH_PROBE_ROUND_TAGS``) -- ``_round_tag_for_arm`` resolves which tag
-each ``(task, arm)`` cell writes under, per arm, inside ``run_campaign``'s
-loop, so a probe arm can never dedup-collide with or get pooled into the
-matrix population's statistics either.
+.BENCH_PROBE_ROUND_TAGS``); a ref arm's rows land under yet another
+distinct tag, ``bench-psmnist-ref-01`` (``experiments.benchmark_tasks
+.BENCH_REF_ROUND_TAGS``) -- ``_round_tag_for_arm`` resolves which tag each
+``(task, arm)`` cell writes under, per arm, inside ``run_campaign``'s loop,
+so neither a probe nor a ref arm can ever dedup-collide with or get pooled
+into the matrix population's statistics.
 
 Pre-flight (fail-loud, before seed 0, ``--device cuda`` only)
 ----------------------------------------------------------------
@@ -133,7 +145,11 @@ import torch
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))  # `experiments.*` (namespace package, no __init__.py)
-from experiments.benchmark_tasks import BENCH_PROBE_ROUND_TAGS, BENCH_ROUND_TAGS  # noqa: E402
+from experiments.benchmark_tasks import (  # noqa: E402
+    BENCH_PROBE_ROUND_TAGS,
+    BENCH_REF_ROUND_TAGS,
+    BENCH_ROUND_TAGS,
+)
 
 _BENCHMARK_LAB_PATH = _REPO_ROOT / "experiments" / "benchmark_lab.py"
 _TORCH_STRATUM_PIN = "2.8."
@@ -155,17 +171,29 @@ _ROUND_TAGS: dict[str, str] = BENCH_ROUND_TAGS
 # `BENCH_PROBE_ROUND_TAGS`'s own comment.
 _PROBE_ROUND_TAGS: dict[str, str] = BENCH_PROBE_ROUND_TAGS
 
+# Reference round tags (gru-large grounding reference, `experiments
+# .benchmark_lab.REF_ARMS`): same distinct source-of-truth-mapping
+# convention as `_PROBE_ROUND_TAGS` above, so a ref arm's rows never land
+# under the matrix `-02` tag either -- see `_round_tag_for_arm` below and
+# `BENCH_REF_ROUND_TAGS`'s own comment.
+_REF_ROUND_TAGS: dict[str, str] = BENCH_REF_ROUND_TAGS
 
-def _round_tag_for_arm(task_name: str, arm: str, probe_arms: dict) -> str:
+
+def _round_tag_for_arm(task_name: str, arm: str, probe_arms: dict, ref_arms: dict) -> str:
     """Ledger ``round`` tag for one ``(task_name, arm)`` cell: the probe
     tag (``_PROBE_ROUND_TAGS``) when ``arm`` is one of ``probe_arms``
-    (``experiments.benchmark_lab.PROBE_ARMS``), else the task's matrix
-    tag (``_ROUND_TAGS``) -- the same per-task tag every matrix arm has
-    always used. A probe arm requested against a task with no entry in
-    `_PROBE_ROUND_TAGS` (every task except S5, per this round's scope)
-    fails loud rather than silently falling back to the matrix tag, which
-    would pollute the clean `-02` matrix population with a differently-
-    configured arm's rows."""
+    (``experiments.benchmark_lab.PROBE_ARMS``); the reference tag
+    (``_REF_ROUND_TAGS``) when ``arm`` is one of ``ref_arms``
+    (``experiments.benchmark_lab.REF_ARMS``); else the task's matrix tag
+    (``_ROUND_TAGS``) -- the same per-task tag every matrix arm has always
+    used. ``probe_arms``/``ref_arms`` are disjoint (a matrix arm is never
+    in either), so checking probe membership first is not a priority
+    choice, just an arbitrary but stable order. A probe/ref arm requested
+    against a task with no entry in its own round-tag mapping (every task
+    except S5 for probes; every task except psMNIST for refs, per this
+    round's scope) fails loud rather than silently falling back to the
+    matrix tag, which would pollute the clean `-02` matrix population with
+    a differently-configured arm's rows."""
     if arm in probe_arms:
         if task_name not in _PROBE_ROUND_TAGS:
             raise ValueError(
@@ -174,6 +202,14 @@ def _round_tag_for_arm(task_name: str, arm: str, probe_arms: dict) -> str:
                 "this probe round does not run that task"
             )
         return _PROBE_ROUND_TAGS[task_name]
+    if arm in ref_arms:
+        if task_name not in _REF_ROUND_TAGS:
+            raise ValueError(
+                f"ref arm {arm!r} has no round tag for task {task_name!r} -- "
+                f"BENCH_REF_ROUND_TAGS only covers {sorted(_REF_ROUND_TAGS)}; "
+                "this reference arm does not run that task"
+            )
+        return _REF_ROUND_TAGS[task_name]
     return _ROUND_TAGS[task_name]
 
 
@@ -392,7 +428,9 @@ def run_campaign(
         task = benchmark_lab.TASKS[task_name]
         task_seeds = _resolve_seeds(task, seeds)
         for arm in arms:
-            round_tag = _round_tag_for_arm(task_name, arm, benchmark_lab.PROBE_ARMS)
+            round_tag = _round_tag_for_arm(
+                task_name, arm, benchmark_lab.PROBE_ARMS, benchmark_lab.REF_ARMS
+            )
             for seed in task_seeds:
                 t0 = time.perf_counter()
                 kwargs = _run_arm_kwargs(round_tag, task, arm, seed, steps, device)
@@ -433,8 +471,10 @@ def main(argv: list[str] | None = None) -> int:
         help="arm subset (default: the nine MATRIX_ARMS -- "
         "log/signed/rotation/rotation-hetero/givens/delta/signed-givens/signed-delta/gru; "
         "the three S5-only PROBE_ARMS -- rotation-hetero-k5/signed-delta-nh3/"
-        "signed-delta-nh4 -- are choosable but never run unless named explicitly, "
-        "and write under their own bench-s5-probe-01 round tag, not the matrix tag)",
+        "signed-delta-nh4 -- and the psMNIST-only REF_ARMS grounding reference "
+        "-- gru-large -- are choosable but never run unless named explicitly, "
+        "and write under their own bench-s5-probe-01 / bench-psmnist-ref-01 "
+        "round tags, not the matrix tag)",
     )
     parser.add_argument(
         "--seeds",

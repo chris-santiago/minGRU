@@ -20,8 +20,23 @@ both generations, for old pilot job logs/sidecars. The S5-only probe round
 .BENCH_PROBE_ROUND_TAGS``) is a separate population entirely -- this
 module's per-task accounting below reads only ``experiments.benchmark_lab
 .MATRIX_ARMS`` (never ``ARM_REGISTRY``, which also includes the three
-S5-only ``PROBE_ARMS``), so the ``-02`` reports this module writes never
-show probe arms and never change shape because of them.
+S5-only ``PROBE_ARMS`` and the psMNIST-only ``REF_ARMS``), so the ``-02``
+reports this module writes never show probe or reference arms and never
+change shape because of them.
+
+A separate, later addition (Amendments, 2026-07-20 "gru-large grounding
+reference" entry) regenerates ``experiments/bench/bench_<task>_ref.json``/
+``.md`` for every task in ``experiments.benchmark_tasks
+.BENCH_REF_ROUND_TAGS`` (currently just ``psmnist``): a REFERENCE-labeled
+report for ``experiments.benchmark_lab.REF_ARMS`` rows (e.g. ``gru-large``)
+-- distinct filenames, distinct round tag, no Fisher-vs-``log`` comparison
+(a ref arm's rows live under a different training budget than the matched
+population `FISHER_REFERENCE_ARM` is judged against, so comparing them
+would silently mix two strata into one statistic -- CLAUDE.md: "evidence
+strata are never mixed silently"). This is purely additive: the four
+canonical ``bench_<task>.{json,md}`` files and their generation code path
+are untouched by it, so the matched ``-02`` accounting/regression check
+stays byte-identical.
 
 Per task, per arm (``experiments.benchmark_lab.MATRIX_ARMS``:
 log/signed/rotation/rotation-hetero/givens/delta/signed-givens/signed-delta/gru
@@ -117,8 +132,13 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from _bench_env import git_commit_sha  # noqa: E402
 from _evidence_stats import fisher_exact_two_sided  # noqa: E402
-from experiments.benchmark_lab import MATRIX_ARMS, build_model  # noqa: E402
-from experiments.benchmark_tasks import BENCH_ROUND_TAGS, TASKS, TaskSpec  # noqa: E402
+from experiments.benchmark_lab import MATRIX_ARMS, REF_ARMS, build_model  # noqa: E402
+from experiments.benchmark_tasks import (  # noqa: E402
+    BENCH_REF_ROUND_TAGS,
+    BENCH_ROUND_TAGS,
+    TASKS,
+    TaskSpec,
+)
 
 _RESULTS = _REPO_ROOT / "experiments" / "lab_results.jsonl"
 _BENCH_DIR = _REPO_ROOT / "experiments" / "bench"
@@ -131,6 +151,14 @@ _BENCH_DIR = _REPO_ROOT / "experiments" / "bench"
 # independently-editable copy -- see that mapping's own comment for the
 # `-01` -> `-02` bump rationale.
 ROUND_TAGS: dict[str, str] = BENCH_ROUND_TAGS
+
+# Reference-arm round tags (gru-large grounding reference, module
+# docstring's "separate, later addition" paragraph) -- this module owns
+# `REF_ROUND_TAGS` as its own name, same binding convention as `ROUND_TAGS`
+# above, bound directly to `experiments.benchmark_tasks
+# .BENCH_REF_ROUND_TAGS` (the single source of truth
+# `scripts/gpu_benchmark_campaign.py`'s `_REF_ROUND_TAGS` also binds to).
+REF_ROUND_TAGS: dict[str, str] = BENCH_REF_ROUND_TAGS
 
 # "log as the Fisher reference arm" (spec §4/§8): a family-validation round
 # contrasts every arm against the vanilla minGRU baseline.
@@ -423,6 +451,82 @@ def _fmt_threshold(value: float) -> str:
     return f"{value:.6g}"
 
 
+def _render_stratum_line(stratum_labels: list[dict[str, Any]]) -> str:
+    """ "Stratum(s) observed: ..." line, shared by the matched and the
+    reference report renderers (both carry the same ``stratum_labels``
+    shape, `_stratum_labels`'s output)."""
+    if not stratum_labels:
+        return "Stratum(s) observed: none (0 rows)."
+    strata_str = "; ".join(
+        f"device={s['device']}, torch={s['torch']}, scan={s['scan']}, compile={s['compile']}"
+        for s in stratum_labels
+    )
+    anomaly = (
+        ""
+        if len(stratum_labels) == 1
+        else " -- MULTIPLE DISTINCT STRATA OBSERVED (never mix silently)"
+    )
+    return f"Stratum(s) observed: {strata_str}{anomaly}"
+
+
+def _render_fits_table_lines(arms: dict[str, dict[str, Any]]) -> list[str]:
+    """ "Fits and generalization accuracy" table, shared by the matched and
+    the reference report renderers (both carry the same per-arm
+    ``ArmReport``-shaped dict, `_build_arm_report`'s output)."""
+    lines: list[str] = []
+    acc_keys = sorted({k for rep in arms.values() for k in rep["mean_acc"]})
+    lines += ["## Fits and generalization accuracy (raw / fit-only)", ""]
+    if acc_keys:
+        acc_header = " | ".join(f"acc@{k} (raw/fit-only)" for k in acc_keys)
+        lines.append(f"| arm | seeds (present/planned) | fits | {acc_header} | params |")
+        lines.append("| --- | --- | --- |" + " --- |" * len(acc_keys) + " --- |")
+    else:
+        lines.append("| arm | seeds (present/planned) | fits | params |")
+        lines.append("| --- | --- | --- | --- |")
+    for arm, rep in arms.items():
+        fits_str = f"{rep['fits']}/{rep['seeds_present']}" if rep["seeds_present"] else "0/0"
+        seeds_cell = f"{rep['seeds_present']}/{rep['seeds_planned']}"
+        if acc_keys:
+            acc_cells = " | ".join(
+                f"{_fmt_acc(rep['mean_acc'].get(k))} / {_fmt_acc(rep['fit_only_acc'].get(k))}"
+                for k in acc_keys
+            )
+            lines.append(f"| {arm} | {seeds_cell} | {fits_str} | {acc_cells} | {rep['params']:,} |")
+        else:
+            lines.append(f"| {arm} | {seeds_cell} | {fits_str} | {rep['params']:,} |")
+        if rep["seeds_present"] == 0:
+            lines.append(f"  (0 rows found for arm `{arm}`)")
+    return lines
+
+
+def _render_robustness_lines(arms: dict[str, dict[str, Any]], thresholds: list[float]) -> list[str]:
+    """ "Threshold-robustness" table, shared by the matched and the
+    reference report renderers."""
+    threshold_header = " | ".join(_fmt_threshold(t) for t in thresholds)
+    lines = ["", "## Threshold-robustness", "", f"| arm | {threshold_header} |"]
+    lines.append("| --- |" + " --- |" * len(thresholds))
+    for arm, rep in arms.items():
+        n = rep["seeds_present"]
+        # dict key must be the exact `str(th)` build_task_report used (see
+        # `_robustness_counts`) -- `_fmt_threshold` above is display-only.
+        cells = " | ".join(f"{rep['robustness'][str(th)]}/{n}" if n else "n/a" for th in thresholds)
+        lines.append(f"| {arm} | {cells} |")
+    return lines
+
+
+def _render_completeness_lines(arms: dict[str, dict[str, Any]]) -> list[str]:
+    """ "Completeness (present vs planned seed matrix)" section, shared by
+    the matched and the reference report renderers."""
+    lines = ["", "## Completeness (present vs planned seed matrix)", ""]
+    for arm, rep in arms.items():
+        seeds_cell = f"{rep['seeds_present']}/{rep['seeds_planned']}"
+        if rep["missing_seeds"]:
+            lines.append(f"- {arm}: {seeds_cell} present; missing seeds: {rep['missing_seeds']}")
+        else:
+            lines.append(f"- {arm}: {seeds_cell} present; complete")
+    return lines
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     """Render one task's ``build_task_report`` payload as Markdown --
     fits/generalization table, threshold-robustness, Fisher-vs-reference,
@@ -453,54 +557,12 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         f"Env: torch {env['torch']}, commit {env['git_commit']}, generated {env['generated']}.",
         "",
+        _render_stratum_line(report["stratum_labels"]),
+        "",
     ]
-    strata = report["stratum_labels"]
-    if strata:
-        strata_str = "; ".join(
-            f"device={s['device']}, torch={s['torch']}, scan={s['scan']}, compile={s['compile']}"
-            for s in strata
-        )
-        anomaly = (
-            "" if len(strata) == 1 else " -- MULTIPLE DISTINCT STRATA OBSERVED (never mix silently)"
-        )
-        lines.append(f"Stratum(s) observed: {strata_str}{anomaly}")
-    else:
-        lines.append("Stratum(s) observed: none (0 rows).")
-    lines.append("")
 
-    acc_keys = sorted({k for rep in arms.values() for k in rep["mean_acc"]})
-    lines += ["## Fits and generalization accuracy (raw / fit-only)", ""]
-    if acc_keys:
-        acc_header = " | ".join(f"acc@{k} (raw/fit-only)" for k in acc_keys)
-        lines.append(f"| arm | seeds (present/planned) | fits | {acc_header} | params |")
-        lines.append("| --- | --- | --- |" + " --- |" * len(acc_keys) + " --- |")
-    else:
-        lines.append("| arm | seeds (present/planned) | fits | params |")
-        lines.append("| --- | --- | --- | --- |")
-    for arm, rep in arms.items():
-        fits_str = f"{rep['fits']}/{rep['seeds_present']}" if rep["seeds_present"] else "0/0"
-        seeds_cell = f"{rep['seeds_present']}/{rep['seeds_planned']}"
-        if acc_keys:
-            acc_cells = " | ".join(
-                f"{_fmt_acc(rep['mean_acc'].get(k))} / {_fmt_acc(rep['fit_only_acc'].get(k))}"
-                for k in acc_keys
-            )
-            lines.append(f"| {arm} | {seeds_cell} | {fits_str} | {acc_cells} | {rep['params']:,} |")
-        else:
-            lines.append(f"| {arm} | {seeds_cell} | {fits_str} | {rep['params']:,} |")
-        if rep["seeds_present"] == 0:
-            lines.append(f"  (0 rows found for arm `{arm}`)")
-
-    thresholds = report["robustness_thresholds"]
-    threshold_header = " | ".join(_fmt_threshold(t) for t in thresholds)
-    lines += ["", "## Threshold-robustness", "", f"| arm | {threshold_header} |"]
-    lines.append("| --- |" + " --- |" * len(thresholds))
-    for arm, rep in arms.items():
-        n = rep["seeds_present"]
-        # dict key must be the exact `str(th)` build_task_report used (see
-        # `_robustness_counts`) -- `_fmt_threshold` above is display-only.
-        cells = " | ".join(f"{rep['robustness'][str(th)]}/{n}" if n else "n/a" for th in thresholds)
-        lines.append(f"| {arm} | {cells} |")
+    lines += _render_fits_table_lines(arms)
+    lines += _render_robustness_lines(arms, report["robustness_thresholds"])
 
     lines += ["", f"## Two-sided Fisher exact vs `{report['fisher_reference_arm']}`", ""]
     for arm, info in report["fisher_vs_reference"].items():
@@ -512,13 +574,103 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"({info['reference_fits']}): p = {info['p']:.4g}"
             )
 
-    lines += ["", "## Completeness (present vs planned seed matrix)", ""]
-    for arm, rep in arms.items():
-        seeds_cell = f"{rep['seeds_present']}/{rep['seeds_planned']}"
-        if rep["missing_seeds"]:
-            lines.append(f"- {arm}: {seeds_cell} present; missing seeds: {rep['missing_seeds']}")
-        else:
-            lines.append(f"- {arm}: {seeds_cell} present; complete")
+    lines += _render_completeness_lines(arms)
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+# ------------------------------------------------------- reference report
+def _rows_for_ref_task(all_rows: list[dict[str, Any]], task_name: str) -> dict[str, list[dict]]:
+    """``all_rows`` filtered to ``task_name``'s REFERENCE round tag
+    (``REF_ROUND_TAGS``), grouped by arm -- the ``REF_ARMS`` counterpart to
+    `_rows_for_task`. Every ``REF_ARMS`` key is present (possibly with an
+    empty list); a row whose ``variant`` isn't a recognized ref arm is
+    silently dropped, mirroring `_rows_for_task`'s contract."""
+    round_tag = REF_ROUND_TAGS[task_name]
+    by_arm: dict[str, list[dict]] = {arm: [] for arm in REF_ARMS}
+    for row in all_rows:
+        if row.get("round") != round_tag or row.get("task") != task_name:
+            continue
+        variant = row.get("variant")
+        if variant in by_arm:
+            by_arm[variant].append(row)
+    return by_arm
+
+
+def build_ref_task_report(task_name: str, all_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Assemble the ``bench_<task>_ref.json`` payload for ``task_name``'s
+    ``REF_ARMS`` rows (e.g. ``gru-large`` on psMNIST) -- an explicitly
+    NON-matched grounding reference, never the matched population
+    `build_task_report` reports (module docstring's "separate, later
+    addition" paragraph).
+
+    Deliberately no Fisher-vs-``log`` comparison here: a ref arm runs
+    under its own training budget (`experiments.benchmark_lab
+    .REF_ARM_BUDGETS`), distinct from the matched arms' frozen
+    ``TaskSpec.budget`` that `FISHER_REFERENCE_ARM`'s matched-population
+    fit rate is itself computed under -- comparing them would silently mix
+    two different strata into one Fisher-exact statistic (CLAUDE.md:
+    "evidence strata are never mixed silently")."""
+    if task_name not in REF_ROUND_TAGS:
+        raise ValueError(
+            f"no REF_ARMS round tag registered for task {task_name!r} -- "
+            f"BENCH_REF_ROUND_TAGS only covers {sorted(REF_ROUND_TAGS)}"
+        )
+    task = TASKS[task_name]
+    by_arm_rows = _rows_for_ref_task(all_rows, task_name)
+    arm_reports = {arm: _build_arm_report(task, arm, rows) for arm, rows in by_arm_rows.items()}
+    all_task_rows = [row for rows in by_arm_rows.values() for row in rows]
+    return {
+        "task": task_name,
+        "round": REF_ROUND_TAGS[task_name],
+        "reference": True,  # non-matched grounding arm(s) -- never in the matched -02 accounting
+        "fit_metric": task.fit_metric,
+        "fit_threshold": task.fit_threshold,
+        "fit_direction": task.fit_direction,
+        "robustness_thresholds": list(task.robustness),
+        "arms": {arm: asdict(rep) for arm, rep in arm_reports.items()},
+        "stratum_labels": _stratum_labels(all_task_rows),
+        "env": {
+            "torch": torch.__version__,
+            "git_commit": git_commit_sha(),
+            "generated": datetime.now(timezone.utc).isoformat(),
+        },
+    }
+
+
+def render_ref_markdown(report: dict[str, Any]) -> str:
+    """Render one task's ``build_ref_task_report`` payload as Markdown --
+    same fits/robustness/completeness sections as `render_markdown`
+    (shared via `_render_fits_table_lines`/`_render_robustness_lines`/
+    `_render_completeness_lines`), but with an explicit REFERENCE banner
+    up top and no Fisher-vs-reference section (see `build_ref_task_report`'s
+    docstring for why)."""
+    arms = report["arms"]
+    fit_dir_symbol = ">=" if report["fit_direction"] == "ge" else "<="
+    env = report["env"]
+    lines = [
+        f"# Benchmark round: {report['task']} REFERENCE arm(s) (`{report['round']}`)",
+        "",
+        f"**Non-matched reference/grounding arm(s) -- NOT part of the matched "
+        f"`{ROUND_TAGS[report['task']]}` seed-matrix accounting.** No Fisher-exact "
+        "comparison is computed here: this population runs under its own training "
+        "budget and round tag, distinct from the matched arms (CLAUDE.md: evidence "
+        "strata are never mixed silently).",
+        "",
+        f"Fit metric: `ckpt.{report['fit_metric']}` {fit_dir_symbol} "
+        f"{report['fit_threshold']} (robustness triple: "
+        f"{', '.join(_fmt_threshold(t) for t in report['robustness_thresholds'])}). Computed "
+        "from `experiments/lab_results.jsonl` (rows matching this reference round's "
+        "tag); regenerated whole by `scripts/report_benchmarks.py`, never hand-edited.",
+        "",
+        f"Env: torch {env['torch']}, commit {env['git_commit']}, generated {env['generated']}.",
+        "",
+        _render_stratum_line(report["stratum_labels"]),
+        "",
+    ]
+    lines += _render_fits_table_lines(arms)
+    lines += _render_robustness_lines(arms, report["robustness_thresholds"])
+    lines += _render_completeness_lines(arms)
     lines.append("")
     return "\n".join(lines) + "\n"
 
@@ -528,7 +680,14 @@ def write_reports(all_rows: list[dict[str, Any]], out_dir: Path) -> dict[str, di
     """Build and write ``bench_<task>.{json,md}`` for every task in
     ``TASKS``, regenerated whole. Returns the built reports (keyed by
     task name) so ``main`` can print the completeness summary without
-    re-reading the just-written files."""
+    re-reading the just-written files.
+
+    Matched-population output ONLY -- untouched by the reference-report
+    addition (`write_ref_reports` below), which writes distinct
+    ``bench_<task>_ref.{json,md}`` filenames from a distinct function, so
+    this function's return shape/byte output for the four canonical tasks
+    is exactly what it was before `REF_ARMS` existed (regression check:
+    the matched `-02` reports stay byte-identical)."""
     out_dir.mkdir(parents=True, exist_ok=True)
     reports: dict[str, dict[str, Any]] = {}
     for task_name in TASKS:
@@ -537,6 +696,22 @@ def write_reports(all_rows: list[dict[str, Any]], out_dir: Path) -> dict[str, di
         (out_dir / f"bench_{task_name}.json").write_text(json.dumps(report, indent=2) + "\n")
         (out_dir / f"bench_{task_name}.md").write_text(render_markdown(report))
     return reports
+
+
+def write_ref_reports(all_rows: list[dict[str, Any]], out_dir: Path) -> dict[str, dict[str, Any]]:
+    """Build and write ``bench_<task>_ref.{json,md}`` for every task in
+    ``REF_ROUND_TAGS`` (currently just ``psmnist``), regenerated whole --
+    the `REF_ARMS` (e.g. ``gru-large``) counterpart to `write_reports`.
+    Distinct filenames from the matched ``bench_<task>.{json,md}`` pair, so
+    calling this never touches the matched output."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ref_reports: dict[str, dict[str, Any]] = {}
+    for task_name in REF_ROUND_TAGS:
+        report = build_ref_task_report(task_name, all_rows)
+        ref_reports[task_name] = report
+        (out_dir / f"bench_{task_name}_ref.json").write_text(json.dumps(report, indent=2) + "\n")
+        (out_dir / f"bench_{task_name}_ref.md").write_text(render_ref_markdown(report))
+    return ref_reports
 
 
 def _print_completeness_summary(reports: dict[str, dict[str, Any]]) -> None:
@@ -566,6 +741,12 @@ def main(argv: list[str] | None = None) -> int:
     reports = write_reports(all_rows, args.out_dir)
     for task_name in reports:
         print(f"wrote {args.out_dir / f'bench_{task_name}.json'} and bench_{task_name}.md")
+    ref_reports = write_ref_reports(all_rows, args.out_dir)
+    for task_name in ref_reports:
+        print(
+            f"wrote {args.out_dir / f'bench_{task_name}_ref.json'} and "
+            f"bench_{task_name}_ref.md (REFERENCE, non-matched)"
+        )
     _print_completeness_summary(reports)
     return 0
 
