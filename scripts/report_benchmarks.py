@@ -24,7 +24,12 @@ S5-only ``PROBE_ARMS``), so the ``-02`` reports this module writes never
 show probe arms and never change shape because of them.
 
 Per task, per arm (``experiments.benchmark_lab.MATRIX_ARMS``:
-log/signed/rotation/rotation-hetero/givens/delta/signed-givens/signed-delta):
+log/signed/rotation/rotation-hetero/givens/delta/signed-givens/signed-delta/gru
+-- ``gru`` is the depth-matched classical ``nn.GRU`` external control arm,
+added by a fourth amendment; not a ``MinGRUStack`` mixer, but a normal
+``MATRIX_ARMS`` row like the other eight, so it flows through this
+module's ``build_model``-based param counting and completeness accounting
+with no special-casing needed here):
 
 - fit count + threshold-robustness triple, judged on the task's own
   ``fit_metric``/``fit_threshold``/``fit_direction``/``robustness``
@@ -176,7 +181,7 @@ def _rows_for_task(all_rows: list[dict[str, Any]], task_name: str) -> dict[str, 
     Deliberately ``MATRIX_ARMS`` here, NOT ``experiments.benchmark_lab
     .ARM_REGISTRY`` (matrix arms unioned with the S5-only ``PROBE_ARMS``,
     e.g. ``rotation-hetero-k5``): this ``-02`` matrix report's planned-arm
-    accounting must stay exactly the eight clean seed-matrix arms --
+    accounting must stay exactly the nine clean seed-matrix arms --
     widening it to ``ARM_REGISTRY`` would make every ``-02`` report show
     the three probe arms as permanently "0/seeds missing" (they write
     under a distinct probe round tag, `BENCH_PROBE_ROUND_TAGS`, never

@@ -24,9 +24,11 @@ Sections
    dir from a synthetic ledger fixture, 0-row round renders without a
    crash, real ledger regeneration doesn't raise.
 8. Regression: `-02` matrix accounting untouched by the S5-only probe round
-   (`PROBE_ARMS`) -- the planned arm set stays exactly the eight
-   `MATRIX_ARMS`, and rows carrying either the probe round tag or a
-   probe-only variant never surface in a `-02` report.
+   (`PROBE_ARMS`) -- the planned arm set stays exactly the nine
+   `MATRIX_ARMS` (the eight `MinGRUStack` mixer arms plus `gru`, the
+   classical control arm added by a fourth amendment), and rows carrying
+   either the probe round tag or a probe-only variant never surface in a
+   `-02` report.
 """
 
 from __future__ import annotations
@@ -417,10 +419,12 @@ def test_regenerating_twice_is_byte_identical_given_same_rows(tmp_path):
 
 # ------------------------- 8. regression: -02 matrix accounting untouched --
 # (S5-only probe round, PROBE_ARMS -- Amendments, 2026-07-20 entry): the
-# `-02` matrix reports' planned-arm accounting must stay exactly the eight
-# clean seed-matrix arms, never widened by the three probe arms added to
-# `experiments.benchmark_lab.ARM_REGISTRY` alongside them.
-def test_matrix_arms_planned_set_is_exactly_the_eight_matrix_arms():
+# `-02` matrix reports' planned-arm accounting must stay exactly the nine
+# clean seed-matrix arms (the eight MinGRUStack mixer arms plus `gru`, the
+# classical control arm added by a fourth amendment), never widened by the
+# three probe arms added to `experiments.benchmark_lab.ARM_REGISTRY`
+# alongside them.
+def test_matrix_arms_planned_set_is_exactly_the_nine_matrix_arms():
     assert set(MATRIX_ARMS) == {
         "log",
         "signed",
@@ -430,12 +434,13 @@ def test_matrix_arms_planned_set_is_exactly_the_eight_matrix_arms():
         "delta",
         "signed-givens",
         "signed-delta",
+        "gru",
     }
-    assert len(MATRIX_ARMS) == 8
+    assert len(MATRIX_ARMS) == 9
     # PROBE_ARMS is disjoint and joins ARM_REGISTRY, but never MATRIX_ARMS.
     assert set(PROBE_ARMS) & set(MATRIX_ARMS) == set()
     assert set(ARM_REGISTRY) == set(MATRIX_ARMS) | set(PROBE_ARMS)
-    assert len(ARM_REGISTRY) == 11
+    assert len(ARM_REGISTRY) == 12
 
 
 def test_probe_round_rows_never_appear_in_a_minus02_matrix_report():

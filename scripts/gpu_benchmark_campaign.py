@@ -29,6 +29,15 @@ NOT in the default ``--arms`` list: probe arms run only when named
 explicitly (e.g. ``--arms rotation-hetero-k5 signed-delta-nh3
 signed-delta-nh4``).
 
+A fourth amendment (2026-07-20, "standard GRU control arm") added ``gru``
+to ``MATRIX_ARMS``, nine total -- a depth-matched (2-layer, d_model=64)
+classical ``nn.GRU`` external control, run on all four tasks like every
+other matrix arm. Unlike ``PROBE_ARMS``, this IS default-``--arms`` matrix
+expansion: no special-casing was needed here, since this module's
+``--arms`` default and choices both already read ``experiments.benchmark_lab
+.MATRIX_ARMS``/``.ARM_REGISTRY`` directly rather than hardcoding an arm
+list.
+
 Round tags: ``bench-s5-02``, ``bench-mqar-02``, ``bench-psmnist-02``,
 ``bench-pendulum-02`` -- one per task, independent of which MATRIX arms
 that task's cell selects, read from ``experiments.benchmark_tasks
@@ -421,8 +430,8 @@ def main(argv: list[str] | None = None) -> int:
         nargs="+",
         choices=sorted(benchmark_lab.ARM_REGISTRY),
         default=list(benchmark_lab.MATRIX_ARMS),
-        help="arm subset (default: the eight MATRIX_ARMS -- "
-        "log/signed/rotation/rotation-hetero/givens/delta/signed-givens/signed-delta; "
+        help="arm subset (default: the nine MATRIX_ARMS -- "
+        "log/signed/rotation/rotation-hetero/givens/delta/signed-givens/signed-delta/gru; "
         "the three S5-only PROBE_ARMS -- rotation-hetero-k5/signed-delta-nh3/"
         "signed-delta-nh4 -- are choosable but never run unless named explicitly, "
         "and write under their own bench-s5-probe-01 round tag, not the matrix tag)",

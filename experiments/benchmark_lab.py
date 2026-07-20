@@ -72,6 +72,26 @@ write under their own distinct ledger round tag
 `-02` tag. See `PROBE_ARMS`'s own comment for the corrected-config
 rationale.
 
+A fourth amendment (same intent-ledger file, 2026-07-20 "standard GRU
+control arm" entry) added a ninth `MATRIX_ARMS` arm, `gru`: a depth-matched
+(2-layer, d_model=64) `nn.GRU` classical control, run on all four tasks
+like every other matrix arm -- unlike the S5-only `PROBE_ARMS`, this is
+genuine matrix expansion (`scripts/report_benchmarks.py`'s `-02`
+completeness accounting and `scripts/gpu_benchmark_campaign.py`'s default
+`--arms` both pick it up automatically since both read `MATRIX_ARMS`).
+This closes a gap the first eight arms left open: every one of them
+compares WITHIN the minGRU family (`log` is the vanilla-minGRU baseline,
+not a classical RNN), so the round had no external anchor for what an
+absolute fit rate even means. `gru` is not a `MinGRUStack` mixer -- it has
+no `mixer`/`mixer_kwargs` shape at all -- so it is not built through
+`build_model`'s `ARM_REGISTRY[arm]` unpacking; see `MATRIX_ARMS`'s own
+comment for the sentinel-tuple representation and `build_model`'s `arm ==
+"gru"` branch for construction. Params are reported, not equalized,
+exactly like the other eight arms. Excluded from `DECAY_CAPABLE_ARMS`
+(see that set's own comment): plain `nn.GRU` has no decay/`delta_t`
+mechanism at all, so pendulum's `dt` reaches it only via the `log1p(dt)`
+feature-concat channel, the same treatment `delta`/the hetero arms get.
+
 Usage:
   uv run python experiments/benchmark_lab.py \
       --round bench-s5-02 --task s5 --model log --seed 0
@@ -235,6 +255,19 @@ RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lab_results.
 # stack's two mixer types, so this round doesn't invent one for either
 # new arm. Both receive dt only via the log1p(dt) feature-concat channel
 # on the pendulum task, like delta and rotation-hetero.
+#
+# gru: the classical external control arm (fourth amendment, module
+# docstring's "standard GRU control arm" paragraph) -- a depth-matched
+# (2-layer, d_model=64) plain `nn.GRU`, the ONLY arm here that is not a
+# `MinGRUStack` mixer. Its tuple value is therefore a SENTINEL, never
+# destructured into `(mixer, mixer_kwargs)`: `build_model` special-cases
+# `arm == "gru"` before it ever unpacks `ARM_REGISTRY[arm]` (see
+# `build_model`'s own comment). The tuple exists only so `"gru"` satisfies
+# `MATRIX_ARMS`/`ARM_REGISTRY` dict membership -- the same membership every
+# other arm gets for free -- which is what makes `gru` show up
+# automatically in the CLI's `--model`/`--arms` choices, the `-02` report's
+# per-arm iteration, and `gpu_benchmark_campaign.py`'s default `--arms`,
+# with no separate registry a caller would have to know to also check.
 MATRIX_ARMS: dict[str, tuple[str | list[str], dict | None]] = {
     "log": ("log", {}),
     "signed": ("signed", {}),
@@ -244,6 +277,7 @@ MATRIX_ARMS: dict[str, tuple[str | list[str], dict | None]] = {
     "delta": ("delta", {"nh": 2, "n_heads": 4, "d_k": 16, "d_v": 16}),
     "signed-givens": (["signed", "givens"], None),
     "signed-delta": (["signed", "delta"], {"delta": {"nh": 2, "n_heads": 4, "d_k": 16, "d_v": 16}}),
+    "gru": ("gru", None),
 }
 
 # Probe arms (Amendments, `.claude/output/intent/2026-07-19-benchmark-round-
@@ -286,7 +320,7 @@ PROBE_ARMS: dict[str, tuple[str | list[str], dict | None]] = {
     ),
 }
 
-# The build_model/CLI lookup: matrix arms (the clean eight-arm seed-matrix
+# The build_model/CLI lookup: matrix arms (the clean nine-arm seed-matrix
 # population, `scripts/report_benchmarks.py`'s `-02` completeness accounting
 # reads `MATRIX_ARMS` directly, never this union) union probe arms. Keeping
 # this as one dict (rather than two independent registries `build_model`
@@ -308,6 +342,11 @@ ARM_REGISTRY: dict[str, tuple[str | list[str], dict | None]] = {**MATRIX_ARMS, *
 # mechanically. The three PROBE_ARMS are excluded for the identical
 # reason -- each is a hetero stack of the same two mixer-type families
 # (rotation+signed, signed+delta) as its non-decay-capable matrix sibling.
+# gru is excluded for a DIFFERENT reason than the hetero arms above: it is
+# not a DecayMixin-mixing packaged mixer at all -- plain nn.GRU has no
+# decay/delta_t mechanism to enable in the first place, not merely one
+# this round declines to wire up. Pendulum's dt reaches it only via the
+# log1p(dt) feature-concat channel, same as every other excluded arm here.
 DECAY_CAPABLE_ARMS = {"log", "signed", "rotation", "givens"}
 
 
@@ -366,6 +405,76 @@ class FeatureSequenceModel(nn.Module):
         return self.head(out)
 
 
+class GRUTokenSequenceModel(nn.Module):
+    """`gru` arm counterpart to `TokenSequenceModel` (dense/masked_query
+    tasks: S5, MQAR): int token ids -> embedding -> a depth-matched
+    (default `N_LAYERS=2`) plain `nn.GRU` -> per-position logits over
+    `n_cls` classes -- the classical external control this round's other
+    eight arms (all `MinGRUStack` mixers) are anchored against (see the
+    module docstring's fourth-amendment paragraph). Ported from
+    `probes.py`'s `GRUTagger` cell pattern (`nn.GRU(D_MODEL, D_MODEL,
+    num_layers=n_layers, batch_first=True)`), generalized to this round's
+    `vocab`/`n_cls` per-task shapes.
+
+    `nn.GRU` dispatches to cuDNN internally and never reads `MINGRU_SCAN` --
+    a `gru`-arm run under `MINGRU_SCAN=triton` (the production job's export
+    for the other eight arms' Triton dispatch) is harmless, not a bug: the
+    env var is simply irrelevant to this arm, and no special-casing is
+    needed to keep it that way."""
+
+    def __init__(
+        self,
+        vocab: int,
+        n_cls: int,
+        n_layers: int = N_LAYERS,
+        d_model: int = D_MODEL,
+    ) -> None:
+        super().__init__()
+        self.emb = nn.Embedding(vocab, d_model)
+        self.rnn = nn.GRU(d_model, d_model, num_layers=n_layers, batch_first=True)
+        self.head = nn.Linear(d_model, n_cls)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h, _ = self.rnn(self.emb(x))
+        return self.head(h)
+
+
+class GRUFeatureSequenceModel(nn.Module):
+    """`gru` arm counterpart to `FeatureSequenceModel` (last_step/regression
+    tasks: psMNIST, pendulum): float features -> a depth-matched plain
+    `nn.GRU` -> per-position outputs.
+
+    `delta_t` is accepted (not omitted) so this model is a drop-in for the
+    same `model(x)` / `model(model_in, delta_t=decay_dt)` call shapes
+    `_forward_last_step`/`_forward_regression` already use uniformly across
+    every arm -- but it must always be `None` here: plain `nn.GRU` has no
+    decay/dt mechanism, and `gru` is excluded from `DECAY_CAPABLE_ARMS`, so
+    `_forward_regression`'s `decay_dt = dt if arm in DECAY_CAPABLE_ARMS else
+    None` never passes this model anything else. Pendulum's `dt` reaches it
+    only through the `log1p(dt)` feature `build_model` concatenates onto
+    the input, exactly like `delta`/the hetero arms."""
+
+    def __init__(
+        self,
+        input_size: int,
+        n_out: int,
+        n_layers: int = N_LAYERS,
+        d_model: int = D_MODEL,
+    ) -> None:
+        super().__init__()
+        self.rnn = nn.GRU(input_size, d_model, num_layers=n_layers, batch_first=True)
+        self.head = nn.Linear(d_model, n_out)
+
+    def forward(self, x: torch.Tensor, delta_t: torch.Tensor | None = None) -> torch.Tensor:
+        assert delta_t is None, (
+            "GRUFeatureSequenceModel has no delta_t/decay path (plain nn.GRU) -- "
+            "gru is excluded from DECAY_CAPABLE_ARMS, so this must never be called "
+            "with a non-None delta_t"
+        )
+        h, _ = self.rnn(x)
+        return self.head(h)
+
+
 def _model_shape(task_name: str) -> tuple[int, int]:
     """(vocab|d_in, n_cls|d_out) for `task_name`'s model -- derived from
     the task module's own data-shape constants (mirrors `probes.py`'s
@@ -389,6 +498,18 @@ def build_model(task: TaskSpec, arm: str) -> nn.Module:
     """Construct `arm`'s model for `task` via `ARM_REGISTRY` (spec §6
     arm configs) and `task.loss_mode` (spec §6 batch contracts).
 
+    `arm == "gru"` is a distinct branch, checked first: `gru` is not a
+    `MinGRUStack` mixer (its `ARM_REGISTRY` value is a sentinel tuple, never
+    destructured -- see `MATRIX_ARMS`'s comment), so it builds
+    `GRUTokenSequenceModel`/`GRUFeatureSequenceModel` directly instead of
+    going through the `mixer`/`mixer_kwargs` unpacking every other arm uses.
+    It still satisfies the exact same per-loss_mode shape contract
+    (`_forward_dense`/`_forward_masked_query`/`_forward_last_step`/
+    `_forward_regression` never know or care which branch built the model),
+    and gets the same `log1p(dt)` feature-concat treatment on pendulum as
+    the other `DECAY_CAPABLE_ARMS`-excluded arms -- just never the
+    mechanical-decay `mixer_kwargs` update, since it has no `mixer_kwargs`.
+
     `arm_kwargs` is `None` for `rotation-hetero` (the one list-mixer arm --
     `MinGRUStack`'s own convention for "no per-type overrides", see its
     docstring); every other arm's `arm_kwargs` is a flat dict, possibly
@@ -397,9 +518,17 @@ def build_model(task: TaskSpec, arm: str) -> nn.Module:
     so downstream code never juggles `None`."""
     if arm not in ARM_REGISTRY:
         raise ValueError(f"unknown arm {arm!r}; expected one of {sorted(ARM_REGISTRY)}")
+    in_dim, out_dim = _model_shape(task.name)
+    if arm == "gru":
+        if task.loss_mode in ("dense", "masked_query"):
+            return GRUTokenSequenceModel(in_dim, out_dim)
+        if task.loss_mode == "last_step":
+            return GRUFeatureSequenceModel(in_dim, out_dim)
+        if task.loss_mode == "regression":
+            return GRUFeatureSequenceModel(in_dim + 1, out_dim)  # +1: log1p(dt) feature
+        raise ValueError(f"unknown loss_mode {task.loss_mode!r}")
     mixer, arm_kwargs = ARM_REGISTRY[arm]
     mixer_kwargs = dict(arm_kwargs) if arm_kwargs else {}
-    in_dim, out_dim = _model_shape(task.name)
     if task.loss_mode in ("dense", "masked_query"):
         return TokenSequenceModel(in_dim, out_dim, mixer, mixer_kwargs)
     if task.loss_mode == "last_step":
@@ -721,6 +850,20 @@ def _resolve_device(device_str: str) -> torch.device:
     return device
 
 
+def _model_layers(model: nn.Module) -> int:
+    """Layer count for the ledger row's `"layers"` field, uniform across
+    both model families `build_model` constructs: `MinGRUStack`-based
+    models (`len(model.stack.blocks)`, the eight mixer arms) and the `gru`
+    arm's plain `nn.GRU`-based models (`model.rnn.num_layers`), mirroring
+    `probes.py`'s `run_one` convention for the same GRU-vs-MinGRUStack
+    split (`model.rnn.num_layers if isinstance(model, GRUTagger) else
+    len(model.stack.blocks)`)."""
+    stack = getattr(model, "stack", None)
+    if stack is not None:
+        return len(stack.blocks)
+    return model.rnn.num_layers
+
+
 # ------------------------------------------------------------------ run_arm
 def run_arm(
     *,
@@ -916,7 +1059,7 @@ def run_arm(
         "round": round_tag,
         "task": task.name,
         "variant": arm,
-        "layers": len(model.stack.blocks),
+        "layers": _model_layers(model),
         "seed": seed,
         "steps": selected_step,  # step index for step-based tasks, epoch index for psMNIST
         "acc": acc,
@@ -1053,7 +1196,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--model",
         choices=sorted(ARM_REGISTRY),
         help="log | signed | rotation | rotation-hetero | givens | delta | "
-        "signed-givens | signed-delta (the eight MATRIX_ARMS) | "
+        "signed-givens | signed-delta | gru (the nine MATRIX_ARMS) | "
         "rotation-hetero-k5 | signed-delta-nh3 | signed-delta-nh4 "
         "(the three S5-only PROBE_ARMS)",
     )

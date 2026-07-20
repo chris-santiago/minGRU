@@ -49,6 +49,17 @@ Sections
    round's matrix value, 2, to 3/4). `MATRIX_ARMS`/`PROBE_ARMS` disjoint,
    `ARM_REGISTRY == MATRIX_ARMS | PROBE_ARMS`; probe arms excluded from
    `DECAY_CAPABLE_ARMS` like their non-decay hetero siblings.
+10. `gru` arm (fourth amendment, "standard GRU control arm" entry) -- the
+    ninth `MATRIX_ARMS` arm and the classical external control this whole
+    round was missing: a depth-matched (2-layer, d_model=64) plain
+    `nn.GRU`, registered with a sentinel (never-destructured) tuple value
+    since it is not a `MinGRUStack` mixer. Construction per task/loss-mode
+    (`GRUTokenSequenceModel`/`GRUFeatureSequenceModel`, mirroring
+    `TokenSequenceModel`/`FeatureSequenceModel`'s shape contracts), the
+    `run_arm` `"layers"`-field fix (`_model_layers`), pendulum's dt-as-
+    feature-only wiring (no mechanical decay path exists to disable),
+    decay exclusion, and a forward+backward gradient-flow smoke per loss
+    mode.
 """
 
 from __future__ import annotations
@@ -66,11 +77,15 @@ from experiments.benchmark_lab import (
     MATRIX_ARMS,
     PROBE_ARMS,
     FeatureSequenceModel,
+    GRUFeatureSequenceModel,
+    GRUTokenSequenceModel,
     TokenSequenceModel,
     _eval_last_step_loader,
+    _forward_dense,
     _forward_last_step,
     _forward_masked_query,
     _forward_regression,
+    _model_layers,
     _row_exists,
     _tiny_task_overrides,
     build_model,
@@ -382,11 +397,21 @@ def test_row_exists_detects_matching_key(tmp_path, monkeypatch):
 
 
 # -------------------------------------------------------- 5. model construction
+# `gru` (Amendments, 2026-07-20 "standard GRU control arm" entry) is not a
+# `MinGRUStack` mixer, so it builds a distinct model class
+# (`GRUTokenSequenceModel`/`GRUFeatureSequenceModel`, see section 10 below)
+# -- the three generic per-loss-mode shape tests below therefore accept
+# EITHER model family's class for the isinstance check (the output-shape
+# assertion, the real invariant these tests exist to pin, is unaffected by
+# which family built the model). The pendulum decay-wiring test excludes
+# `gru` from its `ARM_REGISTRY` parametrization instead: a `gru` model has
+# no `.stack` attribute at all to inspect (see section 10's own dedicated
+# decay-exclusion test).
 @pytest.mark.parametrize("arm", sorted(ARM_REGISTRY))
 def test_build_model_token_sequence_shapes(arm):
     task = TASKS["s5"]
     model = build_model(task, arm)
-    assert isinstance(model, TokenSequenceModel)
+    assert isinstance(model, (TokenSequenceModel, GRUTokenSequenceModel))
     x = torch.randint(0, 120, (2, 9))
     out = model(x)
     assert out.shape == (2, 9, 120)
@@ -396,13 +421,13 @@ def test_build_model_token_sequence_shapes(arm):
 def test_build_model_feature_sequence_last_step_shapes(arm):
     task = TASKS["psmnist"]
     model = build_model(task, arm)
-    assert isinstance(model, FeatureSequenceModel)
+    assert isinstance(model, (FeatureSequenceModel, GRUFeatureSequenceModel))
     x = torch.rand(2, 12, 1)
     out = model(x)
     assert out.shape == (2, 12, 10)
 
 
-@pytest.mark.parametrize("arm", sorted(ARM_REGISTRY))
+@pytest.mark.parametrize("arm", sorted(set(ARM_REGISTRY) - {"gru"}))
 def test_build_model_pendulum_decay_wiring_matches_decay_capable_arms(arm):
     task = TASKS["pendulum"]
     model = build_model(task, arm)
@@ -655,7 +680,7 @@ def test_all_matrix_arms_have_distinct_param_counts():
 def test_matrix_and_probe_arms_are_disjoint_and_union_to_arm_registry():
     assert set(MATRIX_ARMS) & set(PROBE_ARMS) == set()
     assert set(ARM_REGISTRY) == set(MATRIX_ARMS) | set(PROBE_ARMS)
-    assert len(MATRIX_ARMS) == 8
+    assert len(MATRIX_ARMS) == 9  # eight MinGRUStack mixer arms + gru
     assert len(PROBE_ARMS) == 3
 
 
@@ -747,6 +772,187 @@ def test_probe_arms_excluded_from_decay_capable_arms(arm):
     model = build_model(task, arm)
     for block in model.stack.blocks:
         assert block.mingru.decay is None
+
+
+# ------------------------------------------------- 10. gru arm (4th amendment)
+def test_gru_arm_registered_in_matrix_arms_as_sentinel_tuple():
+    """`gru` (Amendments, 2026-07-20 "standard GRU control arm" entry) is
+    registered in `MATRIX_ARMS` with a SENTINEL tuple value -- unlike
+    every other arm, this value is never destructured into `(mixer,
+    mixer_kwargs)`: `build_model` special-cases `arm == "gru"` before it
+    ever consults `ARM_REGISTRY[arm]`'s value (see `MATRIX_ARMS`'s own
+    comment in `benchmark_lab.py`). The tuple exists only so `"gru"`
+    satisfies `MATRIX_ARMS`/`ARM_REGISTRY` dict membership."""
+    assert "gru" in MATRIX_ARMS
+    assert "gru" in ARM_REGISTRY
+    mixer, kwargs = MATRIX_ARMS["gru"]
+    assert mixer == "gru"
+    assert kwargs is None
+
+
+def test_gru_excluded_from_decay_capable_arms():
+    """Plain `nn.GRU` has no decay/`delta_t` mechanism at all -- unlike the
+    hetero arms (excluded for lack of an established decay-split
+    convention), `gru` is excluded because there is no mechanism to wire
+    up in the first place."""
+    assert "gru" not in DECAY_CAPABLE_ARMS
+
+
+@pytest.mark.parametrize("task_name", ["s5", "mqar"])
+def test_build_model_gru_token_sequence_two_layers_and_shapes(task_name):
+    """`gru` on the two token-input tasks (dense/masked_query): a 2-layer
+    `nn.GRU` (depth-matched to the other eight arms' 2-block MinGRUStack),
+    embedding input, per-position logits over the task's own vocab/n_cls
+    shape -- `TokenSequenceModel`'s contract, built by a distinct class."""
+    task = TASKS[task_name]
+    model = build_model(task, "gru")
+    assert isinstance(model, GRUTokenSequenceModel)
+    assert model.rnn.num_layers == 2
+    vocab, n_cls = model.emb.num_embeddings, model.head.out_features
+    x = torch.randint(0, vocab, (2, 9))
+    out = model(x)
+    assert out.shape == (2, 9, n_cls)
+
+
+def test_build_model_gru_feature_sequence_last_step_shapes():
+    """`gru` on psMNIST (last_step): a 2-layer `nn.GRU` over the scalar
+    pixel-stream input (no `log1p(dt)` feature -- psMNIST has no `dt`),
+    `_forward_last_step` reads only the final position's logits --
+    `FeatureSequenceModel`'s contract, built by a distinct class."""
+    task = TASKS["psmnist"]
+    model = build_model(task, "gru")
+    assert isinstance(model, GRUFeatureSequenceModel)
+    assert model.rnn.num_layers == 2
+    assert model.rnn.input_size == 1  # scalar pixel input, no dt feature on psMNIST
+    x = torch.rand(2, 12, 1)
+    out = model(x)
+    assert out.shape == (2, 12, 10)
+    loss, correct, total = _forward_last_step(model, x, torch.zeros(2, dtype=torch.long))
+    assert torch.isfinite(loss)
+    assert total == 2
+
+
+def test_build_model_gru_regression_gets_dt_as_feature_not_mechanical_decay():
+    """`gru` on pendulum (regression): input_size is `in_dim + 1` (the
+    `log1p(dt)` fairness-rule feature `build_model` concatenates for every
+    arm) -- `gru` has no mechanical decay path, so this feature channel is
+    the ONLY way `dt` reaches it, exactly like `delta`/the hetero arms
+    (`gru` is excluded from `DECAY_CAPABLE_ARMS`)."""
+    task = TASKS["pendulum"]
+    model = build_model(task, "gru")
+    assert isinstance(model, GRUFeatureSequenceModel)
+    assert model.rnn.input_size == 3  # 2 state dims + 1 log1p(dt) feature
+    x = torch.randn(2, 8, 2)
+    dt = torch.rand(2, 8).clamp(min=0.01)
+    dt[:, 0] = 0.0
+    y = torch.randn(2, 8, 2)
+    loss, sq_err_sum, count = _forward_regression(model, x, dt, y, "gru")
+    assert torch.isfinite(loss)
+    assert count == y.numel()
+
+
+def test_gru_feature_sequence_model_rejects_a_non_none_delta_t():
+    """Safety-net assertion pin: `GRUFeatureSequenceModel.forward` must
+    reject a non-`None` `delta_t` -- plain `nn.GRU` has no decay path to
+    route it through. `gru`'s exclusion from `DECAY_CAPABLE_ARMS` means
+    `_forward_regression` must never actually pass one, but the model
+    itself should not silently ignore a caller that does."""
+    model = GRUFeatureSequenceModel(input_size=3, n_out=2)
+    x = torch.randn(2, 5, 3)
+    with pytest.raises(AssertionError):
+        model(x, delta_t=torch.rand(2, 5))
+
+
+def test_gru_row_layers_field_reports_two():
+    """`run_arm`'s `"layers"` field must read `model.rnn.num_layers` for
+    the `gru` arm (it has no `.stack` attribute, unlike the eight
+    MinGRUStack arms) -- `_model_layers`'s branch, mirroring `probes.py`'s
+    `run_one` GRU-vs-MinGRUStack split."""
+    tiny_tasks = _tiny_task_overrides()
+    row = run_arm(
+        round_tag="test-gru-layers",
+        task=tiny_tasks["s5"],
+        arm="gru",
+        seed=0,
+        device="cpu",
+        dry_run=True,
+    )
+    assert row["layers"] == 2
+    assert _model_layers(build_model(TASKS["s5"], "gru")) == 2
+
+
+def test_gru_pendulum_row_still_carries_tau():
+    """Sanity: the `gru` arm doesn't disturb the pendulum row's existing
+    `config["tau"]` wiring (item 3) -- that field is set from
+    `task.fit_threshold` unconditionally on the pendulum task, regardless
+    of which arm ran."""
+    tiny_tasks = _tiny_task_overrides()
+    row = run_arm(
+        round_tag="test-gru-tau",
+        task=tiny_tasks["pendulum"],
+        arm="gru",
+        seed=0,
+        device="cpu",
+        dry_run=True,
+    )
+    assert row["config"]["tau"] == tiny_tasks["pendulum"].fit_threshold
+
+
+def _assert_gradients_flow(model: torch.nn.Module) -> None:
+    """Shared post-backward assertion: every parameter that requires grad
+    must have a gradient, and at least one gradient must be non-zero --
+    catches a silently detached path without requiring an exact-value
+    check per parameter."""
+    any_nonzero = False
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        assert p.grad is not None, f"{name}: no gradient (path silently detached?)"
+        if torch.any(p.grad != 0):
+            any_nonzero = True
+    assert any_nonzero, "every parameter's gradient was exactly zero"
+
+
+def test_gru_forward_backward_smoke_dense_s5():
+    torch.manual_seed(0)
+    model = build_model(TASKS["s5"], "gru")
+    x = torch.randint(0, 120, (3, 10))
+    y = torch.randint(0, 120, (3, 10))
+    loss, _, _ = _forward_dense(model, x, y)
+    loss.backward()
+    _assert_gradients_flow(model)
+
+
+def test_gru_forward_backward_smoke_masked_query_mqar():
+    torch.manual_seed(0)
+    model = build_model(TASKS["mqar"], "gru")
+    gen = torch.Generator().manual_seed(1)
+    x, y, mask = make_mqar(3, 32, gen, num_pairs=4)
+    loss, _, _ = _forward_masked_query(model, x, y, mask)
+    loss.backward()
+    _assert_gradients_flow(model)
+
+
+def test_gru_forward_backward_smoke_last_step_psmnist():
+    torch.manual_seed(0)
+    model = build_model(TASKS["psmnist"], "gru")
+    x = torch.rand(3, 10, 1)
+    y = torch.randint(0, 10, (3,))
+    loss, _, _ = _forward_last_step(model, x, y)
+    loss.backward()
+    _assert_gradients_flow(model)
+
+
+def test_gru_forward_backward_smoke_regression_pendulum():
+    torch.manual_seed(0)
+    model = build_model(TASKS["pendulum"], "gru")
+    x = torch.randn(3, 8, 2)
+    dt = torch.rand(3, 8).clamp(min=0.01)
+    dt[:, 0] = 0.0
+    y = torch.randn(3, 8, 2)
+    loss, _, _ = _forward_regression(model, x, dt, y, "gru")
+    loss.backward()
+    _assert_gradients_flow(model)
 
 
 # ------------------------------------------------------ TaskSpec singletons
