@@ -1,0 +1,319 @@
+{
+  "task": "psmnist",
+  "round": "bench-psmnist-02",
+  "fit_metric": "val_acc",
+  "fit_threshold": 0.9,
+  "fit_direction": "ge",
+  "robustness_thresholds": [
+    0.88,
+    0.9,
+    0.92
+  ],
+  "fisher_reference_arm": "log",
+  "arms": {
+    "log": {
+      "arm": "log",
+      "seeds_present": 12,
+      "seeds_planned": 12,
+      "present_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "missing_seeds": [],
+      "fits": 0,
+      "robustness": {
+        "0.88": 0,
+        "0.9": 0,
+        "0.92": 0
+      },
+      "mean_acc": {
+        "test": 0.7839833333333334
+      },
+      "fit_only_acc": {
+        "test": null
+      },
+      "params": 84234
+    },
+    "signed": {
+      "arm": "signed",
+      "seeds_present": 12,
+      "seeds_planned": 12,
+      "present_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "missing_seeds": [],
+      "fits": 0,
+      "robustness": {
+        "0.88": 0,
+        "0.9": 0,
+        "0.92": 0
+      },
+      "mean_acc": {
+        "test": 0.857325
+      },
+      "fit_only_acc": {
+        "test": null
+      },
+      "params": 92554
+    },
+    "rotation": {
+      "arm": "rotation",
+      "seeds_present": 12,
+      "seeds_planned": 12,
+      "present_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "missing_seeds": [],
+      "fits": 0,
+      "robustness": {
+        "0.88": 0,
+        "0.9": 0,
+        "0.92": 0
+      },
+      "mean_acc": {
+        "test": 0.5707166666666666
+      },
+      "fit_only_acc": {
+        "test": null
+      },
+      "params": 92682
+    },
+    "rotation-hetero": {
+      "arm": "rotation-hetero",
+      "seeds_present": 12,
+      "seeds_planned": 12,
+      "present_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "missing_seeds": [],
+      "fits": 0,
+      "robustness": {
+        "0.88": 3,
+        "0.9": 0,
+        "0.92": 0
+      },
+      "mean_acc": {
+        "test": 0.8679833333333334
+      },
+      "fit_only_acc": {
+        "test": null
+      },
+      "params": 92618
+    },
+    "givens": {
+      "arm": "givens",
+      "seeds_present": 12,
+      "seeds_planned": 12,
+      "present_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "missing_seeds": [],
+      "fits": 0,
+      "robustness": {
+        "0.88": 0,
+        "0.9": 0,
+        "0.92": 0
+      },
+      "mean_acc": {
+        "test": 0.29031666666666667
+      },
+      "fit_only_acc": {
+        "test": null
+      },
+      "params": 96842
+    },
+    "delta": {
+      "arm": "delta",
+      "seeds_present": 12,
+      "seeds_planned": 12,
+      "present_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "missing_seeds": [],
+      "fits": 10,
+      "robustness": {
+        "0.88": 12,
+        "0.9": 10,
+        "0.92": 2
+      },
+      "mean_acc": {
+        "test": 0.9047499999999999
+      },
+      "fit_only_acc": {
+        "test": 0.90797
+      },
+      "params": 118554
+    },
+    "signed-givens": {
+      "arm": "signed-givens",
+      "seeds_present": 0,
+      "seeds_planned": 12,
+      "present_seeds": [],
+      "missing_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "fits": 0,
+      "robustness": {
+        "0.88": 0,
+        "0.9": 0,
+        "0.92": 0
+      },
+      "mean_acc": {},
+      "fit_only_acc": {},
+      "params": 94698
+    },
+    "signed-delta": {
+      "arm": "signed-delta",
+      "seeds_present": 0,
+      "seeds_planned": 12,
+      "present_seeds": [],
+      "missing_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "fits": 0,
+      "robustness": {
+        "0.88": 0,
+        "0.9": 0,
+        "0.92": 0
+      },
+      "mean_acc": {},
+      "fit_only_acc": {},
+      "params": 105554
+    }
+  },
+  "fisher_vs_reference": {
+    "signed": {
+      "p": 1.0,
+      "fits": "0/12",
+      "reference_fits": "0/12"
+    },
+    "rotation": {
+      "p": 1.0,
+      "fits": "0/12",
+      "reference_fits": "0/12"
+    },
+    "rotation-hetero": {
+      "p": 1.0,
+      "fits": "0/12",
+      "reference_fits": "0/12"
+    },
+    "givens": {
+      "p": 1.0,
+      "fits": "0/12",
+      "reference_fits": "0/12"
+    },
+    "delta": {
+      "p": 6.730380939561179e-05,
+      "fits": "10/12",
+      "reference_fits": "0/12"
+    },
+    "signed-givens": {
+      "p": null,
+      "note": "n/a (one arm has 0 rows)"
+    },
+    "signed-delta": {
+      "p": null,
+      "note": "n/a (one arm has 0 rows)"
+    }
+  },
+  "stratum_labels": [
+    {
+      "device": "cuda",
+      "torch": "2.8.0+cu128",
+      "scan": "triton",
+      "compile": null
+    }
+  ],
+  "env": {
+    "torch": "2.13.0",
+    "git_commit": "4e0e75e6c39866bd06194023912d161d7fad66e7",
+    "generated": "2026-07-20T11:38:12.474704+00:00"
+  }
+}
