@@ -1,6 +1,6 @@
 # Getting started
 
-This tutorial takes you from an empty environment to a trained sequence model. You will install the package, check a single layer's shapes, then train a two-layer stack to solve **running parity** — labelling each prefix of a bit string with its cumulative XOR — and watch its accuracy climb to 1.000 and hold at four times the training length. Every step prints output so you can see it working.
+This tutorial takes you from an empty environment to a trained sequence model. You will install the package, check a single layer's shapes, then train a two-layer stack to solve **running parity** (labelling each prefix of a bit string with its cumulative XOR) and watch its accuracy climb to 1.000 and hold at four times the training length. Every step prints output so you can see it working.
 
 ## Prerequisites
 
@@ -13,9 +13,9 @@ pip install mingru-scans
 
 Until the first PyPI release lands, install from the repository: `pip install git+https://github.com/chris-santiago/minGRU`.
 
-The distribution is `mingru-scans`; the import name is `mingru`. CPU is enough for this tutorial — no GPU or Triton install is required (see [Triton on GPU](triton-on-gpu.md) for the accelerated path).
+The distribution is `mingru-scans`; the import name is `mingru`. CPU is enough for this tutorial: no GPU or Triton install is required (see [Triton on GPU](triton-on-gpu.md) for the accelerated path).
 
-## Step 1 — Build a layer and check its shapes
+## Step 1: Build a layer and check its shapes
 
 A single `MinGRU` layer maps an input sequence `(B, T, input_size)` to a hidden sequence `(B, T, hidden_size)` in one parallel scan. The same layer also exposes an $O(1)$-memory streaming `step`.
 
@@ -40,7 +40,7 @@ forward: (4, 128, 64)
 step: (4, 64)
 ```
 
-## Step 2 — Train your first model on running parity
+## Step 2: Train your first model on running parity
 
 Parity is the smallest task that separates these mixers from an ordinary decaying RNN: the label is the running XOR of a bit stream, so the state has to *flip sign* on a `1` and *hold* on a `0`. The default mixer, `"log"`, keeps its state positive and cannot flip, so it stays near chance. We therefore pick `mixer="signed"`, whose transition coefficient can reach $-1$. (The [Choose a mixer](../how-to/choose-a-mixer.md) guide covers when to reach for each mixer.)
 
@@ -92,7 +92,7 @@ step 300  loss 0.0001  acc 1.000
 
 The model sits at chance (accuracy near 0.5) for the first fifty-odd steps, then snaps to an exact solution once the sign-flip transition is found.
 
-## Step 3 — Check length generalization
+## Step 3: Check length generalization
 
 The real test of a state-tracking solution is whether it holds *past the training length*. Train at `T=64`, evaluate at `T=256`:
 
@@ -113,7 +113,7 @@ acc @ T=256 (trained at T=64): 1.000
 
 A model that had merely memorized a depth-64 shortcut would decay here. Holding at 1.000 four times out is the signature of the exact recurrent solution — the property these mixers are built for.
 
-## Step 4 — Stream one step at a time
+## Step 4: Stream one step at a time
 
 The trained model runs as a constant-memory recurrence for inference. `init_state()` gives one slot per block; `step` consumes a single timestep `(B, input_size)` and returns the output plus the updated state.
 
@@ -143,7 +143,7 @@ You installed the package, verified a layer's shapes, and trained a two-layer `S
 
 ## Next steps
 
-- [Two-layer stacks](two-layer-stacks.md) — compose *different* mixers in the right order for hierarchical tasks.
-- [Triton on GPU](triton-on-gpu.md) — enable the Triton scan kernels and confirm they engage.
-- [Choose a mixer](../how-to/choose-a-mixer.md) — which of the five mixers fits your problem.
-- [Why the mixers differ](../explanation/index.md) — the state-tracking ideas behind the ladder.
+- [Two-layer stacks](two-layer-stacks.md): compose *different* mixers in the right order for hierarchical tasks.
+- [Triton on GPU](triton-on-gpu.md): enable the Triton scan kernels and confirm they engage.
+- [Choose a mixer](../how-to/choose-a-mixer.md): which of the five mixers fits your problem.
+- [Why the mixers differ](../explanation/index.md): the state-tracking ideas behind the ladder.

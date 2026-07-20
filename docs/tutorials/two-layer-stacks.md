@@ -1,14 +1,14 @@
 # Two-layer stacks
 
-A single mixer tracks one kind of state. Hard sequence problems are often *hierarchical*: something has to be **extracted** from the raw input before the running quantity can be **composed**. `MinGRUStack` lets you assign a different mixer to each layer, so you can put an extractor underneath a composer. This tutorial builds a `SignedMinGRU` extractor feeding a `GivensMinGRU` composer, one of the two recommended composer choices for the repo's hierarchical probe (the small-state option — see [How-to: choose a mixer](../how-to/choose-a-mixer.md#the-two-axis-guidance) for when `DeltaMinGRU` is the better composer instead), and shows why extract-then-compose *order* is the one to reach for regardless of which composer you pick.
+A single mixer tracks one kind of state. Hard sequence problems are often *hierarchical*: something has to be **extracted** from the raw input before the running quantity can be **composed**. `MinGRUStack` lets you assign a different mixer to each layer, so you can put an extractor underneath a composer. This tutorial builds a `SignedMinGRU` extractor feeding a `GivensMinGRU` composer, one of the two recommended composer choices for the repo's hierarchical probe (the small-state option; see [How-to: choose a mixer](../how-to/choose-a-mixer.md#the-two-axis-guidance) for when `DeltaMinGRU` is the better composer instead), and shows why extract-then-compose *order* is the one to reach for regardless of which composer you pick.
 
 By the end you will have constructed the ordered stack with the public API, configured each layer independently, seen the warning that flags a fragile ordering, and read the measured evidence that fixes the order for this class of task.
 
 ## The problem shape: extract, then compose
 
-The motivating task is `S3-hier` (the repo's harder probe; chance $\approx 1/6$). The group operation is hidden inside a *pair* of sub-tokens: a running product over the permutation group $S_3$ is updated only when a pair completes, and a fixed Latin square maps each pair to its generator. Because the square is non-isotopic to any group of order six, no single-token shortcut exists — the generator must genuinely be **extracted** from the pair before it can be **composed** onto the running product. That is a two-stage computation, and it maps cleanly onto two layers: a lower layer that reads pairs into generators, an upper layer that accumulates them.
+The motivating task is `S3-hier` (the repo's harder probe; chance $\approx 1/6$). The group operation is hidden inside a *pair* of sub-tokens: a running product over the permutation group $S_3$ is updated only when a pair completes, and a fixed Latin square maps each pair to its generator. Because the square is non-isotopic to any group of order six, no single-token shortcut exists: the generator must genuinely be **extracted** from the pair before it can be **composed** onto the running product. That is a two-stage computation, and it maps cleanly onto two layers: a lower layer that reads pairs into generators, an upper layer that accumulates them.
 
-## Step 1 — Build the ordered stack
+## Step 1: Build the ordered stack
 
 Pass `mixer` as a list, one entry per block, bottom layer first. `["signed", "givens"]` puts the `SignedMinGRU` extractor at layer 0 and the `GivensMinGRU` composer at layer 1.
 
@@ -33,9 +33,9 @@ block 0 mixer: SignedMinGRU
 block 1 mixer: GivensMinGRU
 ```
 
-The stack forwards exactly like a homogeneous one — `(B, T, input_size) → (B, T, d_model)` plus one state per block. Only the per-layer mixer changed. `GivensMinGRU` requires `d_model` to be a multiple of its `block_size` (default 8); `64` satisfies that.
+The stack forwards exactly like a homogeneous one: `(B, T, input_size) → (B, T, d_model)` plus one state per block. Only the per-layer mixer changed. `GivensMinGRU` requires `d_model` to be a multiple of its `block_size` (default 8); `64` satisfies that.
 
-## Step 2 — Configure each layer independently
+## Step 2: Configure each layer independently
 
 With a list `mixer`, `mixer_kwargs` is keyed **by mixer type**, not applied flat. Each type's dict is that mixer's constructor kwargs, shared by every block of that type. Here we pin the extractor to the decoupled `SignedMinGRU` parameterization and set the composer's block geometry explicitly:
 
@@ -63,7 +63,7 @@ configured forward: (4, 128, 64)
 
 A flat `mixer_kwargs` dict alongside a list `mixer` (or a type-keyed dict alongside a single-string `mixer`) raises `ValueError` naming both schemas, so the two forms cannot be mixed up silently.
 
-## Step 3 — Read the ordering warning
+## Step 3: Read the ordering warning
 
 `signed → givens` constructs silently. A stack with more than one `rotation` block does not: the straight-through angle snap in `RotationMinGRU` can compound across rotation layers, and only the $L{=}2$ case is validated, so construction emits exactly one `UserWarning`. `GivensMinGRU` is continuous (no snap), so it never triggers this warning.
 
@@ -88,7 +88,7 @@ Treat that warning as a signal to prefer a `GivensMinGRU` composer over stacked 
 
 ## Why this order? The measured evidence
 
-Layer order on `S3-hier` is not a matter of taste — it is measured. All figures below are multi-seed means at the standard 1600-step budget with best-val@128 checkpoint selection (best-val@128 = keep the checkpoint that scored highest on held-out length-128 validation), from `experiments/EXPERIMENTS.md` (rounds `hetero-legB-v2`, `hetero-loop-17-sg8`) and the README's `S3-hier` table. Chance is $\approx 0.167$.
+Layer order on `S3-hier` is not a matter of taste. It is measured. All figures below are multi-seed means at the standard 1600-step budget with best-val@128 checkpoint selection (best-val@128 = keep the checkpoint that scored highest on held-out length-128 validation), from `experiments/EXPERIMENTS.md` (rounds `hetero-legB-v2`, `hetero-loop-17-sg8`) and the README's `S3-hier` table. Chance is $\approx 0.167$.
 
 | stack (`mixer=`) | seeds | acc@64 | acc@256 | acc@512 | acc@1024 |
 |---|---|---|---|---|---|
@@ -121,10 +121,10 @@ The `signed → givens` numbers above are reproducible from a repo checkout. The
 
 ## What you built
 
-You constructed a hierarchical stack — a `SignedMinGRU` extractor feeding a `GivensMinGRU` composer, the small-state option for extract-then-compose problems — configured each layer through the type-keyed `mixer_kwargs` schema, saw the warning that flags a fragile stacked-rotation ordering, and grounded the ordering choice in the measured `S3-hier` and `S3` evidence. Swap the composer for `mixer=["signed", "delta"]` with `mixer_kwargs={"delta": {...}}` if your per-token state is free to grow — see [How-to: choose a mixer](../how-to/choose-a-mixer.md#the-two-axis-guidance) for when to make that swap.
+You constructed a hierarchical stack (a `SignedMinGRU` extractor feeding a `GivensMinGRU` composer, the small-state option for extract-then-compose problems), configured each layer through the type-keyed `mixer_kwargs` schema, saw the warning that flags a fragile stacked-rotation ordering, and grounded the ordering choice in the measured `S3-hier` and `S3` evidence. Swap the composer for `mixer=["signed", "delta"]` with `mixer_kwargs={"delta": {...}}` if your per-token state is free to grow; see [How-to: choose a mixer](../how-to/choose-a-mixer.md#the-two-axis-guidance) for when to make that swap.
 
 ## Next steps
 
-- [Choose a mixer](../how-to/choose-a-mixer.md) — the per-mixer decision table.
-- [Reproduce the evidence](../how-to/reproduce-the-evidence.md) — run the ordering experiment yourself.
-- [Givens & Delta deep dive](../explanation/givens-delta.md) — the brick-wall Givens parameterization, the chunked-WY delta-rule composer, and the evidence that separates them.
+- [Choose a mixer](../how-to/choose-a-mixer.md): the per-mixer decision table.
+- [Reproduce the evidence](../how-to/reproduce-the-evidence.md): run the ordering experiment yourself.
+- [Givens & Delta deep dive](../explanation/givens-delta.md): the brick-wall Givens parameterization, the chunked-WY delta-rule composer, and the evidence that separates them.

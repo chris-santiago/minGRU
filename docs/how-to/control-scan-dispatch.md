@@ -14,7 +14,7 @@ The four scan functions (`parallel_scan_log`, `linear_scan`, `matrix_scan`, `mat
 
 ## Force the eager path
 
-Set `MINGRU_SCAN=eager` to guarantee the pure-PyTorch implementation everywhere. This never imports the Triton module, so it is the mode to use below the `torch >= 2.8` floor, for deterministic A/B timing against Triton, or when you only use the diagonal mixers (whose elementwise log scan is *faster* in eager form — see [Run the benchmarks](run-the-benchmarks.md)).
+Set `MINGRU_SCAN=eager` to guarantee the pure-PyTorch implementation everywhere. This never imports the Triton module, so it is the mode to use below the `torch >= 2.8` floor, for deterministic A/B timing against Triton, or when you only use the diagonal mixers (whose elementwise log scan is *faster* in eager form, see [Run the benchmarks](run-the-benchmarks.md)).
 
 ```bash
 MINGRU_SCAN=eager python your_script.py
@@ -33,7 +33,7 @@ print(parallel_scan_log(log_coeffs, log_values).shape)   # torch.Size([2, 5, 3])
 
 ## Require the Triton path
 
-Set `MINGRU_SCAN=triton` to make the Triton kernel mandatory: if a kernel is unavailable — no CUDA device, `triton` not importable, inputs on CPU, or no kernel registered for that op — the call raises `RuntimeError` instead of silently downgrading to eager. Use it in CI or a benchmark harness to prove the accelerated path is actually live.
+Set `MINGRU_SCAN=triton` to make the Triton kernel mandatory: if a kernel is unavailable (no CUDA device, `triton` not importable, inputs on CPU, or no kernel registered for that op), the call raises `RuntimeError` instead of silently downgrading to eager. Use it in CI or a benchmark harness to prove the accelerated path is actually live.
 
 ```python
 import os
@@ -51,7 +51,7 @@ RuntimeError: MINGRU_SCAN=triton requested for 'parallel_scan_log' but Triton is
 
 ## Understand `auto` (the default)
 
-`auto` is what you want in production: CUDA-resident inputs with a usable Triton kernel run on Triton; everything else — CPU tensors, a missing Triton module, an out-of-envelope shape, or an op with no kernel yet — falls through to the unchanged eager implementation. A fallback that happens **despite CUDA inputs** warns exactly once per process, naming the reason, so a silent performance cliff can't hide:
+`auto` is what you want in production: CUDA-resident inputs with a usable Triton kernel run on Triton; everything else (CPU tensors, a missing Triton module, an out-of-envelope shape, or an op with no kernel yet) falls through to the unchanged eager implementation. A fallback that happens **despite CUDA inputs** warns exactly once per process, naming the reason, so a silent performance cliff can't hide:
 
 ```
 UserWarning: MINGRU_SCAN=auto fell back to the eager scan implementation for 'parallel_scan_log' despite CUDA inputs: <reason>
@@ -61,7 +61,7 @@ CPU inputs under `auto` fall back silently (that is the expected path, not a reg
 
 ## Check the current status
 
-`mingru.available()` tells you whether the Triton path *can* run at all — `True`, or a reason string like `"CUDA not available"`:
+`mingru.available()` tells you whether the Triton path *can* run at all: `True`, or a reason string like `"CUDA not available"`:
 
 ```python
 import mingru
