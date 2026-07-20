@@ -13,7 +13,9 @@ Task x arm matrix (spec section 1/6)
 Four tasks (``s5``, ``mqar``, ``psmnist``, ``pendulum``), each run against
 the registered arms -- ``experiments/benchmark_lab.py``'s ``ARM_REGISTRY``
 (spec section 6 "Arms" fixed ``log``/``signed``/``rotation``/``givens``/
-``delta``; ``rotation-hetero`` was added by amendment, six total). Unlike
+``delta``; ``rotation-hetero`` was added by amendment, six total; a second
+amendment then added ``signed-givens``/``signed-delta``, eight total --
+every arm runs on all four tasks, no per-task arm subset). Unlike
 the GPU 36-seed round's ``gpu_hetero_campaign.py``,
 no arm here forces a distinct backend (no per-arm ``MINGRU_SCAN``/
 ``torch.compile`` split) -- every arm of a task runs under the same
@@ -379,8 +381,8 @@ def main(argv: list[str] | None = None) -> int:
         nargs="+",
         choices=sorted(benchmark_lab.ARM_REGISTRY),
         default=list(benchmark_lab.ARM_REGISTRY),
-        help="arm subset (default: all registered arms -- six packaged-mixer arms: "
-        "log/signed/rotation/rotation-hetero/givens/delta)",
+        help="arm subset (default: all registered arms -- eight packaged-mixer arms: "
+        "log/signed/rotation/rotation-hetero/givens/delta/signed-givens/signed-delta)",
     )
     parser.add_argument(
         "--seeds",

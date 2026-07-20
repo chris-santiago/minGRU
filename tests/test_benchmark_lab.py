@@ -35,6 +35,12 @@ Sections
    treatment), and has a param count distinct from `rotation`'s -- see
    `ARM_REGISTRY`'s comment in `benchmark_lab.py` for the full rationale,
    including the same-type reading that was tried and rejected.
+8. `signed-givens`/`signed-delta` arms (second, later amendment) -- the
+   promoted hetero structures (`probes.py`'s `minGRU-hetero-sg8`, GPU-re-
+   evidenced as `hetero_lab.py`'s `hetero-pg8`; and `hetero_lab.py`'s
+   `hetero-pd1024` at the delta mechanism's native config), run on ALL
+   FOUR tasks like every other arm (no per-task arm subset exists).
+   Neither is decay-capable, mirroring `rotation-hetero`'s treatment.
 """
 
 from __future__ import annotations
@@ -529,6 +535,103 @@ def test_rotation_and_rotation_hetero_have_distinct_param_counts():
         p.numel() for p in build_model(task, "rotation-hetero").parameters()
     )
     assert rotation_params != rotation_hetero_params
+
+
+# ------------------------- 8. signed-givens / signed-delta arms (2nd amendment)
+def test_signed_givens_arm_registered_as_signed_givens_hetero_stack():
+    """`signed-givens` (mid-matrix amendment, run on all four tasks like
+    every other arm) is a single `"signed"` block composed with a single
+    `"givens"` block, `mixer_kwargs=None` -- byte-identical to probes.py's
+    `MIXER_REGISTRY["minGRU-hetero-sg8"]` (`(["signed", "givens"], None)`),
+    the S3-hier promoted fit-rate winner, GPU-re-evidenced as
+    `hetero_lab.py`'s `"hetero-pg8"` arm."""
+    assert "signed-givens" in ARM_REGISTRY
+    mixer, kwargs = ARM_REGISTRY["signed-givens"]
+    assert mixer == ["signed", "givens"]
+    assert kwargs is None
+
+
+def test_signed_givens_block_composition_uses_promoted_givens_defaults():
+    """`mixer_kwargs=None` must let `MinGRUStack` apply `GivensMinGRU`'s
+    own class defaults (block_size=8, rounds=3) -- the same config this
+    round's own `givens` arm passes explicitly -- rather than the givens
+    block silently landing on some other configuration."""
+    task = TASKS["s5"]
+    model = build_model(task, "signed-givens")
+    signed_block, givens_block = model.stack.blocks
+    assert type(signed_block.mingru).__name__ == "SignedMinGRU"
+    assert type(givens_block.mingru).__name__ == "GivensMinGRU"
+    assert givens_block.mingru.k == 8  # block_size
+    assert givens_block.mingru.rounds == 3
+
+
+def test_signed_delta_arm_registered_with_native_delta_config():
+    """`signed-delta` (mid-matrix amendment, run on all four tasks like
+    every other arm) is a single `"signed"` block composed with a single
+    `"delta"` block at its native promoted config (nh=2, n_heads=4,
+    d_k=16, d_v=16 -- identical kwargs to this round's own `delta` arm),
+    mirroring `hetero_lab.py`'s `"hetero-pd1024"` row (matched-state/
+    GPU-36 lineage; see `ARM_REGISTRY`'s own comment for the signed-tanh
+    vs packaged-`signed` provenance caveat this row does not hide).
+    Unlike `signed-givens`, `mixer_kwargs` here is NOT `None`: it is a
+    type-keyed dict naming only `"delta"`, so `"signed"` resolves to its
+    own class defaults via the omitted-key-defaults-to-`None` rule."""
+    assert "signed-delta" in ARM_REGISTRY
+    mixer, kwargs = ARM_REGISTRY["signed-delta"]
+    assert mixer == ["signed", "delta"]
+    assert kwargs == {"delta": {"nh": 2, "n_heads": 4, "d_k": 16, "d_v": 16}}
+
+
+def test_signed_delta_block_composition_matches_native_delta_config():
+    task = TASKS["s5"]
+    model = build_model(task, "signed-delta")
+    signed_block, delta_block = model.stack.blocks
+    assert type(signed_block.mingru).__name__ == "SignedMinGRU"
+    assert type(delta_block.mingru).__name__ == "DeltaMinGRU"
+    assert delta_block.mingru.nh == 2
+    assert delta_block.mingru.n_heads == 4
+    assert delta_block.mingru.d_k == 16
+    assert delta_block.mingru.d_v == 16
+
+
+def test_signed_delta_delta_block_kwargs_match_the_plain_delta_arm():
+    """`signed-delta`'s delta block must use the EXACT same kwargs as this
+    round's own `delta` arm -- both mirror the delta mechanism's promoted
+    native-state config, not two independently drifted configs."""
+    _, delta_kwargs = ARM_REGISTRY["delta"]
+    _, hetero_kwargs = ARM_REGISTRY["signed-delta"]
+    assert hetero_kwargs["delta"] == delta_kwargs
+
+
+def test_signed_givens_and_signed_delta_are_excluded_from_decay_capable_arms():
+    assert "signed-givens" not in DECAY_CAPABLE_ARMS
+    assert "signed-delta" not in DECAY_CAPABLE_ARMS
+
+
+@pytest.mark.parametrize("arm", ["signed-givens", "signed-delta"])
+def test_new_hetero_arms_pendulum_wiring_matches_delta_feature_channel_only(arm):
+    """Neither new arm is decay-capable (same rationale as `rotation-
+    hetero`: no established repo precedent for splitting decay wiring
+    across a hetero stack's two mixer types) -- on the pendulum task, `dt`
+    must reach both new arms only via the `log1p(dt)` feature-concat
+    channel, never mechanically through the stack's decay path."""
+    task = TASKS["pendulum"]
+    model = build_model(task, arm)
+    for block in model.stack.blocks:
+        assert block.mingru.decay is None
+
+
+def test_all_registered_arms_have_distinct_param_counts():
+    """Direct local pin of the report-layer invariant
+    `tests/test_report_benchmarks.py::test_param_counts_are_positive_and_vary_by_task_and_arm`:
+    every arm in `ARM_REGISTRY`, including the two new hetero arms, must
+    build a genuinely different model, not a duplicate of an existing one
+    under a new name."""
+    task = TASKS["s5"]
+    params = {
+        arm: sum(p.numel() for p in build_model(task, arm).parameters()) for arm in ARM_REGISTRY
+    }
+    assert len(set(params.values())) == len(ARM_REGISTRY)
 
 
 # ------------------------------------------------------ TaskSpec singletons

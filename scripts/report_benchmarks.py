@@ -18,7 +18,7 @@ rationale; ``scripts/gpu_check.py`` is the one place that still recognizes
 both generations, for old pilot job logs/sidecars.
 
 Per task, per arm (``experiments.benchmark_lab.ARM_REGISTRY``:
-log/signed/rotation/rotation-hetero/givens/delta):
+log/signed/rotation/rotation-hetero/givens/delta/signed-givens/signed-delta):
 
 - fit count + threshold-robustness triple, judged on the task's own
   ``fit_metric``/``fit_threshold``/``fit_direction``/``robustness``

@@ -148,6 +148,32 @@ def test_run_arm_kwargs_shrinks_eval_every_alongside_steps_override():
     assert kwargs["eval_every"] == 20
 
 
+# --- main(): --arms defaults to the full ARM_REGISTRY (no per-task subset) -
+
+
+def test_main_default_arms_is_the_full_arm_registry(monkeypatch):
+    """Confirms `scripts/gpu_benchmark_campaign.py`'s `--arms` default
+    (`list(benchmark_lab.ARM_REGISTRY)`, module docstring's Task x arm
+    matrix section) still resolves to every registered arm -- including
+    `signed-givens`/`signed-delta` -- with no per-task arm scoping: every
+    task runs the same arm list. Captures the arguments `main` actually
+    passes to `run_campaign` rather than asserting on argparse internals
+    directly."""
+    captured: dict = {}
+
+    def _fake_run_campaign(tasks, arms, seeds, steps, device):
+        captured["tasks"] = tasks
+        captured["arms"] = arms
+        return None
+
+    monkeypatch.setattr(gpu_benchmark_campaign, "run_campaign", _fake_run_campaign)
+    gpu_benchmark_campaign.main(["--tasks", "s5", "--seeds", "0"])
+
+    assert set(captured["arms"]) == set(ARM_REGISTRY)
+    assert "signed-givens" in captured["arms"]
+    assert "signed-delta" in captured["arms"]
+
+
 # --- _run_selftest_gate: failure paths raise a clean SystemExit -----------
 
 

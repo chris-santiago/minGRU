@@ -34,8 +34,26 @@ the snap setting), which avoids the multi-rotation warning (a single
 `"rotation"` entry in a mixed stack doesn't warn). See `ARM_REGISTRY`'s
 own comment for the full rationale, including why a same-type second
 reading was tried and rejected (byte-identical to `rotation`, caught by
-`tests/test_report_benchmarks.py`'s distinct-param-count invariant). No
-new mixer code -- every arm is an existing packaged class, called through
+`tests/test_report_benchmarks.py`'s distinct-param-count invariant).
+
+Two more arms, `signed-givens` and `signed-delta`, were added by a
+second, later amendment (same intent-ledger file, Amendments) that runs
+them on ALL FOUR tasks, exactly like the other six arms -- no per-task
+arm scoping exists in this module or its consumers (`ARM_REGISTRY` is
+the one and only arm list every task, `scripts/report_benchmarks.py`,
+and `scripts/gpu_benchmark_campaign.py` iterate). They ground this
+round's arm list in the repo's already-evidenced promoted hetero
+structures rather than inventing a new one: `signed-givens` is
+`probes.py`'s `"minGRU-hetero-sg8"` row (`["signed", "givens"], None`,
+the S3-hier promoted fit-rate winner, GPU-re-evidenced as
+`hetero_lab.py`'s `"hetero-pg8"`); `signed-delta` mirrors
+`hetero_lab.py`'s `"hetero-pd1024"` row (the delta block at its
+matched-state/GPU-36-round native config, nh=2/n_heads=4/d_k=16/d_v=16 --
+identical to this round's own `delta` arm's kwargs) composed with one
+`signed` block. See `ARM_REGISTRY`'s own comment for the provenance
+caveat on `signed-delta` (the lab lineage row used signed-TANH, not the
+packaged `signed` mixer this round's registry path uses). No new mixer
+code -- every arm is an existing packaged class, called through
 `MinGRUStack`'s `mixer=`/`mixer_kwargs=` contract.
 
 Usage:
@@ -120,10 +138,15 @@ RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lab_results.
 # arms' configs (probes.py's MIXER_REGISTRY/build() pattern, generalized to
 # this round's packaged mixers instead of probes.py's historical model
 # names): five fixed by the round's Global Constraints, plus the amended
-# sixth arm below. mixer is a `str` (one type, every block, flat kwargs)
-# for five of the six arms; `rotation-hetero` is the one `list[str]` arm
-# (per-block mixer types, kwargs keyed by type name or `None` -- see
-# `MinGRUStack`'s own docstring for this schema).
+# sixth arm below, plus two more `list[str]` hetero arms (`signed-givens`,
+# `signed-delta`) added by a second amendment -- see the module docstring's
+# "Two more arms" paragraph. mixer is a `str` (one type, every block, flat
+# kwargs) for five of the eight arms; `rotation-hetero`/`signed-givens`/
+# `signed-delta` are the three `list[str]` arms (per-block mixer types,
+# kwargs keyed by type name or `None` -- see `MinGRUStack`'s own docstring
+# for this schema). Every arm here runs on all four tasks -- there is no
+# per-task arm subset; `scripts/report_benchmarks.py` and
+# `scripts/gpu_benchmark_campaign.py` both iterate this same dict.
 #
 # rotation-hetero: a single "rotation" block (RotationMinGRU's own default
 # snap grid, (2, 3, 4, 6) -- the same default the plain "rotation" arm's
@@ -155,6 +178,47 @@ RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lab_results.
 # design -- rotation-hetero is therefore treated like "delta" on pendulum:
 # dt reaches it only via the log1p(dt) feature-concat channel, never
 # mechanically.
+#
+# signed-givens: a single "signed" block (decoupled tanh default, same
+# config as this round's own "signed" arm) composed with a single
+# "givens" block at its own class default kwargs (block_size=8, rounds=3
+# -- confirmed against GivensMinGRU's constructor defaults in
+# src/mingru/min_gru.py, the same config this round's own "givens" arm
+# passes explicitly). mixer_kwargs=None: the list-mixer schema applies
+# every type's default kwargs, exactly like rotation-hetero above.
+# Byte-identical to probes.py's "minGRU-hetero-sg8" MIXER_REGISTRY row
+# (`(["signed", "givens"], None)`) -- the S3-hier promoted fit-rate
+# winner, GPU-re-evidenced as hetero_lab.py's "hetero-pg8" arm
+# (signed-tanh + packaged GivensMinGRU, block_size=8/rounds=3). This
+# round's registry path builds the block from the packaged "signed"
+# mixer (decoupled tanh, same as every other "signed"-family arm in this
+# module), not probes.py's historical "signed-tanh" name -- same
+# mechanism, different registry/module, no behavioral gap.
+#
+# signed-delta: a single "signed" block at default kwargs composed with
+# a single "delta" block at its promoted native-state config (nh=2,
+# n_heads=4, d_k=16, d_v=16 -- identical kwargs to this round's own
+# "delta" arm above). mirrors hetero_lab.py's "hetero-pd1024" row
+# (matched-state/GPU-36-round evidence), which composed the delta block
+# with a "signed-tanh" block, NOT the packaged "signed" mixer this row
+# uses -- a provenance difference worth stating plainly, not glossing
+# over: "signed-tanh" is hetero_lab.py's own lab-local decoupled-tanh
+# block (frozen for that module's evidence lineage), while "signed" here
+# is the promoted packaged SignedMinGRU class this whole round's registry
+# path builds every arm from (the promoted packaged equivalent, not a
+# byte-identical carryover the way signed-givens/hetero-sg8 is above).
+# Unlike rotation-hetero/signed-givens, mixer_kwargs here is NOT `None`:
+# the delta block needs its native config explicitly, so this is a
+# type-keyed dict (`{"delta": {...}}`) with "signed" omitted (defaults to
+# `None`, i.e. the class's own default kwargs -- see MinGRUStack's
+# docstring for the omitted-key-defaults-to-None resolution rule).
+#
+# Neither signed-givens nor signed-delta is decay-capable (see
+# DECAY_CAPABLE_ARMS below): same rationale as rotation-hetero -- no
+# established repo precedent for splitting decay wiring across a hetero
+# stack's two mixer types, so this round doesn't invent one for either
+# new arm. Both receive dt only via the log1p(dt) feature-concat channel
+# on the pendulum task, like delta and rotation-hetero.
 ARM_REGISTRY: dict[str, tuple[str | list[str], dict | None]] = {
     "log": ("log", {}),
     "signed": ("signed", {}),
@@ -162,16 +226,21 @@ ARM_REGISTRY: dict[str, tuple[str | list[str], dict | None]] = {
     "rotation-hetero": (["rotation", "signed"], None),
     "givens": ("givens", {"block_size": 8, "rounds": 3}),
     "delta": ("delta", {"nh": 2, "n_heads": 4, "d_k": 16, "d_v": 16}),
+    "signed-givens": (["signed", "givens"], None),
+    "signed-delta": (["signed", "delta"], {"delta": {"nh": 2, "n_heads": 4, "d_k": 16, "d_v": 16}}),
 }
 
 # Arms whose packaged mixer class mixes in DecayMixin (accepts decay=
 # "learnable"/"fixed" and a delta_t argument). DeltaMinGRU is deliberately
 # excluded: its constructor rejects any decay is not None (frozen contract,
 # see its class docstring) -- pendulum's dt reaches it only via the
-# feature-concat channel below, never mechanically. rotation-hetero is
-# excluded for the same reason (see ARM_REGISTRY's comment): no
-# established repo precedent for splitting decay across a hetero
-# rotation+signed stack, so this round doesn't invent one.
+# feature-concat channel below, never mechanically. rotation-hetero,
+# signed-givens, and signed-delta are excluded for the same reason (see
+# ARM_REGISTRY's comment): no established repo precedent for splitting
+# decay wiring across either mixer type of a hetero stack, so this round
+# doesn't invent one for any of the three hetero arms -- each reaches dt
+# on pendulum only via the log1p(dt) feature-concat channel, never
+# mechanically.
 DECAY_CAPABLE_ARMS = {"log", "signed", "rotation", "givens"}
 
 
@@ -916,7 +985,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--model",
         choices=sorted(ARM_REGISTRY),
-        help="log | signed | rotation | rotation-hetero | givens | delta",
+        help="log | signed | rotation | rotation-hetero | givens | delta | "
+        "signed-givens | signed-delta",
     )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--lr", type=float, default=None, help="override TaskSpec.budget.lr")
