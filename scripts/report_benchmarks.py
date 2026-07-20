@@ -18,11 +18,13 @@ rationale; ``scripts/gpu_check.py`` is the one place that still recognizes
 both generations, for old pilot job logs/sidecars. The S5-only probe round
 (``bench-s5-probe-01``, ``experiments.benchmark_tasks
 .BENCH_PROBE_ROUND_TAGS``) is a separate population entirely -- this
-module's per-task accounting below reads only ``experiments.benchmark_lab
-.MATRIX_ARMS`` (never ``ARM_REGISTRY``, which also includes the three
-S5-only ``PROBE_ARMS`` and the psMNIST-only ``REF_ARMS``), so the ``-02``
-reports this module writes never show probe or reference arms and never
-change shape because of them.
+module's matched ``-02`` per-task accounting below reads only
+``experiments.benchmark_lab.MATRIX_ARMS`` (never ``ARM_REGISTRY``, which
+also includes the three S5-only ``PROBE_ARMS`` and the psMNIST-only
+``REF_ARMS``), so the matched ``-02`` reports this module writes never
+show probe or reference arms and never change shape because of them. The
+probe population gets its own separate report -- see the "further, later
+addition" paragraph below.
 
 A separate, later addition (Amendments, 2026-07-20 "gru-large grounding
 reference" entry) regenerates ``experiments/bench/bench_<task>_ref.json``/
@@ -37,6 +39,21 @@ strata are never mixed silently"). This is purely additive: the four
 canonical ``bench_<task>.{json,md}`` files and their generation code path
 are untouched by it, so the matched ``-02`` accounting/regression check
 stays byte-identical.
+
+A further, later addition (task-11a, S5 design-correction probe write-up)
+regenerates ``experiments/bench/bench_s5_probe.json``/``.md`` for every
+task in ``experiments.benchmark_tasks.BENCH_PROBE_ROUND_TAGS`` (currently
+just ``s5``): a PROBE-labeled report for ``experiments.benchmark_lab
+.PROBE_ARMS`` rows (``rotation-hetero-k5``/``signed-delta-nh3``/
+``signed-delta-nh4``, round tag ``bench-s5-probe-01``) -- a descriptive
+design-correction population, not a competing arm, so it shares the
+REFERENCE report's no-Fisher, no-matched-accounting treatment (both flow
+through the same ``_build_population_task_report``/
+``_render_population_markdown`` path below; only the round tags, arm
+registry, filenames, and banner text differ per population). Also purely
+additive: the matched ``bench_<task>.{json,md}`` and the REFERENCE
+``bench_<task>_ref.{json,md}`` files and their generation code paths are
+untouched by it.
 
 Per task, per arm (``experiments.benchmark_lab.MATRIX_ARMS``:
 log/signed/rotation/rotation-hetero/givens/delta/signed-givens/signed-delta/gru
@@ -132,8 +149,9 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from _bench_env import git_commit_sha  # noqa: E402
 from _evidence_stats import fisher_exact_two_sided  # noqa: E402
-from experiments.benchmark_lab import MATRIX_ARMS, REF_ARMS, build_model  # noqa: E402
+from experiments.benchmark_lab import MATRIX_ARMS, PROBE_ARMS, REF_ARMS, build_model  # noqa: E402
 from experiments.benchmark_tasks import (  # noqa: E402
+    BENCH_PROBE_ROUND_TAGS,
     BENCH_REF_ROUND_TAGS,
     BENCH_ROUND_TAGS,
     TASKS,
@@ -159,6 +177,14 @@ ROUND_TAGS: dict[str, str] = BENCH_ROUND_TAGS
 # .BENCH_REF_ROUND_TAGS` (the single source of truth
 # `scripts/gpu_benchmark_campaign.py`'s `_REF_ROUND_TAGS` also binds to).
 REF_ROUND_TAGS: dict[str, str] = BENCH_REF_ROUND_TAGS
+
+# S5 design-correction probe round tags (task-11a, module docstring's
+# "further, later addition" paragraph) -- this module owns `PROBE_ROUND_TAGS`
+# as its own name, same binding convention as `ROUND_TAGS`/`REF_ROUND_TAGS`
+# above, bound directly to `experiments.benchmark_tasks
+# .BENCH_PROBE_ROUND_TAGS` (the single source of truth
+# `scripts/gpu_benchmark_campaign.py`'s round-tag resolution also reads).
+PROBE_ROUND_TAGS: dict[str, str] = BENCH_PROBE_ROUND_TAGS
 
 # "log as the Fisher reference arm" (spec §4/§8): a family-validation round
 # contrasts every arm against the vanilla minGRU baseline.
@@ -579,15 +605,90 @@ def render_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-# ------------------------------------------------------- reference report
-def _rows_for_ref_task(all_rows: list[dict[str, Any]], task_name: str) -> dict[str, list[dict]]:
-    """``all_rows`` filtered to ``task_name``'s REFERENCE round tag
-    (``REF_ROUND_TAGS``), grouped by arm -- the ``REF_ARMS`` counterpart to
-    `_rows_for_task`. Every ``REF_ARMS`` key is present (possibly with an
-    empty list); a row whose ``variant`` isn't a recognized ref arm is
-    silently dropped, mirroring `_rows_for_task`'s contract."""
-    round_tag = REF_ROUND_TAGS[task_name]
-    by_arm: dict[str, list[dict]] = {arm: [] for arm in REF_ARMS}
+# ----------------------------------------- non-matched population reports
+# `REF_ARMS` (gru-large grounding reference) and `PROBE_ARMS` (S5
+# design-correction probe) are both explicitly NON-matched populations --
+# never in the matched `-02` seed-matrix accounting, never a Fisher-vs-`log`
+# comparison (module docstring's "separate, later addition"/"further, later
+# addition" paragraphs). `_AuxPopulation` bundles the handful of things that
+# actually differ between the two (round tags, arm registry, raise-loud
+# names, banner text) so `_build_population_task_report`/
+# `_render_population_markdown` below are the single build/render path both
+# `build_ref_task_report`/`render_ref_markdown` and `build_probe_task_report`/
+# `render_probe_markdown` flow through, rather than two independently-
+# drifting near-copies of the same population-shape logic.
+@dataclass(frozen=True)
+class _AuxPopulation:
+    # Set True in the payload ("reference"/"probe"); also the word used in
+    # the "rows matching this <payload_key> round's tag" prose sentence
+    # below (`_render_population_markdown`).
+    payload_key: str
+    arms_name: str  # "REF_ARMS" / "PROBE_ARMS" -- raise-loud message only
+    # "BENCH_REF_ROUND_TAGS" / "BENCH_PROBE_ROUND_TAGS" -- raise-loud message only
+    round_tags_name: str
+    round_tags: dict[str, str]
+    arms: dict[str, tuple[str | list[str], dict | None]]
+    banner_title: str  # render_*_markdown's H1 suffix, e.g. "REFERENCE arm(s)"
+    # Explanatory paragraph under the H1; a callable because the REFERENCE
+    # variant embeds the matched `ROUND_TAGS[task]` dynamically.
+    banner_note: Callable[[dict[str, Any]], str]
+
+
+def _ref_banner_note(report: dict[str, Any]) -> str:
+    return (
+        f"**Non-matched reference/grounding arm(s) -- NOT part of the matched "
+        f"`{ROUND_TAGS[report['task']]}` seed-matrix accounting.** No Fisher-exact "
+        "comparison is computed here: this population runs under its own training "
+        "budget and round tag, distinct from the matched arms (CLAUDE.md: evidence "
+        "strata are never mixed silently)."
+    )
+
+
+def _probe_banner_note(report: dict[str, Any]) -> str:
+    return (
+        f"**S5 design-correction probe arm(s) -- NOT part of the matched "
+        f"`{ROUND_TAGS[report['task']]}` seed-matrix accounting.** Tests whether two "
+        "suspected experiment-design artifacts -- `rotation-hetero`'s missing K=5 snap "
+        "order and `signed-delta`'s low nh=2 product count -- rather than a genuine "
+        "mechanism limit, explain S5's 0/36 rows for those families (see "
+        "`experiments.benchmark_lab.PROBE_ARMS`'s own comment). No Fisher-exact "
+        "comparison is computed here: this is a descriptive design-correction "
+        "population, not a competing arm judged against `log`."
+    )
+
+
+_REF_POPULATION = _AuxPopulation(
+    payload_key="reference",
+    arms_name="REF_ARMS",
+    round_tags_name="BENCH_REF_ROUND_TAGS",
+    round_tags=REF_ROUND_TAGS,
+    arms=REF_ARMS,
+    banner_title="REFERENCE arm(s)",
+    banner_note=_ref_banner_note,
+)
+
+_PROBE_POPULATION = _AuxPopulation(
+    payload_key="probe",
+    arms_name="PROBE_ARMS",
+    round_tags_name="BENCH_PROBE_ROUND_TAGS",
+    round_tags=PROBE_ROUND_TAGS,
+    arms=PROBE_ARMS,
+    banner_title="PROBE arm(s)",
+    banner_note=_probe_banner_note,
+)
+
+
+def _rows_for_population(
+    all_rows: list[dict[str, Any]], task_name: str, pop: _AuxPopulation
+) -> dict[str, list[dict]]:
+    """``all_rows`` filtered to ``task_name``'s round tag under ``pop``'s
+    population (`REF_ARMS` or `PROBE_ARMS`), grouped by arm -- the shared
+    non-matched-population counterpart to `_rows_for_task`. Every
+    ``pop.arms`` key is present (possibly with an empty list); a row whose
+    ``variant`` isn't a recognized arm for this population is silently
+    dropped, mirroring `_rows_for_task`'s contract."""
+    round_tag = pop.round_tags[task_name]
+    by_arm: dict[str, list[dict]] = {arm: [] for arm in pop.arms}
     for row in all_rows:
         if row.get("round") != round_tag or row.get("task") != task_name:
             continue
@@ -595,6 +696,42 @@ def _rows_for_ref_task(all_rows: list[dict[str, Any]], task_name: str) -> dict[s
         if variant in by_arm:
             by_arm[variant].append(row)
     return by_arm
+
+
+def _build_population_task_report(
+    task_name: str, all_rows: list[dict[str, Any]], pop: _AuxPopulation
+) -> dict[str, Any]:
+    """Assemble the ``bench_<task>_{ref,probe}.json`` payload for
+    ``task_name``'s ``pop.arms`` rows -- the shared build path behind
+    `build_ref_task_report` and `build_probe_task_report`. Deliberately no
+    Fisher-vs-``log`` comparison for either non-matched population -- see
+    each public wrapper's own docstring for its population-specific
+    rationale."""
+    if task_name not in pop.round_tags:
+        raise ValueError(
+            f"no {pop.arms_name} round tag registered for task {task_name!r} -- "
+            f"{pop.round_tags_name} only covers {sorted(pop.round_tags)}"
+        )
+    task = TASKS[task_name]
+    by_arm_rows = _rows_for_population(all_rows, task_name, pop)
+    arm_reports = {arm: _build_arm_report(task, arm, rows) for arm, rows in by_arm_rows.items()}
+    all_task_rows = [row for rows in by_arm_rows.values() for row in rows]
+    return {
+        "task": task_name,
+        "round": pop.round_tags[task_name],
+        pop.payload_key: True,  # non-matched arm(s) -- never in the matched -02 accounting
+        "fit_metric": task.fit_metric,
+        "fit_threshold": task.fit_threshold,
+        "fit_direction": task.fit_direction,
+        "robustness_thresholds": list(task.robustness),
+        "arms": {arm: asdict(rep) for arm, rep in arm_reports.items()},
+        "stratum_labels": _stratum_labels(all_task_rows),
+        "env": {
+            "torch": torch.__version__,
+            "git_commit": git_commit_sha(),
+            "generated": datetime.now(timezone.utc).isoformat(),
+        },
+    }
 
 
 def build_ref_task_report(task_name: str, all_rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -611,56 +748,47 @@ def build_ref_task_report(task_name: str, all_rows: list[dict[str, Any]]) -> dic
     fit rate is itself computed under -- comparing them would silently mix
     two different strata into one Fisher-exact statistic (CLAUDE.md:
     "evidence strata are never mixed silently")."""
-    if task_name not in REF_ROUND_TAGS:
-        raise ValueError(
-            f"no REF_ARMS round tag registered for task {task_name!r} -- "
-            f"BENCH_REF_ROUND_TAGS only covers {sorted(REF_ROUND_TAGS)}"
-        )
-    task = TASKS[task_name]
-    by_arm_rows = _rows_for_ref_task(all_rows, task_name)
-    arm_reports = {arm: _build_arm_report(task, arm, rows) for arm, rows in by_arm_rows.items()}
-    all_task_rows = [row for rows in by_arm_rows.values() for row in rows]
-    return {
-        "task": task_name,
-        "round": REF_ROUND_TAGS[task_name],
-        "reference": True,  # non-matched grounding arm(s) -- never in the matched -02 accounting
-        "fit_metric": task.fit_metric,
-        "fit_threshold": task.fit_threshold,
-        "fit_direction": task.fit_direction,
-        "robustness_thresholds": list(task.robustness),
-        "arms": {arm: asdict(rep) for arm, rep in arm_reports.items()},
-        "stratum_labels": _stratum_labels(all_task_rows),
-        "env": {
-            "torch": torch.__version__,
-            "git_commit": git_commit_sha(),
-            "generated": datetime.now(timezone.utc).isoformat(),
-        },
-    }
+    return _build_population_task_report(task_name, all_rows, _REF_POPULATION)
 
 
-def render_ref_markdown(report: dict[str, Any]) -> str:
-    """Render one task's ``build_ref_task_report`` payload as Markdown --
-    same fits/robustness/completeness sections as `render_markdown`
-    (shared via `_render_fits_table_lines`/`_render_robustness_lines`/
-    `_render_completeness_lines`), but with an explicit REFERENCE banner
-    up top and no Fisher-vs-reference section (see `build_ref_task_report`'s
-    docstring for why)."""
+def build_probe_task_report(task_name: str, all_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Assemble the ``bench_s5_probe.json`` payload for ``task_name``'s
+    ``PROBE_ARMS`` rows (``rotation-hetero-k5``/``signed-delta-nh3``/
+    ``signed-delta-nh4``) -- an explicitly NON-matched, descriptive
+    design-correction population, never the matched population
+    `build_task_report` reports (module docstring's "further, later
+    addition" paragraph; the `REF_ARMS` counterpart is `build_ref_task_
+    report`, sharing this function's `_build_population_task_report` path).
+
+    Deliberately no Fisher-vs-``log`` comparison here either: unlike
+    `REF_ARMS`, the probe arms run under the SAME matched ``TaskSpec.budget``
+    (no ``PROBE_ARM_BUDGETS`` override exists), but the probe is a
+    diagnostic for whether `rotation-hetero`/`signed-delta`'s matrix configs
+    themselves were under-specified (see `experiments.benchmark_lab
+    .PROBE_ARMS`'s own comment) -- a descriptive design-correction readout,
+    not a claim to be tested against `log`'s matched fit rate."""
+    return _build_population_task_report(task_name, all_rows, _PROBE_POPULATION)
+
+
+def _render_population_markdown(report: dict[str, Any], pop: _AuxPopulation) -> str:
+    """Render one task's `_build_population_task_report` payload as
+    Markdown -- the shared render path behind `render_ref_markdown` and
+    `render_probe_markdown`: same fits/robustness/completeness sections as
+    `render_markdown` (shared via `_render_fits_table_lines`/
+    `_render_robustness_lines`/`_render_completeness_lines`), but with a
+    population-specific banner up top and no Fisher-vs-reference section."""
     arms = report["arms"]
     fit_dir_symbol = ">=" if report["fit_direction"] == "ge" else "<="
     env = report["env"]
     lines = [
-        f"# Benchmark round: {report['task']} REFERENCE arm(s) (`{report['round']}`)",
+        f"# Benchmark round: {report['task']} {pop.banner_title} (`{report['round']}`)",
         "",
-        f"**Non-matched reference/grounding arm(s) -- NOT part of the matched "
-        f"`{ROUND_TAGS[report['task']]}` seed-matrix accounting.** No Fisher-exact "
-        "comparison is computed here: this population runs under its own training "
-        "budget and round tag, distinct from the matched arms (CLAUDE.md: evidence "
-        "strata are never mixed silently).",
+        pop.banner_note(report),
         "",
         f"Fit metric: `ckpt.{report['fit_metric']}` {fit_dir_symbol} "
         f"{report['fit_threshold']} (robustness triple: "
         f"{', '.join(_fmt_threshold(t) for t in report['robustness_thresholds'])}). Computed "
-        "from `experiments/lab_results.jsonl` (rows matching this reference round's "
+        f"from `experiments/lab_results.jsonl` (rows matching this {pop.payload_key} round's "
         "tag); regenerated whole by `scripts/report_benchmarks.py`, never hand-edited.",
         "",
         f"Env: torch {env['torch']}, commit {env['git_commit']}, generated {env['generated']}.",
@@ -673,6 +801,25 @@ def render_ref_markdown(report: dict[str, Any]) -> str:
     lines += _render_completeness_lines(arms)
     lines.append("")
     return "\n".join(lines) + "\n"
+
+
+def render_ref_markdown(report: dict[str, Any]) -> str:
+    """Render one task's ``build_ref_task_report`` payload as Markdown --
+    same fits/robustness/completeness sections as `render_markdown`
+    (shared via `_render_fits_table_lines`/`_render_robustness_lines`/
+    `_render_completeness_lines`), but with an explicit REFERENCE banner
+    up top and no Fisher-vs-reference section (see `build_ref_task_report`'s
+    docstring for why)."""
+    return _render_population_markdown(report, _REF_POPULATION)
+
+
+def render_probe_markdown(report: dict[str, Any]) -> str:
+    """Render one task's ``build_probe_task_report`` payload as Markdown --
+    mirrors `render_ref_markdown` via the shared `_render_population_markdown`
+    path, with an explicit PROBE banner instead of the REFERENCE banner and
+    no Fisher-vs-reference section (see `build_probe_task_report`'s
+    docstring for why)."""
+    return _render_population_markdown(report, _PROBE_POPULATION)
 
 
 # --------------------------------------------------------------------- write
@@ -714,6 +861,23 @@ def write_ref_reports(all_rows: list[dict[str, Any]], out_dir: Path) -> dict[str
     return ref_reports
 
 
+def write_probe_reports(all_rows: list[dict[str, Any]], out_dir: Path) -> dict[str, dict[str, Any]]:
+    """Build and write ``bench_<task>_probe.{json,md}`` for every task in
+    ``PROBE_ROUND_TAGS`` (currently just ``s5``), regenerated whole -- the
+    `PROBE_ARMS` counterpart to `write_ref_reports`. Distinct filenames
+    from both the matched ``bench_<task>.{json,md}`` pair and the
+    reference ``bench_<task>_ref.{json,md}`` pair, so calling this never
+    touches either."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    probe_reports: dict[str, dict[str, Any]] = {}
+    for task_name in PROBE_ROUND_TAGS:
+        report = build_probe_task_report(task_name, all_rows)
+        probe_reports[task_name] = report
+        (out_dir / f"bench_{task_name}_probe.json").write_text(json.dumps(report, indent=2) + "\n")
+        (out_dir / f"bench_{task_name}_probe.md").write_text(render_probe_markdown(report))
+    return probe_reports
+
+
 def _print_completeness_summary(reports: dict[str, dict[str, Any]]) -> None:
     print("Completeness readout (present/planned seeds per arm):")
     for task_name, report in reports.items():
@@ -746,6 +910,12 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"wrote {args.out_dir / f'bench_{task_name}_ref.json'} and "
             f"bench_{task_name}_ref.md (REFERENCE, non-matched)"
+        )
+    probe_reports = write_probe_reports(all_rows, args.out_dir)
+    for task_name in probe_reports:
+        print(
+            f"wrote {args.out_dir / f'bench_{task_name}_probe.json'} and "
+            f"bench_{task_name}_probe.md (PROBE, S5-only)"
         )
     _print_completeness_summary(reports)
     return 0

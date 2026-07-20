@@ -35,6 +35,12 @@ Sections
    the matched `bench_<task>.{json,md}` pair; no Fisher-vs-`log` section;
    rows carrying either the ref round tag or a ref-only variant never
    surface in a `-02` report, mirroring section 8's probe regression.
+10. `PROBE_ARMS` S5 design-correction probe (task-11a) -- the mirror-image
+    `build_probe_task_report`/`render_probe_markdown`/`write_probe_reports`
+    path writing `bench_s5_probe.{json,md}`, sharing section 9's
+    `_build_population_task_report`/`_render_population_markdown` helper;
+    no Fisher-vs-`log` section; a PROBE banner instead of REFERENCE; only
+    `s5` has a registered round tag.
 """
 
 from __future__ import annotations
@@ -69,13 +75,17 @@ _spec.loader.exec_module(report_benchmarks)
 
 ROUND_TAGS = report_benchmarks.ROUND_TAGS
 REF_ROUND_TAGS = report_benchmarks.REF_ROUND_TAGS
+PROBE_ROUND_TAGS = report_benchmarks.PROBE_ROUND_TAGS
 FISHER_REFERENCE_ARM = report_benchmarks.FISHER_REFERENCE_ARM
 build_task_report = report_benchmarks.build_task_report
 build_ref_task_report = report_benchmarks.build_ref_task_report
+build_probe_task_report = report_benchmarks.build_probe_task_report
 render_markdown = report_benchmarks.render_markdown
 render_ref_markdown = report_benchmarks.render_ref_markdown
+render_probe_markdown = report_benchmarks.render_probe_markdown
 write_reports = report_benchmarks.write_reports
 write_ref_reports = report_benchmarks.write_ref_reports
+write_probe_reports = report_benchmarks.write_probe_reports
 main = report_benchmarks.main
 _load_all_rows = report_benchmarks._load_all_rows
 
@@ -608,3 +618,99 @@ def test_write_ref_reports_writes_distinct_filenames_from_the_matched_pair(tmp_p
     on_disk_matched = json.loads((tmp_path / "bench_psmnist.json").read_text())
     assert on_disk_matched == matched_reports["psmnist"]
     assert on_disk_matched["arms"]["log"]["seeds_present"] == 0
+
+
+# ------------------------- 10. PROBE_ARMS S5 design-correction probe -----
+# (task-11a): the mirror-image `build_probe_task_report`/
+# `render_probe_markdown`/`write_probe_reports` path, sharing section 9's
+# `_build_population_task_report`/`_render_population_markdown` helper --
+# writes `bench_s5_probe.{json,md}`, never the matched `bench_s5.{json,md}`
+# or the reference `bench_psmnist_ref.{json,md}` pair.
+def test_probe_round_tags_match_bench_probe_round_tags():
+    assert PROBE_ROUND_TAGS == BENCH_PROBE_ROUND_TAGS
+    assert PROBE_ROUND_TAGS == {"s5": "bench-s5-probe-01"}
+
+
+def test_build_probe_task_report_reads_only_the_probe_round_and_probe_arms():
+    """Mirrors `test_build_ref_task_report_reads_only_the_ref_round_and_ref_arms`:
+    a matched `-02` row for a probe arm (wrong round) and a matched `log`
+    row under the probe tag (wrong arm) must both be excluded -- only a
+    probe-arm row under the probe tag counts."""
+    wrong_round = _s5_row(0, "signed-delta-nh4", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)
+    wrong_arm = _s5_row(1, "log", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)
+    wrong_arm["round"] = BENCH_PROBE_ROUND_TAGS["s5"]
+    real_probe_row = _s5_row(2, "signed-delta-nh4", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)
+    real_probe_row["round"] = BENCH_PROBE_ROUND_TAGS["s5"]
+
+    report = build_probe_task_report("s5", [wrong_round, wrong_arm, real_probe_row])
+
+    assert set(report["arms"]) == set(PROBE_ARMS)
+    assert report["arms"]["signed-delta-nh4"]["seeds_present"] == 1
+    assert report["arms"]["signed-delta-nh4"]["present_seeds"] == [2]
+
+
+def test_build_probe_task_report_has_no_fisher_section():
+    """Deliberately no Fisher-vs-`log` comparison in the probe report
+    either (`build_probe_task_report`'s docstring): a descriptive
+    design-correction population, not a competing arm judged against
+    `log`'s matched fit rate."""
+    report = build_probe_task_report("s5", [])
+    assert "fisher_vs_reference" not in report
+    assert "fisher_reference_arm" not in report
+    assert report["probe"] is True
+
+
+def test_build_probe_task_report_raises_for_a_task_with_no_probe_round_tag():
+    for task_name in ("mqar", "psmnist", "pendulum"):
+        with pytest.raises(ValueError, match="no PROBE_ARMS round tag"):
+            build_probe_task_report(task_name, [])
+
+
+def test_probe_round_matches_the_three_probe_arms_exactly():
+    report = build_probe_task_report("s5", [])
+    assert set(report["arms"]) == {"rotation-hetero-k5", "signed-delta-nh3", "signed-delta-nh4"}
+
+
+def test_render_probe_markdown_labels_probe_and_omits_fisher_section():
+    report = build_probe_task_report("s5", [])
+    md = render_probe_markdown(report)
+    assert "PROBE arm(s)" in md
+    assert "NOT part of the matched" in md
+    assert "bench-s5-probe-01" in md
+    assert "signed-delta-nh3" in md
+    assert "Fisher exact" not in md
+    assert "0 rows found for arm `rotation-hetero-k5`" in md
+
+
+def test_write_probe_reports_writes_distinct_filenames_from_matched_and_ref(tmp_path):
+    """`write_probe_reports` must write `bench_<task>_probe.{json,md}` --
+    distinct filenames from both `write_reports`'s `bench_<task>.{json,md}`
+    and `write_ref_reports`'s `bench_<task>_ref.{json,md}` -- so calling it
+    never touches (or collides with) either."""
+    probe_row = _s5_row(0, "signed-delta-nh4", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)
+    probe_row["round"] = BENCH_PROBE_ROUND_TAGS["s5"]
+    ref_row = _psmnist_row(0, "gru-large", val_acc=0.93, test_acc=0.92)
+    ref_row["round"] = BENCH_REF_ROUND_TAGS["psmnist"]
+
+    matched_reports = write_reports([], tmp_path)
+    ref_reports = write_ref_reports([ref_row], tmp_path)
+    probe_reports = write_probe_reports([probe_row], tmp_path)
+
+    assert set(probe_reports) == set(PROBE_ROUND_TAGS)
+    assert (tmp_path / "bench_s5_probe.json").exists()
+    assert (tmp_path / "bench_s5_probe.md").exists()
+    # The matched and ref files are untouched by the probe write.
+    on_disk_matched = json.loads((tmp_path / "bench_s5.json").read_text())
+    assert on_disk_matched == matched_reports["s5"]
+    assert on_disk_matched["arms"]["log"]["seeds_present"] == 0
+    on_disk_ref = json.loads((tmp_path / "bench_psmnist_ref.json").read_text())
+    assert on_disk_ref == ref_reports["psmnist"]
+
+
+def test_main_writes_the_probe_report_alongside_matched_and_ref(tmp_path):
+    """End-to-end: `main` must write `bench_s5_probe.{json,md}` in the
+    same run as the matched and reference reports, from the real ledger."""
+    exit_code = main(["--out-dir", str(tmp_path)])
+    assert exit_code == 0
+    assert (tmp_path / "bench_s5_probe.json").exists()
+    assert (tmp_path / "bench_s5_probe.md").exists()
