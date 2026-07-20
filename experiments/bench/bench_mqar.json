@@ -190,10 +190,9 @@
     },
     "rotation-hetero": {
       "arm": "rotation-hetero",
-      "seeds_present": 0,
+      "seeds_present": 36,
       "seeds_planned": 36,
-      "present_seeds": [],
-      "missing_seeds": [
+      "present_seeds": [
         0,
         1,
         2,
@@ -231,22 +230,28 @@
         34,
         35
       ],
+      "missing_seeds": [],
       "fits": 0,
       "robustness": {
         "0.98": 0,
         "0.99": 0,
         "0.995": 0
       },
-      "mean_acc": {},
-      "fit_only_acc": {},
+      "mean_acc": {
+        "T256_p16": 0.047125,
+        "T256_p32": 0.03846388888888889
+      },
+      "fit_only_acc": {
+        "T256_p16": null,
+        "T256_p32": null
+      },
       "params": 100096
     },
     "givens": {
       "arm": "givens",
-      "seeds_present": 0,
+      "seeds_present": 36,
       "seeds_planned": 36,
-      "present_seeds": [],
-      "missing_seeds": [
+      "present_seeds": [
         0,
         1,
         2,
@@ -284,22 +289,28 @@
         34,
         35
       ],
+      "missing_seeds": [],
       "fits": 0,
       "robustness": {
         "0.98": 0,
         "0.99": 0,
         "0.995": 0
       },
-      "mean_acc": {},
-      "fit_only_acc": {},
+      "mean_acc": {
+        "T256_p16": 0.03048333333333333,
+        "T256_p32": 0.030350000000000002
+      },
+      "fit_only_acc": {
+        "T256_p16": null,
+        "T256_p32": null
+      },
       "params": 104320
     },
     "delta": {
       "arm": "delta",
-      "seeds_present": 0,
+      "seeds_present": 36,
       "seeds_planned": 36,
-      "present_seeds": [],
-      "missing_seeds": [
+      "present_seeds": [
         0,
         1,
         2,
@@ -337,14 +348,21 @@
         34,
         35
       ],
-      "fits": 0,
+      "missing_seeds": [],
+      "fits": 36,
       "robustness": {
-        "0.98": 0,
-        "0.99": 0,
-        "0.995": 0
+        "0.98": 36,
+        "0.99": 36,
+        "0.995": 36
       },
-      "mean_acc": {},
-      "fit_only_acc": {},
+      "mean_acc": {
+        "T256_p16": 0.930663888888889,
+        "T256_p32": 0.49268888888888884
+      },
+      "fit_only_acc": {
+        "T256_p16": 0.930663888888889,
+        "T256_p32": 0.49268888888888884
+      },
       "params": 126032
     },
     "signed-givens": {
@@ -464,6 +482,65 @@
         "T256_p32": 0.6898972222222223
       },
       "params": 113032
+    },
+    "gru": {
+      "arm": "gru",
+      "seeds_present": 36,
+      "seeds_planned": 36,
+      "present_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "missing_seeds": [],
+      "fits": 0,
+      "robustness": {
+        "0.98": 0,
+        "0.99": 0,
+        "0.995": 0
+      },
+      "mean_acc": {
+        "T256_p16": 0.11054722222222223,
+        "T256_p32": 0.07644444444444444
+      },
+      "fit_only_acc": {
+        "T256_p16": null,
+        "T256_p32": null
+      },
+      "params": 58176
     }
   },
   "fisher_vs_reference": {
@@ -478,16 +555,19 @@
       "reference_fits": "0/36"
     },
     "rotation-hetero": {
-      "p": null,
-      "note": "n/a (one arm has 0 rows)"
+      "p": 1.0,
+      "fits": "0/36",
+      "reference_fits": "0/36"
     },
     "givens": {
-      "p": null,
-      "note": "n/a (one arm has 0 rows)"
+      "p": 1.0,
+      "fits": "0/36",
+      "reference_fits": "0/36"
     },
     "delta": {
-      "p": null,
-      "note": "n/a (one arm has 0 rows)"
+      "p": 2.3220945091344955e-13,
+      "fits": "36/36",
+      "reference_fits": "0/36"
     },
     "signed-givens": {
       "p": 1.0,
@@ -497,6 +577,11 @@
     "signed-delta": {
       "p": 2.3220945091344955e-13,
       "fits": "36/36",
+      "reference_fits": "0/36"
+    },
+    "gru": {
+      "p": 1.0,
+      "fits": "0/36",
       "reference_fits": "0/36"
     }
   },
@@ -510,7 +595,7 @@
   ],
   "env": {
     "torch": "2.13.0",
-    "git_commit": "4e0e75e6c39866bd06194023912d161d7fad66e7",
-    "generated": "2026-07-20T11:38:12.455137+00:00"
+    "git_commit": "e91944201560019e4bb24485f004bde56665af73",
+    "generated": "2026-07-20T20:52:33.264851+00:00"
   }
 }

@@ -211,10 +211,9 @@
     },
     "signed-givens": {
       "arm": "signed-givens",
-      "seeds_present": 0,
+      "seeds_present": 12,
       "seeds_planned": 12,
-      "present_seeds": [],
-      "missing_seeds": [
+      "present_seeds": [
         0,
         1,
         2,
@@ -228,22 +227,26 @@
         10,
         11
       ],
+      "missing_seeds": [],
       "fits": 0,
       "robustness": {
         "0.88": 0,
         "0.9": 0,
         "0.92": 0
       },
-      "mean_acc": {},
-      "fit_only_acc": {},
+      "mean_acc": {
+        "test": 0.6514666666666666
+      },
+      "fit_only_acc": {
+        "test": null
+      },
       "params": 94698
     },
     "signed-delta": {
       "arm": "signed-delta",
-      "seeds_present": 0,
+      "seeds_present": 12,
       "seeds_planned": 12,
-      "present_seeds": [],
-      "missing_seeds": [
+      "present_seeds": [
         0,
         1,
         2,
@@ -257,15 +260,53 @@
         10,
         11
       ],
-      "fits": 0,
+      "missing_seeds": [],
+      "fits": 12,
       "robustness": {
-        "0.88": 0,
-        "0.9": 0,
+        "0.88": 12,
+        "0.9": 12,
+        "0.92": 12
+      },
+      "mean_acc": {
+        "test": 0.924025
+      },
+      "fit_only_acc": {
+        "test": 0.924025
+      },
+      "params": 105554
+    },
+    "gru": {
+      "arm": "gru",
+      "seeds_present": 12,
+      "seeds_planned": 12,
+      "present_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11
+      ],
+      "missing_seeds": [],
+      "fits": 3,
+      "robustness": {
+        "0.88": 11,
+        "0.9": 3,
         "0.92": 0
       },
-      "mean_acc": {},
-      "fit_only_acc": {},
-      "params": 105554
+      "mean_acc": {
+        "test": 0.88525
+      },
+      "fit_only_acc": {
+        "test": 0.8972333333333333
+      },
+      "params": 38474
     }
   },
   "fisher_vs_reference": {
@@ -295,12 +336,19 @@
       "reference_fits": "0/12"
     },
     "signed-givens": {
-      "p": null,
-      "note": "n/a (one arm has 0 rows)"
+      "p": 1.0,
+      "fits": "0/12",
+      "reference_fits": "0/12"
     },
     "signed-delta": {
-      "p": null,
-      "note": "n/a (one arm has 0 rows)"
+      "p": 7.39602301050679e-07,
+      "fits": "12/12",
+      "reference_fits": "0/12"
+    },
+    "gru": {
+      "p": 0.21739130434782608,
+      "fits": "3/12",
+      "reference_fits": "0/12"
     }
   },
   "stratum_labels": [
@@ -313,7 +361,7 @@
   ],
   "env": {
     "torch": "2.13.0",
-    "git_commit": "4e0e75e6c39866bd06194023912d161d7fad66e7",
-    "generated": "2026-07-20T11:38:12.474704+00:00"
+    "git_commit": "e91944201560019e4bb24485f004bde56665af73",
+    "generated": "2026-07-20T20:52:33.287492+00:00"
   }
 }

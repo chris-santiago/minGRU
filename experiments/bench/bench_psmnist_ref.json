@@ -13,10 +13,9 @@
   "arms": {
     "gru-large": {
       "arm": "gru-large",
-      "seeds_present": 0,
+      "seeds_present": 12,
       "seeds_planned": 12,
-      "present_seeds": [],
-      "missing_seeds": [
+      "present_seeds": [
         0,
         1,
         2,
@@ -30,21 +29,33 @@
         10,
         11
       ],
-      "fits": 0,
+      "missing_seeds": [],
+      "fits": 12,
       "robustness": {
-        "0.88": 0,
-        "0.9": 0,
-        "0.92": 0
+        "0.88": 12,
+        "0.9": 12,
+        "0.92": 11
       },
-      "mean_acc": {},
-      "fit_only_acc": {},
+      "mean_acc": {
+        "test": 0.92205
+      },
+      "fit_only_acc": {
+        "test": 0.92205
+      },
       "params": 596234
     }
   },
-  "stratum_labels": [],
+  "stratum_labels": [
+    {
+      "device": "cuda",
+      "torch": "2.8.0+cu128",
+      "scan": "triton",
+      "compile": null
+    }
+  ],
   "env": {
     "torch": "2.13.0",
-    "git_commit": "7cfda8b9f4f1011caf0ce0457b097e5a1dfa76b9",
-    "generated": "2026-07-20T14:09:21.318062+00:00"
+    "git_commit": "e91944201560019e4bb24485f004bde56665af73",
+    "generated": "2026-07-20T20:52:33.326719+00:00"
   }
 }
