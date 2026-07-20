@@ -65,6 +65,13 @@ budgets are the committed ``TaskSpec`` values), the chain stays a single
 foreground ``&&``-joined string, and ``--tasks``/``--arms``/``--seeds``
 passthrough is unaffected by the new export step. String-only assertions
 against the built command -- no subprocess, no ``lightning_sdk``.
+
+A later amendment (2026-07-20 entry, S5-only probe round) adds
+``BENCH_PROBE_ROUND_TAGS``'s single ``bench-s5-probe-01`` tag to
+``_BENCHMARKS_ROUNDS`` alongside the pilot/matrix generations -- the
+finish handler must accept probe rows and dedup them by the same
+four-field key as matrix rows, without touching the matrix accounting
+already pinned above.
 """
 
 from __future__ import annotations
@@ -848,8 +855,51 @@ def test_benchmarks_rounds_accepts_both_pilot_and_current_generations():
         assert tag in _BENCH_ROUNDS
     for tag in BENCH_ROUND_TAGS.values():
         assert tag in _BENCH_ROUNDS
-    # No accidental collision between the two generations.
-    assert len(_BENCH_ROUNDS) == len(pilot_tags) + len(BENCH_ROUND_TAGS)
+    # No accidental collision between the two generations (the S5-only
+    # probe round is a third, separately-counted generation -- see
+    # test_benchmarks_rounds_also_accepts_the_probe_round below).
+    assert len(_BENCH_ROUNDS) == len(pilot_tags) + len(BENCH_ROUND_TAGS) + 1
+
+
+def test_benchmarks_rounds_also_accepts_the_probe_round():
+    """`_BENCHMARKS_ROUNDS` must additionally accept the S5-only probe
+    round tag (`experiments.benchmark_tasks.BENCH_PROBE_ROUND_TAGS`,
+    Amendments 2026-07-20 entry) -- the finish handler is the one place
+    that must recognize probe rows as this job mode's own data, alongside
+    the pilot and matrix generations."""
+    from experiments.benchmark_tasks import BENCH_PROBE_ROUND_TAGS
+
+    assert BENCH_PROBE_ROUND_TAGS == {"s5": "bench-s5-probe-01"}
+    for tag in BENCH_PROBE_ROUND_TAGS.values():
+        assert tag in _BENCH_ROUNDS
+
+
+def test_valid_benchmarks_key_accepts_a_probe_round_and_variant_row():
+    row = _bench_row("bench-s5-probe-01", "s5", "rotation-hetero-k5", 99)
+    assert gpu_check._valid_benchmarks_key(row, _BENCH_ROUNDS) == (
+        "bench-s5-probe-01",
+        "s5",
+        "rotation-hetero-k5",
+        99,
+    )
+
+
+def test_append_benchmarks_rows_dedups_probe_round_rows_by_full_key(tmp_path):
+    # Same (round, task, variant, seed) dedup contract applies to probe
+    # rows as to matrix rows -- variant is still load-bearing (two
+    # different probe arms at the same seed under the probe round tag are
+    # not duplicates of each other).
+    ledger = tmp_path / "lab_results.jsonl"
+    rows = [
+        _bench_row("bench-s5-probe-01", "s5", "rotation-hetero-k5", 99),
+        _bench_row("bench-s5-probe-01", "s5", "signed-delta-nh3", 99),
+        _bench_row("bench-s5-probe-01", "s5", "rotation-hetero-k5", 99),  # duplicate
+    ]
+    result = gpu_check._append_benchmarks_rows(ledger, rows, _BENCH_ROUNDS)
+    assert (result.appended, result.skipped_duplicate, result.skipped_invalid) == (2, 0, 0)
+    assert result.deduped_in_batch == 1
+    written = {json.loads(line)["variant"] for line in ledger.read_text().splitlines()}
+    assert written == {"rotation-hetero-k5", "signed-delta-nh3"}
 
 
 def test_valid_benchmarks_key_rejects_non_dict_payload():

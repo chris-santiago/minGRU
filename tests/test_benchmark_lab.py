@@ -41,6 +41,14 @@ Sections
    `hetero-pd1024` at the delta mechanism's native config), run on ALL
    FOUR tasks like every other arm (no per-task arm subset exists).
    Neither is decay-capable, mirroring `rotation-hetero`'s treatment.
+9. `PROBE_ARMS` (third amendment, S5-only follow-up probe) --
+   `rotation-hetero-k5` (the `rotation-hetero` stack with the rotation
+   block's snap grid widened to `(2, 3, 4, 5, 6)`, K=5 included; `signed`
+   block untouched) and `signed-delta-nh3`/`signed-delta-nh4` (the
+   `signed-delta` stack with the delta block's `nh` raised from this
+   round's matrix value, 2, to 3/4). `MATRIX_ARMS`/`PROBE_ARMS` disjoint,
+   `ARM_REGISTRY == MATRIX_ARMS | PROBE_ARMS`; probe arms excluded from
+   `DECAY_CAPABLE_ARMS` like their non-decay hetero siblings.
 """
 
 from __future__ import annotations
@@ -55,6 +63,8 @@ import torch.nn.functional as F
 from experiments.benchmark_lab import (
     ARM_REGISTRY,
     DECAY_CAPABLE_ARMS,
+    MATRIX_ARMS,
+    PROBE_ARMS,
     FeatureSequenceModel,
     TokenSequenceModel,
     _eval_last_step_loader,
@@ -621,17 +631,122 @@ def test_new_hetero_arms_pendulum_wiring_matches_delta_feature_channel_only(arm)
         assert block.mingru.decay is None
 
 
-def test_all_registered_arms_have_distinct_param_counts():
+def test_all_matrix_arms_have_distinct_param_counts():
     """Direct local pin of the report-layer invariant
     `tests/test_report_benchmarks.py::test_param_counts_are_positive_and_vary_by_task_and_arm`:
-    every arm in `ARM_REGISTRY`, including the two new hetero arms, must
+    every arm in `MATRIX_ARMS`, including the two new hetero arms, must
     build a genuinely different model, not a duplicate of an existing one
-    under a new name."""
+    under a new name.
+
+    Deliberately scoped to `MATRIX_ARMS`, NOT `ARM_REGISTRY`: `PROBE_ARMS`'s
+    `rotation-hetero-k5` is BY CONSTRUCTION param-count-identical to
+    `rotation-hetero` (`snap` is a registered buffer, not a parameter --
+    see `test_rotation_hetero_k5_and_rotation_hetero_have_equal_param_counts`
+    below), so this invariant would falsely fail if it included
+    `ARM_REGISTRY`'s three probe arms."""
     task = TASKS["s5"]
     params = {
-        arm: sum(p.numel() for p in build_model(task, arm).parameters()) for arm in ARM_REGISTRY
+        arm: sum(p.numel() for p in build_model(task, arm).parameters()) for arm in MATRIX_ARMS
     }
-    assert len(set(params.values())) == len(ARM_REGISTRY)
+    assert len(set(params.values())) == len(MATRIX_ARMS)
+
+
+# ------------------------------------------------ 9. PROBE_ARMS (3rd amendment)
+def test_matrix_and_probe_arms_are_disjoint_and_union_to_arm_registry():
+    assert set(MATRIX_ARMS) & set(PROBE_ARMS) == set()
+    assert set(ARM_REGISTRY) == set(MATRIX_ARMS) | set(PROBE_ARMS)
+    assert len(MATRIX_ARMS) == 8
+    assert len(PROBE_ARMS) == 3
+
+
+def test_rotation_hetero_k5_registered_with_widened_snap_grid_signed_untouched():
+    """`rotation-hetero-k5` is the same `["rotation", "signed"]` stack as
+    `rotation-hetero`, with the rotation block's snap grid widened to
+    include K=5 (S5's element orders are {2, 3, 4, 5, 6}; a 5-cycle needs
+    an order-5 rotation) -- the `signed` block gets no per-type override
+    (omitted key resolves to its own class defaults, per `MinGRUStack`'s
+    type-keyed-kwargs convention)."""
+    assert "rotation-hetero-k5" in PROBE_ARMS
+    mixer, kwargs = PROBE_ARMS["rotation-hetero-k5"]
+    assert mixer == ["rotation", "signed"]
+    assert kwargs == {"rotation": {"snap": (2, 3, 4, 5, 6)}}
+    assert "signed" not in kwargs
+
+
+def test_rotation_hetero_k5_block_composition_routes_snap_to_rotation_block_only():
+    task = TASKS["s5"]
+    model = build_model(task, "rotation-hetero-k5")
+    rotation_block, signed_block = model.stack.blocks
+    assert type(rotation_block.mingru).__name__ == "RotationMinGRU"
+    assert type(signed_block.mingru).__name__ == "SignedMinGRU"
+    assert rotation_block.mingru.snap == (2, 3, 4, 5, 6)
+    # signed_block has no `snap` attribute at all -- confirms the per-type
+    # kwargs routing never leaked the rotation-only override onto it.
+    assert not hasattr(signed_block.mingru, "snap")
+
+
+def test_rotation_hetero_k5_and_rotation_hetero_have_equal_param_counts():
+    """`snap` is a registered buffer on `RotationMinGRU`, not a
+    `nn.Parameter` -- widening the snap grid changes NO tensor shape, so
+    `rotation-hetero-k5` and `rotation-hetero` must build models with
+    IDENTICAL parameter counts. This is the documented exception to
+    `test_all_matrix_arms_have_distinct_param_counts`'s invariant, by
+    construction, not a bug -- see that test's own docstring."""
+    task = TASKS["s5"]
+    rotation_hetero_params = sum(
+        p.numel() for p in build_model(task, "rotation-hetero").parameters()
+    )
+    rotation_hetero_k5_params = sum(
+        p.numel() for p in build_model(task, "rotation-hetero-k5").parameters()
+    )
+    assert rotation_hetero_k5_params == rotation_hetero_params
+
+
+@pytest.mark.parametrize("arm,expected_nh", [("signed-delta-nh3", 3), ("signed-delta-nh4", 4)])
+def test_signed_delta_nh_probe_arms_registered_with_raised_nh(arm, expected_nh):
+    """`signed-delta-nh3`/`signed-delta-nh4` are the `signed-delta` stack
+    with the delta block's Householder-product count `nh` raised from
+    this round's matrix value (2) to 3/4 -- `n_heads`/`d_k`/`d_v` unchanged
+    from the matrix `delta`/`signed-delta` arms' own kwargs."""
+    assert arm in PROBE_ARMS
+    mixer, kwargs = PROBE_ARMS[arm]
+    assert mixer == ["signed", "delta"]
+    assert kwargs == {"delta": {"nh": expected_nh, "n_heads": 4, "d_k": 16, "d_v": 16}}
+
+
+@pytest.mark.parametrize("arm,expected_nh", [("signed-delta-nh3", 3), ("signed-delta-nh4", 4)])
+def test_signed_delta_nh_probe_arms_block_composition_matches_registered_nh(arm, expected_nh):
+    task = TASKS["s5"]
+    model = build_model(task, arm)
+    signed_block, delta_block = model.stack.blocks
+    assert type(signed_block.mingru).__name__ == "SignedMinGRU"
+    assert type(delta_block.mingru).__name__ == "DeltaMinGRU"
+    assert delta_block.mingru.nh == expected_nh
+    assert delta_block.mingru.n_heads == 4
+    assert delta_block.mingru.d_k == 16
+    assert delta_block.mingru.d_v == 16
+
+
+def test_signed_delta_nh_probe_arms_have_distinct_param_counts():
+    """Unlike `rotation-hetero-k5`'s snap widening, `nh` IS a real
+    constructor-time shape parameter (more Householder reflections per
+    delta step) -- `signed-delta`, `signed-delta-nh3`, and
+    `signed-delta-nh4` must build three genuinely different models."""
+    task = TASKS["s5"]
+    params = {
+        arm: sum(p.numel() for p in build_model(task, arm).parameters())
+        for arm in ("signed-delta", "signed-delta-nh3", "signed-delta-nh4")
+    }
+    assert len(set(params.values())) == 3
+
+
+@pytest.mark.parametrize("arm", ["rotation-hetero-k5", "signed-delta-nh3", "signed-delta-nh4"])
+def test_probe_arms_excluded_from_decay_capable_arms(arm):
+    assert arm not in DECAY_CAPABLE_ARMS
+    task = TASKS["pendulum"]
+    model = build_model(task, arm)
+    for block in model.stack.blocks:
+        assert block.mingru.decay is None
 
 
 # ------------------------------------------------------ TaskSpec singletons

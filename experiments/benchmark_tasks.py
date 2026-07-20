@@ -783,3 +783,24 @@ BENCH_ROUND_TAGS: dict[str, str] = {
     "psmnist": "bench-psmnist-02",
     "pendulum": "bench-pendulum-02",
 }
+
+# Probe round tags (Amendments, `.claude/output/intent/2026-07-19-benchmark-
+# round-intent.md`, 2026-07-20 entry): a follow-up S5-only probe testing
+# whether two suspected experiment-design artifacts -- `rotation-hetero`'s
+# missing K=5 snap order and `signed-delta`'s low nh=2 product count --
+# rather than a genuine mechanism limit, explain S5's 0/36 rows for those
+# families. The three probe arms (`experiments.benchmark_lab.PROBE_ARMS`)
+# write under THIS distinct tag, never under `BENCH_ROUND_TAGS["s5"]`
+# (`bench-s5-02`) -- a fresh tag keeps the clean eight-arm matrix population
+# from ever being touched by probe rows (see `PROBE_ARMS`'s own comment and
+# `scripts/report_benchmarks.py::_rows_for_task`'s `MATRIX_ARMS`-scoped
+# planned-arm set). Only `"s5"` has an entry: the probe never runs the other
+# three tasks (no decay-capability question to probe there), so a probe arm
+# requested against any other task has no round tag to write under --
+# `scripts/gpu_benchmark_campaign.py`'s round-tag resolution fails loud in
+# that case rather than guessing one. `scripts/gpu_check.py`'s
+# `_BENCHMARKS_ROUNDS` unions these values in alongside the `-01` pilot and
+# `-02` matrix tags so the finish handler accepts probe rows too.
+BENCH_PROBE_ROUND_TAGS: dict[str, str] = {
+    "s5": "bench-s5-probe-01",
+}

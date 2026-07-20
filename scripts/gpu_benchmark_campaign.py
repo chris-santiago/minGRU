@@ -10,21 +10,28 @@ full design.
 
 Task x arm matrix (spec section 1/6)
 -------------------------------------
-Four tasks (``s5``, ``mqar``, ``psmnist``, ``pendulum``), each run against
-the registered arms -- ``experiments/benchmark_lab.py``'s ``ARM_REGISTRY``
-(spec section 6 "Arms" fixed ``log``/``signed``/``rotation``/``givens``/
+Four tasks (``s5``, ``mqar``, ``psmnist``, ``pendulum``), each run by
+default against ``experiments/benchmark_lab.py``'s ``MATRIX_ARMS`` (spec
+section 6 "Arms" fixed ``log``/``signed``/``rotation``/``givens``/
 ``delta``; ``rotation-hetero`` was added by amendment, six total; a second
 amendment then added ``signed-givens``/``signed-delta``, eight total --
-every arm runs on all four tasks, no per-task arm subset). Unlike
+every matrix arm runs on all four tasks, no per-task arm subset). Unlike
 the GPU 36-seed round's ``gpu_hetero_campaign.py``,
 no arm here forces a distinct backend (no per-arm ``MINGRU_SCAN``/
 ``torch.compile`` split) -- every arm of a task runs under the same
 ``--device`` this invocation was given; the round's Global Constraints fix
 the training budget per task, not a per-arm backend.
 
+A third amendment (2026-07-20) added ``PROBE_ARMS`` (``rotation-hetero-k5``,
+``signed-delta-nh3``, ``signed-delta-nh4``) -- an S5-only follow-up probe,
+selectable via ``ARM_REGISTRY`` (``MATRIX_ARMS`` union ``PROBE_ARMS``) but
+NOT in the default ``--arms`` list: probe arms run only when named
+explicitly (e.g. ``--arms rotation-hetero-k5 signed-delta-nh3
+signed-delta-nh4``).
+
 Round tags: ``bench-s5-02``, ``bench-mqar-02``, ``bench-psmnist-02``,
-``bench-pendulum-02`` -- one per task, independent of which arms that
-task's cell selects, read from ``experiments.benchmark_tasks
+``bench-pendulum-02`` -- one per task, independent of which MATRIX arms
+that task's cell selects, read from ``experiments.benchmark_tasks
 .BENCH_ROUND_TAGS`` (the single source of truth this module and
 ``scripts/report_benchmarks.py`` both bind to). Bumped from the spec's
 original ``-01`` tags at the pre-matrix technical review (2026-07-19): the
@@ -32,7 +39,12 @@ original ``-01`` tags at the pre-matrix technical review (2026-07-19): the
 (heterogeneous per-seed training budgets), so the seed matrices land under
 clean ``-02`` tags that can't dedup-collide with pilot rows or get pooled
 into the same statistics by the report -- see ``BENCH_ROUND_TAGS``'s own
-comment for the full rationale.
+comment for the full rationale. A probe arm's rows land under a distinct
+tag instead, ``bench-s5-probe-01`` (``experiments.benchmark_tasks
+.BENCH_PROBE_ROUND_TAGS``) -- ``_round_tag_for_arm`` resolves which tag
+each ``(task, arm)`` cell writes under, per arm, inside ``run_campaign``'s
+loop, so a probe arm can never dedup-collide with or get pooled into the
+matrix population's statistics either.
 
 Pre-flight (fail-loud, before seed 0, ``--device cuda`` only)
 ----------------------------------------------------------------
@@ -112,7 +124,7 @@ import torch
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))  # `experiments.*` (namespace package, no __init__.py)
-from experiments.benchmark_tasks import BENCH_ROUND_TAGS  # noqa: E402
+from experiments.benchmark_tasks import BENCH_PROBE_ROUND_TAGS, BENCH_ROUND_TAGS  # noqa: E402
 
 _BENCHMARK_LAB_PATH = _REPO_ROOT / "experiments" / "benchmark_lab.py"
 _TORCH_STRATUM_PIN = "2.8."
@@ -126,6 +138,34 @@ _ENV_PREFIX = "MINGRU_LAB_ENV "
 # independently-editable copy -- see that mapping's own comment for the
 # `-01` -> `-02` bump rationale.
 _ROUND_TAGS: dict[str, str] = BENCH_ROUND_TAGS
+
+# Probe round tags (S5-only follow-up probe, `experiments.benchmark_lab
+# .PROBE_ARMS`): a distinct source-of-truth mapping, same binding
+# convention as `_ROUND_TAGS` above, so a probe arm's rows never land
+# under the matrix `-02` tag -- see `_round_tag_for_arm` below and
+# `BENCH_PROBE_ROUND_TAGS`'s own comment.
+_PROBE_ROUND_TAGS: dict[str, str] = BENCH_PROBE_ROUND_TAGS
+
+
+def _round_tag_for_arm(task_name: str, arm: str, probe_arms: dict) -> str:
+    """Ledger ``round`` tag for one ``(task_name, arm)`` cell: the probe
+    tag (``_PROBE_ROUND_TAGS``) when ``arm`` is one of ``probe_arms``
+    (``experiments.benchmark_lab.PROBE_ARMS``), else the task's matrix
+    tag (``_ROUND_TAGS``) -- the same per-task tag every matrix arm has
+    always used. A probe arm requested against a task with no entry in
+    `_PROBE_ROUND_TAGS` (every task except S5, per this round's scope)
+    fails loud rather than silently falling back to the matrix tag, which
+    would pollute the clean `-02` matrix population with a differently-
+    configured arm's rows."""
+    if arm in probe_arms:
+        if task_name not in _PROBE_ROUND_TAGS:
+            raise ValueError(
+                f"probe arm {arm!r} has no round tag for task {task_name!r} -- "
+                f"BENCH_PROBE_ROUND_TAGS only covers {sorted(_PROBE_ROUND_TAGS)}; "
+                "this probe round does not run that task"
+            )
+        return _PROBE_ROUND_TAGS[task_name]
+    return _ROUND_TAGS[task_name]
 
 
 def _import_benchmark_lab() -> Any:
@@ -341,9 +381,9 @@ def run_campaign(
 
     for task_name in tasks:
         task = benchmark_lab.TASKS[task_name]
-        round_tag = _ROUND_TAGS[task_name]
         task_seeds = _resolve_seeds(task, seeds)
         for arm in arms:
+            round_tag = _round_tag_for_arm(task_name, arm, benchmark_lab.PROBE_ARMS)
             for seed in task_seeds:
                 t0 = time.perf_counter()
                 kwargs = _run_arm_kwargs(round_tag, task, arm, seed, steps, device)
@@ -380,9 +420,12 @@ def main(argv: list[str] | None = None) -> int:
         "--arms",
         nargs="+",
         choices=sorted(benchmark_lab.ARM_REGISTRY),
-        default=list(benchmark_lab.ARM_REGISTRY),
-        help="arm subset (default: all registered arms -- eight packaged-mixer arms: "
-        "log/signed/rotation/rotation-hetero/givens/delta/signed-givens/signed-delta)",
+        default=list(benchmark_lab.MATRIX_ARMS),
+        help="arm subset (default: the eight MATRIX_ARMS -- "
+        "log/signed/rotation/rotation-hetero/givens/delta/signed-givens/signed-delta; "
+        "the three S5-only PROBE_ARMS -- rotation-hetero-k5/signed-delta-nh3/"
+        "signed-delta-nh4 -- are choosable but never run unless named explicitly, "
+        "and write under their own bench-s5-probe-01 round tag, not the matrix tag)",
     )
     parser.add_argument(
         "--seeds",

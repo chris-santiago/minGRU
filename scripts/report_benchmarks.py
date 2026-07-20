@@ -15,9 +15,15 @@ tags (``bench-s5-02``, ``bench-mqar-02``, ``bench-psmnist-02``,
 per-seed budgets) and are deliberately excluded here -- see
 ``BENCH_ROUND_TAGS``'s own comment for the ``-01`` -> ``-02`` bump
 rationale; ``scripts/gpu_check.py`` is the one place that still recognizes
-both generations, for old pilot job logs/sidecars.
+both generations, for old pilot job logs/sidecars. The S5-only probe round
+(``bench-s5-probe-01``, ``experiments.benchmark_tasks
+.BENCH_PROBE_ROUND_TAGS``) is a separate population entirely -- this
+module's per-task accounting below reads only ``experiments.benchmark_lab
+.MATRIX_ARMS`` (never ``ARM_REGISTRY``, which also includes the three
+S5-only ``PROBE_ARMS``), so the ``-02`` reports this module writes never
+show probe arms and never change shape because of them.
 
-Per task, per arm (``experiments.benchmark_lab.ARM_REGISTRY``:
+Per task, per arm (``experiments.benchmark_lab.MATRIX_ARMS``:
 log/signed/rotation/rotation-hetero/givens/delta/signed-givens/signed-delta):
 
 - fit count + threshold-robustness triple, judged on the task's own
@@ -64,7 +70,7 @@ log/signed/rotation/rotation-hetero/givens/delta/signed-givens/signed-delta):
   rule).
 
 Completeness readout: which ``(arm, seed)`` cells are present vs the
-planned ``range(TaskSpec.seeds)`` matrix (arms from ``ARM_REGISTRY``,
+planned ``range(TaskSpec.seeds)`` matrix (arms from ``MATRIX_ARMS``,
 seed counts from ``TASKS``) -- consumed by a later task that verifies the
 seed matrices landed in full (task brief).
 
@@ -106,7 +112,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from _bench_env import git_commit_sha  # noqa: E402
 from _evidence_stats import fisher_exact_two_sided  # noqa: E402
-from experiments.benchmark_lab import ARM_REGISTRY, build_model  # noqa: E402
+from experiments.benchmark_lab import MATRIX_ARMS, build_model  # noqa: E402
 from experiments.benchmark_tasks import BENCH_ROUND_TAGS, TASKS, TaskSpec  # noqa: E402
 
 _RESULTS = _REPO_ROOT / "experiments" / "lab_results.jsonl"
@@ -162,12 +168,22 @@ def _load_all_rows(path: Path) -> list[dict[str, Any]]:
 
 def _rows_for_task(all_rows: list[dict[str, Any]], task_name: str) -> dict[str, list[dict]]:
     """``all_rows`` filtered to ``task_name``'s round tag, grouped by arm
-    (``variant``). Every ``ARM_REGISTRY`` key is present (possibly with an
+    (``variant``). Every ``MATRIX_ARMS`` key is present (possibly with an
     empty list) so a 0-row arm still appears in the completeness readout;
-    a row whose ``variant`` isn't a recognized arm is silently dropped
-    (not this round's data)."""
+    a row whose ``variant`` isn't a recognized MATRIX arm is silently
+    dropped (not this round's data).
+
+    Deliberately ``MATRIX_ARMS`` here, NOT ``experiments.benchmark_lab
+    .ARM_REGISTRY`` (matrix arms unioned with the S5-only ``PROBE_ARMS``,
+    e.g. ``rotation-hetero-k5``): this ``-02`` matrix report's planned-arm
+    accounting must stay exactly the eight clean seed-matrix arms --
+    widening it to ``ARM_REGISTRY`` would make every ``-02`` report show
+    the three probe arms as permanently "0/seeds missing" (they write
+    under a distinct probe round tag, `BENCH_PROBE_ROUND_TAGS`, never
+    this task's `-02` tag, so they can never have rows here regardless).
+    See `experiments.benchmark_lab.PROBE_ARMS`'s own comment."""
     round_tag = ROUND_TAGS[task_name]
-    by_arm: dict[str, list[dict]] = {arm: [] for arm in ARM_REGISTRY}
+    by_arm: dict[str, list[dict]] = {arm: [] for arm in MATRIX_ARMS}
     for row in all_rows:
         if row.get("round") != round_tag or row.get("task") != task_name:
             continue

@@ -137,7 +137,7 @@ from typing import Any, NamedTuple
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))  # `experiments.*` (namespace package, no __init__.py)
-from experiments.benchmark_tasks import BENCH_ROUND_TAGS  # noqa: E402
+from experiments.benchmark_tasks import BENCH_PROBE_ROUND_TAGS, BENCH_ROUND_TAGS  # noqa: E402
 
 DEFAULT_IMAGE = "pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel"
 DEFAULT_MACHINE = "L4"
@@ -172,13 +172,22 @@ _BENCHMARKS_ENV_PREFIX = "MINGRU_LAB_ENV "
 # the recorded pilot/calibration population (heterogeneous per-seed
 # budgets, see `experiments.benchmark_tasks.BENCH_ROUND_TAGS`'s comment) --
 # kept here hardcoded, forever, so old pilot job logs/sidecars stay
-# parseable -- UNIONED with the current `-02` tags, read from
+# parseable -- UNIONED with the current `-02` matrix tags, read from
 # `BENCH_ROUND_TAGS` (the single source of truth `gpu_benchmark_campaign
 # .py`'s `_ROUND_TAGS` and `report_benchmarks.py`'s `ROUND_TAGS` also bind
-# to, so all three never risk drifting out of sync on the live tag). One
-# round per task, independent of which arms/seeds that task's cell selects.
+# to, so all three never risk drifting out of sync on the live tag), AND
+# the S5-only probe tag(s) from `BENCH_PROBE_ROUND_TAGS` (same source-of-
+# truth binding as `gpu_benchmark_campaign.py`'s `_PROBE_ROUND_TAGS`) --
+# the finish handler's dedup key already includes `variant`
+# (`_valid_benchmarks_key`), so a probe arm's rows dedup correctly on
+# their own round tag without any further change here. One round per
+# task, independent of which arms/seeds that task's cell selects.
 _BENCHMARKS_ROUNDS_PILOT = ("bench-s5-01", "bench-mqar-01", "bench-psmnist-01", "bench-pendulum-01")
-_BENCHMARKS_ROUNDS = _BENCHMARKS_ROUNDS_PILOT + tuple(BENCH_ROUND_TAGS.values())
+_BENCHMARKS_ROUNDS = (
+    _BENCHMARKS_ROUNDS_PILOT
+    + tuple(BENCH_ROUND_TAGS.values())
+    + tuple(BENCH_PROBE_ROUND_TAGS.values())
+)
 
 
 def _sh(cmd: list[str]) -> str:

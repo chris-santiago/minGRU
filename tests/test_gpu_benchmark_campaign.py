@@ -19,13 +19,18 @@ Split into two groups, mirroring ``test_gpu_hetero_campaign.py``:
   -- these never reach ``_run_selftest_gate`` through the end-to-end tests
   below (``--device cpu`` skips pre-flight entirely; ``--device cuda`` trips
   the CUDA assert before the selftest gate on this CUDA-less test machine),
-  so they need direct unit coverage.
+  so they need direct unit coverage. Also pure: ``_round_tag_for_arm``'s
+  probe-vs-matrix routing (S5-only probe round, ``BENCH_PROBE_ROUND_TAGS``)
+  and ``main``'s default ``--arms`` (``MATRIX_ARMS`` only, probe arms
+  excluded unless named explicitly).
 - End-to-end subprocess checks per the task's stated verification: a tiny
   ``--device cpu`` smoke run emits a valid ``MINGRU_LAB_ROW`` line and never
   touches ``experiments/lab_results.jsonl``, and the default (``--device
   cuda``) invocation fails fast at pre-flight with a clear, non-traceback
-  message on this CUDA-less test machine. These import torch (via the
-  subprocess) and are slower, so they're kept to one case each.
+  message on this CUDA-less test machine. A second smoke run confirms the
+  three probe arms emit rows tagged ``bench-s5-probe-01``, never
+  ``bench-s5-02``. These import torch (via the subprocess) and are slower,
+  so they're kept to a small, fixed number of cases.
 """
 
 from __future__ import annotations
@@ -38,7 +43,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from experiments.benchmark_lab import ARM_REGISTRY
+from experiments.benchmark_lab import ARM_REGISTRY, MATRIX_ARMS, PROBE_ARMS
 from experiments.benchmark_tasks import TASKS
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -51,8 +56,10 @@ sys.modules.setdefault("gpu_benchmark_campaign", gpu_benchmark_campaign)
 _spec.loader.exec_module(gpu_benchmark_campaign)
 
 _ROUND_TAGS = gpu_benchmark_campaign._ROUND_TAGS
+_PROBE_ROUND_TAGS = gpu_benchmark_campaign._PROBE_ROUND_TAGS
 _resolve_seeds = gpu_benchmark_campaign._resolve_seeds
 _resolve_eval_every = gpu_benchmark_campaign._resolve_eval_every
+_round_tag_for_arm = gpu_benchmark_campaign._round_tag_for_arm
 _run_selftest_gate = gpu_benchmark_campaign._run_selftest_gate
 _run_arm_kwargs = gpu_benchmark_campaign._run_arm_kwargs
 
@@ -79,6 +86,36 @@ def test_round_tags_match_current_bench_round_tags():
 
 def test_round_tags_cover_every_registered_task():
     assert set(_ROUND_TAGS) == set(TASKS)
+
+
+# --- probe round tags + _round_tag_for_arm: probe routing -----------------
+
+
+def test_probe_round_tags_match_bench_probe_round_tags():
+    from experiments.benchmark_tasks import BENCH_PROBE_ROUND_TAGS
+
+    assert _PROBE_ROUND_TAGS == BENCH_PROBE_ROUND_TAGS
+    assert _PROBE_ROUND_TAGS == {"s5": "bench-s5-probe-01"}
+
+
+@pytest.mark.parametrize("arm", sorted(PROBE_ARMS))
+def test_round_tag_for_arm_routes_probe_arms_to_the_probe_tag(arm):
+    assert _round_tag_for_arm("s5", arm, PROBE_ARMS) == "bench-s5-probe-01"
+
+
+@pytest.mark.parametrize("arm", sorted(MATRIX_ARMS))
+def test_round_tag_for_arm_routes_matrix_arms_to_the_matrix_tag(arm):
+    for task_name in TASKS:
+        assert _round_tag_for_arm(task_name, arm, PROBE_ARMS) == _ROUND_TAGS[task_name]
+
+
+def test_round_tag_for_arm_raises_for_probe_arm_on_a_task_with_no_probe_tag():
+    # The probe round is S5-only (BENCH_PROBE_ROUND_TAGS has one entry) --
+    # a probe arm requested against any other task must fail loud rather
+    # than silently falling back to that task's matrix tag.
+    for task_name in ("mqar", "psmnist", "pendulum"):
+        with pytest.raises(ValueError, match="no round tag"):
+            _round_tag_for_arm(task_name, "rotation-hetero-k5", PROBE_ARMS)
 
 
 # --- _resolve_seeds: per-task default vs. override -------------------------
@@ -148,17 +185,18 @@ def test_run_arm_kwargs_shrinks_eval_every_alongside_steps_override():
     assert kwargs["eval_every"] == 20
 
 
-# --- main(): --arms defaults to the full ARM_REGISTRY (no per-task subset) -
+# --- main(): --arms defaults to MATRIX_ARMS only (no per-task subset) -----
 
 
-def test_main_default_arms_is_the_full_arm_registry(monkeypatch):
+def test_main_default_arms_is_matrix_arms_only(monkeypatch):
     """Confirms `scripts/gpu_benchmark_campaign.py`'s `--arms` default
-    (`list(benchmark_lab.ARM_REGISTRY)`, module docstring's Task x arm
-    matrix section) still resolves to every registered arm -- including
+    (`list(benchmark_lab.MATRIX_ARMS)`, module docstring's Task x arm
+    matrix section) resolves to exactly the eight matrix arms -- including
     `signed-givens`/`signed-delta` -- with no per-task arm scoping: every
-    task runs the same arm list. Captures the arguments `main` actually
-    passes to `run_campaign` rather than asserting on argparse internals
-    directly."""
+    task runs the same arm list. The three `PROBE_ARMS` must NOT be in the
+    default (probe arms run only when named explicitly via `--arms`).
+    Captures the arguments `main` actually passes to `run_campaign` rather
+    than asserting on argparse internals directly."""
     captured: dict = {}
 
     def _fake_run_campaign(tasks, arms, seeds, steps, device):
@@ -169,9 +207,38 @@ def test_main_default_arms_is_the_full_arm_registry(monkeypatch):
     monkeypatch.setattr(gpu_benchmark_campaign, "run_campaign", _fake_run_campaign)
     gpu_benchmark_campaign.main(["--tasks", "s5", "--seeds", "0"])
 
-    assert set(captured["arms"]) == set(ARM_REGISTRY)
+    assert set(captured["arms"]) == set(MATRIX_ARMS)
     assert "signed-givens" in captured["arms"]
     assert "signed-delta" in captured["arms"]
+    for arm in PROBE_ARMS:
+        assert arm not in captured["arms"]
+
+
+def test_main_arms_choices_still_include_probe_arms_for_explicit_selection(monkeypatch):
+    """Probe arms are excluded from the DEFAULT `--arms` list but must
+    still be explicitly selectable -- `argparse`'s `choices=` is
+    `sorted(ARM_REGISTRY)` (matrix union probe), not `MATRIX_ARMS`."""
+    captured: dict = {}
+
+    def _fake_run_campaign(tasks, arms, seeds, steps, device):
+        captured["arms"] = arms
+        return None
+
+    monkeypatch.setattr(gpu_benchmark_campaign, "run_campaign", _fake_run_campaign)
+    gpu_benchmark_campaign.main(
+        [
+            "--tasks",
+            "s5",
+            "--arms",
+            "rotation-hetero-k5",
+            "signed-delta-nh3",
+            "signed-delta-nh4",
+            "--seeds",
+            "0",
+        ]
+    )
+
+    assert set(captured["arms"]) == set(PROBE_ARMS)
 
 
 # --- _run_selftest_gate: failure paths raise a clean SystemExit -----------
@@ -301,6 +368,59 @@ def test_cpu_smoke_emits_valid_row_and_touches_no_ledger():
     assert not any(
         line.startswith(gpu_benchmark_campaign._ENV_PREFIX) for line in result.stdout.splitlines()
     )
+
+    after = ledger.stat().st_mtime_ns if ledger.exists() else None
+    assert before == after, "CPU smoke run must never touch the ledger"
+
+
+def test_cpu_smoke_probe_arms_emit_rows_tagged_with_the_probe_round():
+    """Task's stated local-smoke verification: `--arms
+    rotation-hetero-k5 signed-delta-nh3 signed-delta-nh4` on `s5` emits
+    three rows, all tagged `bench-s5-probe-01` -- never the matrix
+    `bench-s5-02` tag."""
+    ledger = _REPO_ROOT / "experiments" / "lab_results.jsonl"
+    before = ledger.stat().st_mtime_ns if ledger.exists() else None
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_SCRIPT_PATH),
+            "--tasks",
+            "s5",
+            "--arms",
+            "rotation-hetero-k5",
+            "signed-delta-nh3",
+            "signed-delta-nh4",
+            "--seeds",
+            "99",
+            "--steps",
+            "40",
+            "--device",
+            "cpu",
+        ],
+        cwd=_REPO_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stderr
+
+    row_lines = [
+        line
+        for line in result.stdout.splitlines()
+        if line.startswith(gpu_benchmark_campaign._ROW_PREFIX)
+    ]
+    assert len(row_lines) == 3, result.stdout
+    rows = [json.loads(line[len(gpu_benchmark_campaign._ROW_PREFIX) :]) for line in row_lines]
+    assert {row["variant"] for row in rows} == {
+        "rotation-hetero-k5",
+        "signed-delta-nh3",
+        "signed-delta-nh4",
+    }
+    for row in rows:
+        assert row["round"] == "bench-s5-probe-01"
+        assert row["task"] == "s5"
+        assert row["seed"] == 99
 
     after = ledger.stat().st_mtime_ns if ledger.exists() else None
     assert before == after, "CPU smoke run must never touch the ledger"

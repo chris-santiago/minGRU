@@ -38,13 +38,13 @@ reading was tried and rejected (byte-identical to `rotation`, caught by
 
 Two more arms, `signed-givens` and `signed-delta`, were added by a
 second, later amendment (same intent-ledger file, Amendments) that runs
-them on ALL FOUR tasks, exactly like the other six arms -- no per-task
-arm scoping exists in this module or its consumers (`ARM_REGISTRY` is
-the one and only arm list every task, `scripts/report_benchmarks.py`,
-and `scripts/gpu_benchmark_campaign.py` iterate). They ground this
-round's arm list in the repo's already-evidenced promoted hetero
-structures rather than inventing a new one: `signed-givens` is
-`probes.py`'s `"minGRU-hetero-sg8"` row (`["signed", "givens"], None`,
+them on ALL FOUR tasks, exactly like the other six arms -- these eight
+arms (`MATRIX_ARMS`) are the clean seed-matrix population every task,
+`scripts/report_benchmarks.py`'s `-02` completeness accounting, and
+`scripts/gpu_benchmark_campaign.py`'s default `--arms` all still iterate.
+They ground this round's arm list in the repo's already-evidenced
+promoted hetero structures rather than inventing a new one: `signed-givens`
+is `probes.py`'s `"minGRU-hetero-sg8"` row (`["signed", "givens"], None`,
 the S3-hier promoted fit-rate winner, GPU-re-evidenced as
 `hetero_lab.py`'s `"hetero-pg8"`); `signed-delta` mirrors
 `hetero_lab.py`'s `"hetero-pd1024"` row (the delta block at its
@@ -55,6 +55,22 @@ caveat on `signed-delta` (the lab lineage row used signed-TANH, not the
 packaged `signed` mixer this round's registry path uses). No new mixer
 code -- every arm is an existing packaged class, called through
 `MinGRUStack`'s `mixer=`/`mixer_kwargs=` contract.
+
+A third amendment (same intent-ledger file, 2026-07-20 entry) added three
+more arms, `PROBE_ARMS` (`rotation-hetero-k5`, `signed-delta-nh3`,
+`signed-delta-nh4`) -- an S5-only follow-up probe testing whether two
+suspected experiment-design artifacts, not a mechanism limit, explain
+S5's 0/36 rows for `rotation-hetero` and `signed-delta`. Unlike the
+first two amendments, these do NOT join the eight-arm seed-matrix
+population: `ARM_REGISTRY` (this module's `build_model`/CLI lookup) is
+`MATRIX_ARMS` unioned with `PROBE_ARMS`, but `scripts
+/report_benchmarks.py`'s `-02` completeness accounting and
+`scripts/gpu_benchmark_campaign.py`'s default `--arms` read `MATRIX_ARMS`
+only -- probe arms run solely when explicitly named via `--arms` and
+write under their own distinct ledger round tag
+(`experiments.benchmark_tasks.BENCH_PROBE_ROUND_TAGS`), never the matrix
+`-02` tag. See `PROBE_ARMS`'s own comment for the corrected-config
+rationale.
 
 Usage:
   uv run python experiments/benchmark_lab.py \
@@ -219,7 +235,7 @@ RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lab_results.
 # stack's two mixer types, so this round doesn't invent one for either
 # new arm. Both receive dt only via the log1p(dt) feature-concat channel
 # on the pendulum task, like delta and rotation-hetero.
-ARM_REGISTRY: dict[str, tuple[str | list[str], dict | None]] = {
+MATRIX_ARMS: dict[str, tuple[str | list[str], dict | None]] = {
     "log": ("log", {}),
     "signed": ("signed", {}),
     "rotation": ("rotation", {}),
@@ -230,17 +246,68 @@ ARM_REGISTRY: dict[str, tuple[str | list[str], dict | None]] = {
     "signed-delta": (["signed", "delta"], {"delta": {"nh": 2, "n_heads": 4, "d_k": 16, "d_v": 16}}),
 }
 
+# Probe arms (Amendments, `.claude/output/intent/2026-07-19-benchmark-round-
+# intent.md`, 2026-07-20 entry): three corrected-config S5-only follow-up
+# arms testing whether two suspected experiment-design artifacts -- not a
+# mechanism limit -- explain S5's 0/36 rows for `rotation-hetero` and
+# `signed-delta`.
+#
+# rotation-hetero-k5: byte-identical to `rotation-hetero` above (same
+# `["rotation", "signed"]` stack) except the rotation block's snap grid is
+# widened to include K=5 -- S5's element orders are {2, 3, 4, 5, 6} (a
+# 5-cycle needs an order-5 rotation to land an exact attractor), but
+# `RotationMinGRU`'s own default snap grid, `(2, 3, 4, 6)`, is missing it.
+# `RotationMinGRU`'s docstring: "the snap grid must contain the [element]
+# order[s]" -- this arm is the grid corrected to match S5's actual group,
+# not a new comparison axis. `snap` is a registered buffer, not a
+# parameter (`RotationMinGRU.__init__`), so this arm's param count is
+# IDENTICAL to `rotation-hetero`'s (see `PROBE_ARMS`'s param-count
+# invariant note below and `tests/test_benchmark_lab.py`'s pinned test) --
+# the all-arms-distinct-param-count invariant that holds across
+# `MATRIX_ARMS` does NOT extend to this arm, by construction, not by bug.
+#
+# signed-delta-nh3 / signed-delta-nh4: `signed-delta`'s stack
+# (`["signed", "delta"]`) with the delta block's Householder-product count
+# `nh` raised from this round's matrix value (nh=2) to 3 and 4
+# respectively -- `n_heads`/`d_k`/`d_v` unchanged, matching `DeltaMinGRU`'s
+# constructor (`n_heads=4, nh=1, d_k=None, d_v=None` defaults) as ground
+# truth. `nh` IS a real constructor-time shape parameter (more Householder
+# reflections per delta step), so these two arms DO have distinct param
+# counts from `signed-delta` and from each other.
+PROBE_ARMS: dict[str, tuple[str | list[str], dict | None]] = {
+    "rotation-hetero-k5": (["rotation", "signed"], {"rotation": {"snap": (2, 3, 4, 5, 6)}}),
+    "signed-delta-nh3": (
+        ["signed", "delta"],
+        {"delta": {"nh": 3, "n_heads": 4, "d_k": 16, "d_v": 16}},
+    ),
+    "signed-delta-nh4": (
+        ["signed", "delta"],
+        {"delta": {"nh": 4, "n_heads": 4, "d_k": 16, "d_v": 16}},
+    ),
+}
+
+# The build_model/CLI lookup: matrix arms (the clean eight-arm seed-matrix
+# population, `scripts/report_benchmarks.py`'s `-02` completeness accounting
+# reads `MATRIX_ARMS` directly, never this union) union probe arms. Keeping
+# this as one dict (rather than two independent registries `build_model`
+# would have to check in turn) means every existing single-lookup call site
+# below (`build_model`, the CLI's `--model`/`--arms` choices) transparently
+# resolves both arm families with no dispatch change.
+ARM_REGISTRY: dict[str, tuple[str | list[str], dict | None]] = {**MATRIX_ARMS, **PROBE_ARMS}
+
 # Arms whose packaged mixer class mixes in DecayMixin (accepts decay=
 # "learnable"/"fixed" and a delta_t argument). DeltaMinGRU is deliberately
 # excluded: its constructor rejects any decay is not None (frozen contract,
 # see its class docstring) -- pendulum's dt reaches it only via the
 # feature-concat channel below, never mechanically. rotation-hetero,
 # signed-givens, and signed-delta are excluded for the same reason (see
-# ARM_REGISTRY's comment): no established repo precedent for splitting
+# MATRIX_ARMS's comment): no established repo precedent for splitting
 # decay wiring across either mixer type of a hetero stack, so this round
 # doesn't invent one for any of the three hetero arms -- each reaches dt
 # on pendulum only via the log1p(dt) feature-concat channel, never
-# mechanically.
+# mechanically. The three PROBE_ARMS are excluded for the identical
+# reason -- each is a hetero stack of the same two mixer-type families
+# (rotation+signed, signed+delta) as its non-decay-capable matrix sibling.
 DECAY_CAPABLE_ARMS = {"log", "signed", "rotation", "givens"}
 
 
@@ -986,7 +1053,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--model",
         choices=sorted(ARM_REGISTRY),
         help="log | signed | rotation | rotation-hetero | givens | delta | "
-        "signed-givens | signed-delta",
+        "signed-givens | signed-delta (the eight MATRIX_ARMS) | "
+        "rotation-hetero-k5 | signed-delta-nh3 | signed-delta-nh4 "
+        "(the three S5-only PROBE_ARMS)",
     )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--lr", type=float, default=None, help="override TaskSpec.budget.lr")

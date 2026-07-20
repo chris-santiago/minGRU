@@ -23,6 +23,10 @@ Sections
 7. End-to-end `write_reports`/`main` -- JSON + MD written to a `tmp_path`
    dir from a synthetic ledger fixture, 0-row round renders without a
    crash, real ledger regeneration doesn't raise.
+8. Regression: `-02` matrix accounting untouched by the S5-only probe round
+   (`PROBE_ARMS`) -- the planned arm set stays exactly the eight
+   `MATRIX_ARMS`, and rows carrying either the probe round tag or a
+   probe-only variant never surface in a `-02` report.
 """
 
 from __future__ import annotations
@@ -33,8 +37,8 @@ import sys
 from pathlib import Path
 
 import pytest
-from experiments.benchmark_lab import ARM_REGISTRY, DECAY_CAPABLE_ARMS
-from experiments.benchmark_tasks import BENCH_ROUND_TAGS, TASKS
+from experiments.benchmark_lab import ARM_REGISTRY, DECAY_CAPABLE_ARMS, MATRIX_ARMS, PROBE_ARMS
+from experiments.benchmark_tasks import BENCH_PROBE_ROUND_TAGS, BENCH_ROUND_TAGS, TASKS
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SCRIPT_PATH = _REPO_ROOT / "scripts" / "report_benchmarks.py"
@@ -323,7 +327,7 @@ def test_completeness_reports_present_and_missing_seeds():
 
 def test_completeness_all_arms_present_even_with_zero_rows():
     report = build_task_report("s5", [])
-    assert set(report["arms"]) == set(ARM_REGISTRY)
+    assert set(report["arms"]) == set(MATRIX_ARMS)
     for rep in report["arms"].values():
         assert rep["seeds_present"] == 0
         assert rep["missing_seeds"] == list(range(TASKS["s5"].seeds))
@@ -334,7 +338,7 @@ def test_param_counts_are_positive_and_vary_by_task_and_arm():
     report_s5 = build_task_report("s5", [])
     report_psmnist = build_task_report("psmnist", [])
 
-    for arm in ARM_REGISTRY:
+    for arm in MATRIX_ARMS:
         assert report_s5["arms"][arm]["params"] > 0
         assert report_psmnist["arms"][arm]["params"] > 0
 
@@ -342,8 +346,8 @@ def test_param_counts_are_positive_and_vary_by_task_and_arm():
     # counts for the same arm; params are reported per arm, never equalized
     # across arms within a task.
     assert report_s5["arms"]["log"]["params"] != report_psmnist["arms"]["log"]["params"]
-    log_params = {report_s5["arms"][arm]["params"] for arm in ARM_REGISTRY}
-    assert len(log_params) == len(ARM_REGISTRY)  # every arm's count is distinct
+    log_params = {report_s5["arms"][arm]["params"] for arm in MATRIX_ARMS}
+    assert len(log_params) == len(MATRIX_ARMS)  # every arm's count is distinct
 
 
 def test_delta_arm_excludes_decay_wiring_on_pendulum():
@@ -409,3 +413,59 @@ def test_regenerating_twice_is_byte_identical_given_same_rows(tmp_path):
         b = json.loads((out_b / f"bench_{task_name}.json").read_text())
         a["env"]["generated"] = b["env"]["generated"] = None
         assert a == b
+
+
+# ------------------------- 8. regression: -02 matrix accounting untouched --
+# (S5-only probe round, PROBE_ARMS -- Amendments, 2026-07-20 entry): the
+# `-02` matrix reports' planned-arm accounting must stay exactly the eight
+# clean seed-matrix arms, never widened by the three probe arms added to
+# `experiments.benchmark_lab.ARM_REGISTRY` alongside them.
+def test_matrix_arms_planned_set_is_exactly_the_eight_matrix_arms():
+    assert set(MATRIX_ARMS) == {
+        "log",
+        "signed",
+        "rotation",
+        "rotation-hetero",
+        "givens",
+        "delta",
+        "signed-givens",
+        "signed-delta",
+    }
+    assert len(MATRIX_ARMS) == 8
+    # PROBE_ARMS is disjoint and joins ARM_REGISTRY, but never MATRIX_ARMS.
+    assert set(PROBE_ARMS) & set(MATRIX_ARMS) == set()
+    assert set(ARM_REGISTRY) == set(MATRIX_ARMS) | set(PROBE_ARMS)
+    assert len(ARM_REGISTRY) == 11
+
+
+def test_probe_round_rows_never_appear_in_a_minus02_matrix_report():
+    """A row tagged under the probe round (`BENCH_PROBE_ROUND_TAGS["s5"]`)
+    with a probe-arm `variant` must never surface in the `-02` matrix
+    report: `_rows_for_task` filters by round tag FIRST (the probe tag
+    never equals `ROUND_TAGS["s5"]`), so the row is dropped before variant
+    matching is even attempted."""
+    probe_row = _s5_row(0, "rotation-hetero-k5", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)
+    probe_row["round"] = BENCH_PROBE_ROUND_TAGS["s5"]
+    matrix_row = _s5_row(0, "log", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)
+
+    report = build_task_report("s5", [probe_row, matrix_row])
+
+    assert set(report["arms"]) == set(MATRIX_ARMS)
+    assert "rotation-hetero-k5" not in report["arms"]
+    assert report["arms"]["log"]["seeds_present"] == 1
+
+
+def test_unrecognized_probe_variant_under_the_matrix_round_tag_is_silently_dropped():
+    """A row that somehow carried the MATRIX `-02` round tag but a
+    probe-only `variant` (never emitted by the campaign -- `PROBE_ARMS`
+    always writes under the distinct probe tag) is still silently dropped,
+    matching `_rows_for_task`'s documented "unrecognized variant" contract
+    -- it must not crash the report or fabricate a ninth arm column."""
+    stray_row = _s5_row(0, "signed-delta-nh3", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)
+    matrix_row = _s5_row(0, "log", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)
+
+    report = build_task_report("s5", [stray_row, matrix_row])
+
+    assert set(report["arms"]) == set(MATRIX_ARMS)
+    assert "signed-delta-nh3" not in report["arms"]
+    assert report["arms"]["log"]["seeds_present"] == 1
