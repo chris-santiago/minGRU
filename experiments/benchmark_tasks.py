@@ -824,3 +824,38 @@ BENCH_PROBE_ROUND_TAGS: dict[str, str] = {
 BENCH_REF_ROUND_TAGS: dict[str, str] = {
     "psmnist": "bench-psmnist-ref-01",
 }
+
+# Per-arm round-tag correction overrides (design spec, `.claude/output/specs/
+# 2026-07-21-round-tag-override-design.md`): the single source of truth
+# consulted by write (`scripts/gpu_benchmark_campaign.py`'s per-arm round-tag
+# resolver), read (`scripts/report_benchmarks.py`'s `_source_round_for_arm`),
+# ingest (`scripts/gpu_check.py`'s `_BENCHMARKS_ROUNDS` allow-list), and
+# disclosure (report payload's `arm_round_overrides` key) -- mirroring how
+# `BENCH_ROUND_TAGS` above is already consulted by write/read/ingest. Shape
+# is one dimension deeper than the population tag maps: `arm -> {task ->
+# correction round tag}`. `BENCH_ARM_ROUND_OVERRIDES.get(arm, {}).get(task)`
+# is the correction tag if present, else `None` -- an absent arm or absent
+# task means no override, and every touchpoint falls through to its normal
+# population routing (matrix tag / probe tag / ref tag) unchanged. This is
+# the two-layer model: population-default tag vs per-arm correction tag.
+# Populated for the `signed-rotation` composer-order fix (rotation-order
+# rename+swap landed; this is the correction re-run, not a fresh `-03` full
+# matrix): `signed-rotation` gets a correction tag on all four matrix tasks,
+# and its K=5 probe sibling `signed-rotation-k5` gets one on `"s5"` only (the
+# probe never runs the other three tasks, same as `BENCH_PROBE_ROUND_TAGS`
+# above). No other arm has an entry here -- every other matrix arm, the two
+# other probe arms, and the ref arm are untouched and keep writing/reading
+# under their existing population tags. Adding or removing an entry here is the
+# only edit that routes or un-routes an arm's correction round across all four
+# touchpoints.
+BENCH_ARM_ROUND_OVERRIDES: dict[str, dict[str, str]] = {
+    "signed-rotation": {
+        "s5": "bench-s5-rotfix-01",
+        "mqar": "bench-mqar-rotfix-01",
+        "psmnist": "bench-psmnist-rotfix-01",
+        "pendulum": "bench-pendulum-rotfix-01",
+    },
+    "signed-rotation-k5": {
+        "s5": "bench-s5-probe-rotfix-01",
+    },
+}
