@@ -104,21 +104,71 @@ def test_probe_round_tags_match_bench_probe_round_tags():
     assert _PROBE_ROUND_TAGS == {"s5": "bench-s5-probe-01"}
 
 
-@pytest.mark.parametrize("arm", sorted(PROBE_ARMS))
+@pytest.mark.parametrize("arm", sorted(set(PROBE_ARMS) - {"signed-rotation-k5"}))
 def test_round_tag_for_arm_routes_probe_arms_to_the_probe_tag(arm):
+    # `signed-rotation-k5` is excluded here -- it has a correction override
+    # for s5 (round-tag override design spec) and is covered separately by
+    # test_round_tag_for_arm_routes_overridden_probe_arm_to_its_correction_tag
+    # below; the other two probe arms (signed-delta-nh3/nh4) are unchanged.
     assert _round_tag_for_arm("s5", arm, PROBE_ARMS, REF_ARMS) == "bench-s5-probe-01"
 
 
-@pytest.mark.parametrize("arm", sorted(MATRIX_ARMS))
+def test_round_tag_for_arm_routes_overridden_probe_arm_to_its_correction_tag():
+    # signed-rotation-k5 (rotation-order correction re-run) has an override
+    # entry for s5 only -- BENCH_ARM_ROUND_OVERRIDES["signed-rotation-k5"]
+    # -- so it routes to the probe-rotfix tag instead of the plain probe tag.
+    assert (
+        _round_tag_for_arm("s5", "signed-rotation-k5", PROBE_ARMS, REF_ARMS)
+        == "bench-s5-probe-rotfix-01"
+    )
+
+
+@pytest.mark.parametrize("arm", sorted(set(MATRIX_ARMS) - {"signed-rotation"}))
 def test_round_tag_for_arm_routes_matrix_arms_to_the_matrix_tag(arm):
+    # `signed-rotation` is excluded here -- it has a correction override on
+    # all four tasks (round-tag override design spec) and is covered
+    # separately by
+    # test_round_tag_for_arm_routes_overridden_matrix_arm_to_its_correction_tag
+    # below; every other matrix arm is unchanged.
     for task_name in TASKS:
         assert _round_tag_for_arm(task_name, arm, PROBE_ARMS, REF_ARMS) == _ROUND_TAGS[task_name]
+
+
+def test_round_tag_for_arm_routes_overridden_matrix_arm_to_its_correction_tag():
+    from experiments.benchmark_tasks import BENCH_ARM_ROUND_OVERRIDES
+
+    for task_name, expected_tag in BENCH_ARM_ROUND_OVERRIDES["signed-rotation"].items():
+        assert _round_tag_for_arm(task_name, "signed-rotation", PROBE_ARMS, REF_ARMS) == (
+            expected_tag
+        )
+
+
+def test_round_tag_for_arm_override_first_then_falls_through_to_population_routing():
+    """Write-side resolver contract (design spec section 6): the override
+    map is consulted before probe/ref/matrix routing, for every registered
+    ``(arm, task)`` pair in the source-of-truth map -- not just the two
+    arms this round happens to populate -- so this test still discriminates
+    correctly if the map grows. An arm/task pair absent from the map falls
+    through unchanged to population routing (here, the probe tag)."""
+    from experiments.benchmark_tasks import BENCH_ARM_ROUND_OVERRIDES
+
+    for arm, per_task in BENCH_ARM_ROUND_OVERRIDES.items():
+        for task_name, override_tag in per_task.items():
+            assert _round_tag_for_arm(task_name, arm, PROBE_ARMS, REF_ARMS) == override_tag
+
+    # signed-delta-nh3 has no override entry at all -- falls through to the
+    # ordinary probe-tag routing, proving the override doesn't swallow
+    # arms it was never told about.
+    assert _round_tag_for_arm("s5", "signed-delta-nh3", PROBE_ARMS, REF_ARMS) == "bench-s5-probe-01"
 
 
 def test_round_tag_for_arm_raises_for_probe_arm_on_a_task_with_no_probe_tag():
     # The probe round is S5-only (BENCH_PROBE_ROUND_TAGS has one entry) --
     # a probe arm requested against any other task must fail loud rather
-    # than silently falling back to that task's matrix tag.
+    # than silently falling back to that task's matrix tag. signed-rotation-k5's
+    # override entry only covers s5 (BENCH_ARM_ROUND_OVERRIDES), so mqar/
+    # psmnist/pendulum still have no override and no probe tag -- the raise
+    # is preserved, not weakened, by the override-first check.
     for task_name in ("mqar", "psmnist", "pendulum"):
         with pytest.raises(ValueError, match="no round tag"):
             _round_tag_for_arm(task_name, "signed-rotation-k5", PROBE_ARMS, REF_ARMS)
@@ -426,8 +476,10 @@ def test_cpu_smoke_emits_valid_row_and_touches_no_ledger():
 def test_cpu_smoke_probe_arms_emit_rows_tagged_with_the_probe_round():
     """Task's stated local-smoke verification: `--arms
     signed-rotation-k5 signed-delta-nh3 signed-delta-nh4` on `s5` emits
-    three rows, all tagged `bench-s5-probe-01` -- never the matrix
-    `bench-s5-02` tag."""
+    three rows, never the matrix `bench-s5-02` tag. Per-arm assertion
+    (round-tag override design spec): `signed-rotation-k5` has a
+    correction override for s5 and is tagged `bench-s5-probe-rotfix-01`;
+    the other two probe arms are unchanged at `bench-s5-probe-01`."""
     ledger = _REPO_ROOT / "experiments" / "lab_results.jsonl"
     before = ledger.stat().st_mtime_ns if ledger.exists() else None
 
@@ -467,8 +519,13 @@ def test_cpu_smoke_probe_arms_emit_rows_tagged_with_the_probe_round():
         "signed-delta-nh3",
         "signed-delta-nh4",
     }
+    expected_round_by_variant = {
+        "signed-rotation-k5": "bench-s5-probe-rotfix-01",
+        "signed-delta-nh3": "bench-s5-probe-01",
+        "signed-delta-nh4": "bench-s5-probe-01",
+    }
     for row in rows:
-        assert row["round"] == "bench-s5-probe-01"
+        assert row["round"] == expected_round_by_variant[row["variant"]]
         assert row["task"] == "s5"
         assert row["seed"] == 99
 

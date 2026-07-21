@@ -146,6 +146,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))  # `experiments.*` (namespace package, no __init__.py)
 from experiments.benchmark_tasks import (  # noqa: E402
+    BENCH_ARM_ROUND_OVERRIDES,
     BENCH_PROBE_ROUND_TAGS,
     BENCH_REF_ROUND_TAGS,
     BENCH_ROUND_TAGS,
@@ -178,10 +179,26 @@ _PROBE_ROUND_TAGS: dict[str, str] = BENCH_PROBE_ROUND_TAGS
 # `BENCH_REF_ROUND_TAGS`'s own comment.
 _REF_ROUND_TAGS: dict[str, str] = BENCH_REF_ROUND_TAGS
 
+# Per-arm round-tag correction overrides (design spec, `.claude/output/
+# specs/2026-07-21-round-tag-override-design.md`): the write-side half of
+# the paired override rule -- `scripts/report_benchmarks.py`'s
+# `_source_round_for_arm` is the read-side half, both resolving the same
+# `arm -> {task -> correction round tag}` map so the two paths cannot
+# diverge (spec section 6). Same binding convention as `_ROUND_TAGS`/
+# `_PROBE_ROUND_TAGS`/`_REF_ROUND_TAGS` above: this module owns its own
+# name, bound directly to the single source of truth in
+# `experiments/benchmark_tasks.py`, never a hardcoded copy.
+_ARM_ROUND_OVERRIDES: dict[str, dict[str, str]] = BENCH_ARM_ROUND_OVERRIDES
+
 
 def _round_tag_for_arm(task_name: str, arm: str, probe_arms: dict, ref_arms: dict) -> str:
-    """Ledger ``round`` tag for one ``(task_name, arm)`` cell: the probe
-    tag (``_PROBE_ROUND_TAGS``) when ``arm`` is one of ``probe_arms``
+    """Ledger ``round`` tag for one ``(task_name, arm)`` cell.
+
+    The override map (``_ARM_ROUND_OVERRIDES``) is consulted first: if
+    ``arm`` has a correction tag registered for ``task_name``, that tag
+    wins outright, ahead of every other branch below (spec section 6,
+    "write-side resolver contract"). Otherwise: the probe tag
+    (``_PROBE_ROUND_TAGS``) when ``arm`` is one of ``probe_arms``
     (``experiments.benchmark_lab.PROBE_ARMS``); the reference tag
     (``_REF_ROUND_TAGS``) when ``arm`` is one of ``ref_arms``
     (``experiments.benchmark_lab.REF_ARMS``); else the task's matrix tag
@@ -189,11 +206,14 @@ def _round_tag_for_arm(task_name: str, arm: str, probe_arms: dict, ref_arms: dic
     used. ``probe_arms``/``ref_arms`` are disjoint (a matrix arm is never
     in either), so checking probe membership first is not a priority
     choice, just an arbitrary but stable order. A probe/ref arm requested
-    against a task with no entry in its own round-tag mapping (every task
-    except S5 for probes; every task except psMNIST for refs, per this
-    round's scope) fails loud rather than silently falling back to the
-    matrix tag, which would pollute the clean `-02` matrix population with
-    a differently-configured arm's rows."""
+    against a task with no entry in its own round-tag mapping AND no
+    override entry (every task except S5 for probes; every task except
+    psMNIST for refs, per this round's scope) fails loud rather than
+    silently falling back to the matrix tag, which would pollute the clean
+    `-02` matrix population with a differently-configured arm's rows."""
+    override_tag = _ARM_ROUND_OVERRIDES.get(arm, {}).get(task_name)
+    if override_tag is not None:
+        return override_tag
     if arm in probe_arms:
         if task_name not in _PROBE_ROUND_TAGS:
             raise ValueError(
