@@ -1153,8 +1153,11 @@ def main() -> int:
             try:
                 job = _run(user=owner)
             except Exception as user_exc:
-                print(f"error: teamspace resolution failed as org ({org_exc}) "
-                      f"and as user ({user_exc})", file=sys.stderr)
+                print(
+                    f"error: teamspace resolution failed as org ({org_exc}) "
+                    f"and as user ({user_exc})",
+                    file=sys.stderr,
+                )
                 return 2
     print(f"submitted: {job.name}; waiting...")
     try:
