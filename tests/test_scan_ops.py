@@ -32,7 +32,14 @@ from __future__ import annotations
 import pytest
 import torch
 
-from mingru import linear_scan, matrix_affine_scan, matrix_scan, parallel_scan_log, triton_scans
+from mingru import (
+    DeltaMinGRU,
+    linear_scan,
+    matrix_affine_scan,
+    matrix_scan,
+    parallel_scan_log,
+    triton_scans,
+)
 
 SEED = 42
 
@@ -530,3 +537,382 @@ class TestDeltaBackwardTorchVsEagerAutograd:
             torch.testing.assert_close(
                 got, want, atol=1e-12, rtol=1e-12, msg=f"{name} mismatch vs eager autograd"
             )
+
+
+# ===========================================================================
+# 8. Gated DeltaMinGRU chunked forward (decay active) vs the sequential oracle
+# ===========================================================================
+#
+# ``DeltaMinGRU._forward_chunked_gated`` threads a per-token time-decay gate
+# through the SAME unit-triangular UT solve as ``_forward_chunked`` (spec
+# section 6, log-space decay-ratio form): per chunk it weights the ``T``
+# off-diagonal, the carried-state ``rhs`` term, the readout, and the chunk-end
+# carry by decay RATIOS ``exp(logP_a - logP_b) in (0, 1]`` (never a bare
+# ``1 / Gamma``), so the decay-active forward equals the sequential gated
+# recurrence (``DeltaMinGRU.step`` iterated token-by-token, the Task-2 oracle)
+# regardless of ``chunk_size`` AND stays finite in float32 under strong decay.
+# These CPU fp64 tests are the correctness proof the spec's "Oracle
+# gradcheck"/"Tiling invariance"/"gamma->1 reduction" criteria call for; the
+# float32 tests below pin the "Float32 robustness" criterion. No Triton/CUDA
+# path is exercised (decay is eager-only).
+
+
+def _delta_gated_step_oracle(
+    layer: DeltaMinGRU, x: torch.Tensor, h0_flat: torch.Tensor, dt: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sequential gated oracle: ``DeltaMinGRU.step`` token-by-token.
+
+    Threads ``h_prev`` and the per-token ``delta_t`` column through
+    ``step`` (each call decays the carried state once, then runs the
+    token's ``nh`` micro-steps undecayed), stacking readouts to
+    ``(B, T, hidden_size)`` and returning the final flattened state.
+    ``step`` is ``@torch.no_grad`` (a value oracle only), so this pins
+    the gated forward's *values*; its gradients are pinned by the finite-
+    difference ``gradcheck`` below.
+    """
+    h = h0_flat
+    ys = []
+    for t in range(x.size(1)):
+        y_t, h = layer.step(x[:, t], h_prev=h, delta_t=dt[:, t])
+        ys.append(y_t)
+    return torch.stack(ys, dim=1), h
+
+
+class TestDeltaGatedForwardVsOracle:
+    """CPU fp64 correctness of the gated chunked forward.
+
+    Value-matches the sequential gated ``step`` oracle (ragged final
+    chunk, non-zero ``h_0``, fixed and learnable modes with moderate
+    non-zero ``delta_t``), is invariant to ``chunk_size``, reduces to the
+    ungated ``_forward_chunked`` at ``gamma -> 1``, and its backward
+    passes finite-difference ``gradcheck``.
+    """
+
+    B, D_IN, D_H, N_HEADS = 2, 8, 6, 2
+    # Two full chunks plus a ragged tail at CHUNK_SIZE=4 -> lengths 4, 4, 2.
+    CHUNK_SIZE, T = 4, 10
+
+    def _moderate_dt(self) -> torch.Tensor:
+        """delta_t in a gamma-sensitive mid-range (~0.3-0.9 at decay_rate=0.5).
+
+        NOT large delta_t (gamma -> 0 washes carried memory to ~0 and
+        would mask a real forward/oracle disagreement); NOT zero (that is
+        the separate gamma -> 1 reduction test).
+        """
+        torch.manual_seed(SEED + 7)
+        return (0.2 + 1.4 * torch.rand(self.B, self.T, dtype=torch.float64)).requires_grad_(False)
+
+    @pytest.mark.parametrize("decay", ["fixed", "learnable"])
+    @pytest.mark.parametrize("nh", [1, 2])
+    def test_gated_forward_matches_sequential_oracle(self, decay, nh):
+        torch.manual_seed(SEED)
+        layer = DeltaMinGRU(
+            self.D_IN,
+            self.D_H,
+            n_heads=self.N_HEADS,
+            nh=nh,
+            chunk_size=self.CHUNK_SIZE,
+            decay=decay,
+            decay_rate=0.5,
+        ).double()
+        x = torch.randn(self.B, self.T, self.D_IN, dtype=torch.float64)
+        # Non-zero incoming state.
+        h0 = torch.randn(self.B, 1, layer.n_heads * layer.d_k * layer.d_v, dtype=torch.float64)
+        dt = self._moderate_dt()
+
+        y, hT = layer(x, h_0=h0, delta_t=dt, return_state=True)
+        y_ref, hT_ref = _delta_gated_step_oracle(layer, x, h0.reshape(self.B, -1), dt)
+
+        torch.testing.assert_close(y, y_ref, atol=1e-10, rtol=1e-10)
+        torch.testing.assert_close(hT.reshape(self.B, -1), hT_ref, atol=1e-10, rtol=1e-10)
+
+    @pytest.mark.parametrize("decay", ["fixed", "learnable"])
+    def test_gated_forward_tiling_invariant(self, decay):
+        """Output is independent of chunk_size (single-chunk, exact-multiple,
+        and ragged tilings of the same T all agree to fp64)."""
+        torch.manual_seed(SEED)
+        base = DeltaMinGRU(
+            self.D_IN,
+            self.D_H,
+            n_heads=self.N_HEADS,
+            nh=2,
+            chunk_size=self.T,
+            decay=decay,
+            decay_rate=0.5,
+        ).double()
+        x = torch.randn(self.B, self.T, self.D_IN, dtype=torch.float64)
+        h0 = torch.randn(self.B, 1, base.n_heads * base.d_k * base.d_v, dtype=torch.float64)
+        dt = self._moderate_dt()
+
+        y_single = base(x, h_0=h0, delta_t=dt)
+        for cs in (4, 5):  # 4 -> ragged (4,4,2); 5 -> exact multiple (5,5)
+            base.chunk_size = cs
+            y_cs = base(x, h_0=h0, delta_t=dt)
+            torch.testing.assert_close(y_cs, y_single, atol=1e-10, rtol=1e-10)
+
+    @pytest.mark.parametrize("decay", ["fixed", "learnable"])
+    def test_gamma_one_reduces_to_ungated_forward(self, decay):
+        """delta_t = 0 -> gamma = exp(0) = 1: the gated chunked forward
+        reproduces the decay-free ``_forward_chunked`` output to fp64."""
+        torch.manual_seed(SEED)
+        layer = DeltaMinGRU(
+            self.D_IN,
+            self.D_H,
+            n_heads=self.N_HEADS,
+            nh=2,
+            chunk_size=self.CHUNK_SIZE,
+            decay=decay,
+            decay_rate=0.5,
+        ).double()
+        x = torch.randn(self.B, self.T, self.D_IN, dtype=torch.float64)
+        h0 = torch.randn(self.B, 1, layer.n_heads * layer.d_k * layer.d_v, dtype=torch.float64)
+        H = h0.reshape(self.B, layer.n_heads, layer.d_k, layer.d_v)
+        dt = torch.zeros(self.B, self.T, dtype=torch.float64)
+
+        y_gated, H_gated = layer._forward_chunked_gated(x, H, dt)
+        y_ungated, H_ungated = layer._forward_chunked(x, H)
+        torch.testing.assert_close(y_gated, y_ungated, atol=1e-12, rtol=1e-12)
+        torch.testing.assert_close(H_gated, H_ungated, atol=1e-12, rtol=1e-12)
+
+    @pytest.mark.parametrize("decay", ["fixed", "learnable"])
+    @pytest.mark.parametrize("nh", [1, 2])
+    def test_gated_forward_gradcheck(self, decay, nh):
+        """Finite-difference gradcheck of the gated forward+backward through
+        ``x``, ``h_0``, and ``delta_t`` (moderate non-zero, per-head gate),
+        with a ragged final chunk and non-zero incoming state."""
+        torch.manual_seed(SEED)
+        layer = DeltaMinGRU(
+            self.D_IN,
+            self.D_H,
+            n_heads=self.N_HEADS,
+            nh=nh,
+            chunk_size=self.CHUNK_SIZE,
+            decay=decay,
+            decay_rate=0.5,
+        ).double()
+        x = torch.randn(self.B, self.T, self.D_IN, dtype=torch.float64, requires_grad=True)
+        h0 = torch.randn(
+            self.B,
+            1,
+            layer.n_heads * layer.d_k * layer.d_v,
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        dt = self._moderate_dt().requires_grad_(True)
+
+        def f(x_, h0_, dt_):
+            return layer(x_, h_0=h0_, delta_t=dt_)
+
+        assert torch.autograd.gradcheck(f, (x, h0, dt), atol=1e-6, rtol=1e-4)
+
+    def test_learnable_rho_receives_nonzero_grad(self):
+        """The per-head learnable rate is on the graph: a backward through the
+        gated forward gives ``rho`` a finite, non-zero gradient (pins the
+        per-head ``(n_heads,)`` decay actually drives the output)."""
+        torch.manual_seed(SEED)
+        layer = DeltaMinGRU(
+            self.D_IN,
+            self.D_H,
+            n_heads=self.N_HEADS,
+            nh=2,
+            chunk_size=self.CHUNK_SIZE,
+            decay="learnable",
+            decay_rate=0.5,
+        ).double()
+        x = torch.randn(self.B, self.T, self.D_IN, dtype=torch.float64)
+        dt = self._moderate_dt()
+
+        layer(x, delta_t=dt).pow(2).sum().backward()
+        assert layer.rho.grad is not None
+        assert layer.rho.shape == (self.N_HEADS,)
+        assert torch.isfinite(layer.rho.grad).all()
+        assert layer.rho.grad.abs().sum() > 0
+
+    def test_decay_none_forward_unchanged_and_gradchecks(self):
+        """Guards the untouched decay=None path: ``forward`` still routes to
+        the decay-free ``_forward_chunked`` (byte-equal output) and remains
+        differentiable, unperturbed by the added gated branch."""
+        torch.manual_seed(SEED)
+        layer = DeltaMinGRU(
+            self.D_IN,
+            self.D_H,
+            n_heads=self.N_HEADS,
+            nh=2,
+            chunk_size=self.CHUNK_SIZE,
+        ).double()
+        x = torch.randn(self.B, self.T, self.D_IN, dtype=torch.float64)
+        h0 = torch.randn(self.B, 1, layer.n_heads * layer.d_k * layer.d_v, dtype=torch.float64)
+        H = h0.reshape(self.B, layer.n_heads, layer.d_k, layer.d_v)
+
+        y = layer(x, h_0=h0)
+        y_direct, _ = layer._forward_chunked(x, H)
+        y_direct = layer.out_proj(y_direct.reshape(self.B, self.T, layer.n_heads * layer.d_v))
+        assert torch.equal(y, y_direct)
+
+        x_g = x.clone().requires_grad_(True)
+        h0_g = h0.clone().requires_grad_(True)
+        assert torch.autograd.gradcheck(
+            lambda x_, h0_: layer(x_, h_0=h0_), (x_g, h0_g), atol=1e-6, rtol=1e-4
+        )
+
+
+class TestDeltaGatedForwardFloat32Robustness:
+    """Float32 finiteness of the gated forward under strong / infinite decay.
+
+    The log-space decay-ratio form (spec sections 6/7) keeps every decay
+    factor in ``(0, 1]``, so the forward stays finite in float32 even when
+    the chunk-relative cumulative decay ``Gamma_C`` is far below the
+    float32 subnormal floor -- the regime where the rejected bare
+    ``1 / Gamma`` change-of-variables overflowed to ``nan``. The first
+    test is that regression (it MUST fail on the old ``V / Gamma`` code);
+    the second pins the sanitized ``+inf`` ``delta_t`` cap path against
+    the ``step`` oracle.
+    """
+
+    B, D_IN, D_H, N_HEADS = 2, 8, 6, 2
+    CHUNK_SIZE, T = 64, 96  # T > chunk_size so a full chunk accumulates decay
+
+    def test_float32_strong_decay_is_finite_and_tiling_invariant(self):
+        """At chunk_size=64, decay_rate=1.0, per-token dt ~1.6-2.0 (gamma ~
+        0.13-0.20), the full-chunk product ``Gamma_C ~ exp(-64 * 1.8) ~
+        1e-50`` underflows float32, so a bare ``1 / Gamma`` yields ``inf``
+        -> ``nan``. The decay-ratio form must instead stay finite AND match
+        a smaller-chunk float32 run (tiling invariance in float32)."""
+        torch.manual_seed(SEED)
+        layer = DeltaMinGRU(
+            self.D_IN,
+            self.D_H,
+            n_heads=self.N_HEADS,
+            nh=2,
+            chunk_size=self.CHUNK_SIZE,
+            decay="fixed",
+            decay_rate=1.0,
+        )  # float32 (default dtype)
+        x = torch.randn(self.B, self.T, self.D_IN)
+        torch.manual_seed(SEED + 11)
+        dt = 1.6 + 0.4 * torch.rand(self.B, self.T)  # gamma ~ 0.13-0.20 per token
+
+        y_full = layer(x, delta_t=dt)
+        assert torch.isfinite(y_full).all(), "gated float32 forward produced non-finite output"
+
+        # Tiling invariance in float32: a smaller chunk_size (T not a
+        # multiple -> ragged) must agree within float32 tolerance.
+        layer.chunk_size = 20
+        y_small = layer(x, delta_t=dt)
+        assert torch.isfinite(y_small).all()
+        torch.testing.assert_close(y_full, y_small, atol=1e-4, rtol=1e-4)
+
+    def test_plus_inf_delta_t_matches_step_oracle(self):
+        """A ``+inf`` entry in ``delta_t`` (sanitizer-capped to 1e10) wipes
+        the pre-gap memory (gamma -> exp(-1e10) = 0). The gated forward
+        must stay finite and match the sequential ``step`` oracle to fp64
+        across that gap.
+
+        The gap is placed on a chunk-boundary token (last token of chunk
+        0 at chunk_size=6) so the memory wipe propagates ACROSS the chunk
+        boundary through the carried state (chunk 1 reads a state whose
+        pre-gap content is gone), exercising the cross-chunk path. Aligning
+        it to the boundary also keeps the log-space decay ratios exact: the
+        underflow is a clean ``exp(-1e10) = 0`` and no post-gap token reads
+        back across the cap WITHIN a chunk (which would subtract two
+        ``~ -1e10`` cumulative logs and lose ``~ulp(1e10) ~ 2e-6`` of the
+        recovered per-token decay -- a float64 property of the 1e10 cap
+        magnitude, not of the decay-ratio form, since the ``step`` oracle
+        forms each token's gamma directly and never subtracts near the
+        cap)."""
+        torch.manual_seed(SEED)
+        layer = DeltaMinGRU(
+            self.D_IN,
+            self.D_H,
+            n_heads=self.N_HEADS,
+            nh=2,
+            chunk_size=6,
+            decay="fixed",
+            decay_rate=1.0,
+        ).double()
+        T = 12
+        x = torch.randn(self.B, T, self.D_IN, dtype=torch.float64)
+        h0 = torch.randn(self.B, 1, layer.n_heads * layer.d_k * layer.d_v, dtype=torch.float64)
+        torch.manual_seed(SEED + 13)
+        dt = 0.2 + 0.6 * torch.rand(self.B, T, dtype=torch.float64)
+        dt[:, 5] = float("inf")  # full-decay gap at the chunk-0 boundary (tokens 0..5)
+
+        y, hT = layer(x, h_0=h0, delta_t=dt, return_state=True)
+        assert torch.isfinite(y).all()
+        assert torch.isfinite(hT).all()
+
+        y_ref, hT_ref = _delta_gated_step_oracle(layer, x, h0.reshape(self.B, -1), dt)
+        torch.testing.assert_close(y, y_ref, atol=1e-10, rtol=1e-10)
+        torch.testing.assert_close(hT.reshape(self.B, -1), hT_ref, atol=1e-10, rtol=1e-10)
+
+    def test_mid_chunk_plus_inf_delta_t_is_finite(self):
+        """Sibling of ``test_plus_inf_delta_t_matches_step_oracle`` above,
+        but the ``+inf`` gap sits MID-CHUNK (not on a chunk-boundary token),
+        pinning spec section 7's invariant that output finiteness holds
+        "regardless of +inf gap placement" -- boundary-aligned and
+        interior placements both exercise the same ``exp(logP_a - logP_b)``
+        decay-ratio path, never a bare ``1 / Gamma``.
+
+        Uses ``chunk_size=8``, ``T=20`` so token 10 (the gap) falls inside
+        chunk 1 (tokens 8..15), strictly interior to both its chunk and the
+        sequence.
+
+        Float32 (the training dtype) only needs the primary finiteness
+        invariant. Float64 additionally checks agreement with the
+        sequential ``step`` oracle, but at a LOOSE tolerance: a mid-chunk
+        gap means a later token within the *same* chunk subtracts two
+        cumulative log-decays that are both near the ``-1e10`` sanitizer
+        cap, losing ~``ulp(1e10) ~ 2e-6`` of the recovered per-token decay.
+        That's a float64 cancellation artifact of the 1e10 cap magnitude
+        (the ``step`` oracle never subtracts near the cap since it forms
+        each token's gamma directly), not a defect of the decay-ratio form
+        itself -- so finiteness is asserted tightly and oracle-agreement
+        loosely (atol=1e-5), unlike the boundary-aligned sibling's 1e-10."""
+        CHUNK_SIZE, T = 8, 20
+        MID_CHUNK_TOKEN = 10  # inside chunk 1 (tokens 8..15), not a multiple of CHUNK_SIZE
+
+        # --- float32: primary invariant ---
+        torch.manual_seed(SEED)
+        layer_f32 = DeltaMinGRU(
+            self.D_IN,
+            self.D_H,
+            n_heads=self.N_HEADS,
+            nh=2,
+            chunk_size=CHUNK_SIZE,
+            decay="fixed",
+            decay_rate=1.0,
+        )  # float32 (default dtype)
+        x_f32 = torch.randn(self.B, T, self.D_IN)
+        torch.manual_seed(SEED + 17)
+        dt_f32 = 0.2 + 0.6 * torch.rand(self.B, T)
+        dt_f32[:, MID_CHUNK_TOKEN] = float("inf")
+
+        y_f32 = layer_f32(x_f32, delta_t=dt_f32)
+        assert torch.isfinite(y_f32).all(), "gated float32 forward produced non-finite output"
+
+        # --- float64: finiteness (tight) + oracle agreement (loose) ---
+        torch.manual_seed(SEED)
+        layer_f64 = DeltaMinGRU(
+            self.D_IN,
+            self.D_H,
+            n_heads=self.N_HEADS,
+            nh=2,
+            chunk_size=CHUNK_SIZE,
+            decay="fixed",
+            decay_rate=1.0,
+        ).double()
+        x_f64 = torch.randn(self.B, T, self.D_IN, dtype=torch.float64)
+        h0 = torch.randn(
+            self.B, 1, layer_f64.n_heads * layer_f64.d_k * layer_f64.d_v, dtype=torch.float64
+        )
+        torch.manual_seed(SEED + 17)
+        dt_f64 = 0.2 + 0.6 * torch.rand(self.B, T, dtype=torch.float64)
+        dt_f64[:, MID_CHUNK_TOKEN] = float("inf")
+
+        y, hT = layer_f64(x_f64, h_0=h0, delta_t=dt_f64, return_state=True)
+        assert torch.isfinite(y).all()
+        assert torch.isfinite(hT).all()
+
+        y_ref, hT_ref = _delta_gated_step_oracle(layer_f64, x_f64, h0.reshape(self.B, -1), dt_f64)
+        torch.testing.assert_close(y, y_ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(hT.reshape(self.B, -1), hT_ref, atol=1e-5, rtol=1e-5)

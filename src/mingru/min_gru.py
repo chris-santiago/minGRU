@@ -2773,14 +2773,17 @@ class DeltaMinGRU(DecayMixin, nn.Module):
     tolerance, but close enough to it that the default (not an
     oversized) chunk size is recommended for long sequences.
 
-    Time decay construction is supported (``decay="fixed"``/
-    ``"learnable"``, via the shared ``DecayMixin`` contract -- see
-    ``MinGRU`` for the ``gamma = exp(-lambda * f(delta_t))`` mechanics,
-    one rate per head here), but folding a per-token decay into the
-    delta-rule computation is not yet implemented: ``forward``/``step``
-    construct and accept a paired ``delta_t`` without error, but raise
-    ``NotImplementedError`` when actually called with decay active (a
-    follow-up task lands the gated computation). ``decay=None`` (the
+    Time decay is supported (``decay="fixed"``/``"learnable"``, via the
+    shared ``DecayMixin`` contract -- see ``MinGRU`` for the ``gamma =
+    exp(-lambda * f(delta_t))`` mechanics, one rate per head here). With
+    decay active, the state is gated per token: carried memory is decayed
+    by that token's ``gamma`` once at the token boundary, before the
+    token's ``nh`` micro-steps run undecayed (``step``, spec "Sequential
+    gated recurrence"). The chunked-WY ``forward`` realizes the same
+    gated recurrence in parallel via log-space decay-ratio weighting of
+    the same UT-transform solve (``_forward_chunked_gated``), so it stays
+    tiling-invariant and matches ``step`` token-by-token. The decay-active
+    forward is eager-only (no Triton decay path yet). ``decay=None`` (the
     default) is unaffected: construction, ``forward``, and ``step`` stay
     byte-identical to this mixer before it gained the ``DecayMixin``
     contract.
@@ -2820,10 +2823,9 @@ class DeltaMinGRU(DecayMixin, nn.Module):
         head (``num_channels=n_heads``). ``None`` disables decay:
         ``delta_t`` must then be omitted, and construction/forward/step
         are byte-identical to the module without this feature.
-        Construction with ``"fixed"``/``"learnable"`` is supported now;
-        calling ``forward``/``step`` with decay active currently raises
-        ``NotImplementedError`` (the gated computation lands in a
-        follow-up task).
+        ``"fixed"``/``"learnable"`` activate the per-token gated path in
+        both ``forward`` (parallel, ``_forward_chunked_gated``) and
+        ``step`` (sequential).
     decay_rate : float, default=1.0
         Fixed decay rate, or the learnable rate's init target
         (``softplus(rho) == decay_rate`` at construction); unused when
@@ -2843,10 +2845,6 @@ class DeltaMinGRU(DecayMixin, nn.Module):
         without ``delta_t``, or ``delta_t`` is given without decay
         enabled, or ``h_0``/``h_prev`` has the wrong shape (at call
         time).
-    NotImplementedError
-        If ``forward``/``step`` is called with decay active (a
-        non-``None`` ``delta_t``): the gated computation is not yet
-        implemented (see class docstring).
 
     Notes
     -----
@@ -3131,6 +3129,148 @@ class DeltaMinGRU(DecayMixin, nn.Module):
         y = torch.cat(y_chunks, dim=2).permute(0, 2, 1, 3)  # (B, T, n_heads, d_v)
         return y, H
 
+    def _forward_chunked_gated(
+        self, x: torch.Tensor, H: torch.Tensor, dt: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gated chunked-WY forward: per-token time decay via log-space ratios.
+
+        Threads a per-token time-decay gate through the *same* unit-
+        triangular UT-transform solve as ``_forward_chunked`` (spec
+        section 6 "Parallel gated forward", log-space decay-ratio form).
+        Deliberately mirrors that method's structure -- the ``KK`` /
+        ``strict_lower`` / ``read_mask`` / ``eye_M`` pieces and the
+        ``solve_triangular`` call are the same -- adding only the decay
+        weighting, so the two forwards diff cleanly and the decay-free
+        path stays physically the same code (spec section 8).
+
+        The sequential gated recurrence (``step``'s math) decays carried
+        memory once per token *before* that token's ``nh`` micro-steps
+        run undecayed: ``H_t = gamma_t * A_t H_{t-1} + B_t``, where
+        ``A_t``/``B_t`` are the token's Householder product and writes.
+        With the chunk-relative cumulative log-decay ``logP_t = sum_{s in
+        [start, t]} log gamma_s`` (reset to 0 at each chunk start, so
+        ``P_t = exp(logP_t) in (0, 1]``), decay enters the solve, readout,
+        and carry ONLY as ratios ``exp(logP_a - logP_b)`` with ``a >= b``
+        (exponent ``<= 0``, value in ``(0, 1]``) -- the state is never
+        rescaled by a bare ``1 / Gamma`` (which underflows/overflows to
+        ``nan`` in float32 under strong decay). Concretely, per chunk:
+
+        - the ``T`` off-diagonal ``beta_l (k_l . k_i)`` (``l < i``) is
+          weighted by ``exp(logP_i - logP_l)``;
+        - ``rhs_i = v_i - exp(logP_i) * (K H_0)_i`` (the carried-state
+          term scaled by ``P_i <= 1``; values ``v_i`` are NOT divided), so
+          ``U`` holds the true pseudo-values (not tilde-rescaled);
+        - the readout is ``y_t = exp(logP_t) * (q_t . H_0) + sum_{l <= t}
+          exp(logP_t - logP_l) * beta_l (q_t . k_l) u_l``;
+        - the chunk-end carry is ``H_M = exp(logP_C) * H_0 + sum_l
+          exp(logP_C - logP_l) * beta_l k_l u_l^T`` with ``logP_C`` the
+          full chunk's cumulative log-decay; ``H_M`` carries to the next
+          chunk (whose ``logP`` resets to 0 -- no cross-chunk product).
+
+        Every decay factor is ``exp(<= 0) in (0, 1]``, so no intermediate
+        exceeds the inputs' magnitude and the output is finite in float32
+        across long sequences and strong decay. The unused upper triangle
+        / non-causal region (where the ratio's exponent would be positive)
+        is filled with ``-inf`` BEFORE ``exp`` so it becomes a clean ``0``
+        rather than ``inf`` (a masked ``0 * inf`` would be ``nan``); the
+        used region's genuine ``exp(<= 0)`` values pass through untouched.
+
+        Only permitted division: the ``solve_triangular`` implicit unit
+        diagonal (as in ``_forward_chunked``). Decay carries no division
+        -- it is entirely multiplicative ``exp(<= 0)`` ratios.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input sequence, shape ``(B, T, input_size)``.
+        H : torch.Tensor
+            Initial per-head state, shape ``(B, n_heads, d_k, d_v)``.
+        dt : torch.Tensor
+            Normalized per-token time gaps, shape ``(B, T)`` (the
+            ``_prepare_decay(delta_t, canonical_ndim=2)`` output; decay is
+            active, so this is never ``None``).
+
+        Returns
+        -------
+        tuple of torch.Tensor
+            ``(y, H_T)`` in exactly ``_forward_chunked``'s convention:
+            ``y`` shape ``(B, T, n_heads, d_v)`` (not yet flattened/
+            ``out_proj``-ed), ``H_T`` shape ``(B, n_heads, d_k, d_v)``.
+        """
+        B, T, _ = x.shape
+        nh, n_heads, d_k, d_v = self.nh, self.n_heads, self.d_k, self.d_v
+        q, ks, vs, betas = self._coeffs(x)
+        K_all = torch.stack(ks, dim=2).permute(0, 3, 1, 2, 4)  # (B, n_heads, T, nh, d_k)
+        V_all = torch.stack(vs, dim=2).permute(0, 3, 1, 2, 4)  # (B, n_heads, T, nh, d_v)
+        beta_all = torch.stack(betas, dim=2).permute(0, 3, 1, 2)  # (B, n_heads, T, nh)
+        Q_all = q.permute(0, 2, 1, 3)  # (B, n_heads, T, d_k)
+
+        # Per-token log gamma in (B, H_dim, T) layout so per-chunk slicing
+        # lines up with K_all's (B, n_heads, T, ...) axes. H_dim is 1 for
+        # fixed decay (scalar lambda, broadcasts across heads) or n_heads
+        # for learnable decay (one rate per head). log gamma <= 0 (lambda,
+        # dt >= 0), so all cumulative sums below are non-positive and every
+        # decay ratio exp(diff) with diff <= 0 lies in (0, 1].
+        lam = self._decay_lambda()  # () (fixed) or (n_heads,) (learnable)
+        log_gamma = -lam.reshape(1, -1, 1) * dt.unsqueeze(1)  # (B, H_dim, T)
+
+        chunk_size = self.chunk_size
+        y_chunks = []
+        for start in range(0, T, chunk_size):
+            end = min(start + chunk_size, T)
+            C = end - start
+            M = nh * C
+            K = K_all[:, :, start:end].reshape(B, n_heads, M, d_k)
+            V = V_all[:, :, start:end].reshape(B, n_heads, M, d_v)
+            beta = beta_all[:, :, start:end].reshape(B, n_heads, M)
+            Q = Q_all[:, :, start:end]  # (B, n_heads, C, d_k)
+
+            # Chunk-relative cumulative log-decay logP, reset to 0 at chunk
+            # start (logP_tok[..., 0] = log gamma_start). Per micro-step logP
+            # repeats each token's value nh times along M, matching the
+            # token-major/micro-step-minor axis K/V/beta were reshaped into.
+            logP_tok = torch.cumsum(log_gamma[:, :, start:end], dim=-1)  # (B, H_dim, C)
+            logP_micro = logP_tok.repeat_interleave(nh, dim=-1)  # (B, H_dim, M)
+
+            KK = K @ K.transpose(-1, -2)  # (B, n_heads, M, M); k_i . k_l
+            strict_lower = torch.tril(K.new_ones(M, M), diagonal=-1)
+            eye_M = torch.eye(M, dtype=K.dtype, device=K.device)
+            # Off-diagonal decay ratio exp(logP_i - logP_l) on the strict-
+            # lower (i > l) region, where the exponent is <= 0. Fill the
+            # unused upper triangle + diagonal with -inf BEFORE exp so it is
+            # a clean 0 (a positive exponent there would overflow to inf in
+            # float32, and 0 * inf = nan); the diagonal comes from eye_M.
+            logratio_mm = logP_micro.unsqueeze(-1) - logP_micro.unsqueeze(-2)  # (B, H_dim, M, M)
+            decay_lower = torch.exp(logratio_mm.masked_fill(strict_lower == 0, float("-inf")))
+            T_mat = eye_M + KK * beta.unsqueeze(-2) * decay_lower  # unit lower-triangular
+            # rhs: carried-state term scaled by P_i = exp(logP_i) <= 1;
+            # values V are NOT divided. U holds the true pseudo-values.
+            rhs = V - torch.exp(logP_micro).unsqueeze(-1) * (K @ H)  # (B, n_heads, M, d_v)
+            U = torch.linalg.solve_triangular(T_mat, rhs, upper=False, unitriangular=True)
+
+            R = Q @ K.transpose(-1, -2)  # (B, n_heads, C, M); q_t . k_l
+            read_mask = torch.tril(Q.new_ones(C, C)).repeat_interleave(nh, dim=1)  # (C, M)
+            # Readout decay ratio exp(logP_t - logP_l) on the token-causal
+            # region (l up to token t's last micro-step, exponent <= 0);
+            # non-causal columns masked to -inf -> 0 before exp (same
+            # 0 * inf guard as above).
+            logratio_cm = logP_tok.unsqueeze(-1) - logP_micro.unsqueeze(-2)  # (B, H_dim, C, M)
+            decay_read = torch.exp(logratio_cm.masked_fill(read_mask == 0, float("-inf")))
+            y_chunk = (
+                torch.exp(logP_tok).unsqueeze(-1) * (Q @ H)
+                + (R * beta.unsqueeze(-2) * decay_read) @ U
+            )
+            # Chunk-end carry: full-chunk cumulative logP_C = logP at the
+            # last token (the minimum, so logP_C - logP_l <= 0 for all l).
+            logP_C = logP_tok[:, :, -1:]  # (B, H_dim, 1)
+            decay_carry = torch.exp(logP_C - logP_micro)  # (B, H_dim, M), exponent <= 0
+            P_C = torch.exp(logP_tok[:, :, -1]).unsqueeze(-1).unsqueeze(-1)  # (B, H_dim, 1, 1)
+            H = P_C * H + K.transpose(-1, -2) @ ((decay_carry * beta).unsqueeze(-1) * U)
+            y_chunks.append(y_chunk)
+
+        y = torch.cat(y_chunks, dim=2).permute(0, 2, 1, 3)  # (B, T, n_heads, d_v)
+        return y, H
+
     def forward(
         self,
         x: torch.Tensor,
@@ -3158,12 +3298,12 @@ class DeltaMinGRU(DecayMixin, nn.Module):
             ``(B, T, 1)``; required iff ``decay`` is enabled, following
             the same pairing contract as the other mixers (``ValueError``
             in either direction -- see ``DecayMixin._prepare_decay``).
-            Decay-active construction is supported, but the gated
-            chunked forward itself is not yet implemented: a non-
-            ``None`` ``delta_t`` currently raises
-            ``NotImplementedError`` (a follow-up task lands the
-            computation); ``decay=None`` (the default) runs the
-            unchanged decay-free forward below.
+            When decay is active, a non-``None`` ``delta_t`` routes to
+            the eager gated chunked forward (``_forward_chunked_gated``),
+            which threads the per-token gate through the same UT solve
+            and is tiling-invariant like the decay-free path;
+            ``decay=None`` (the default) runs the unchanged
+            fused-or-eager decay-free forward below.
         return_state : bool, default=False
             If True, also return the final state ``h_T`` (same
             flattened shape as ``h_0``).
@@ -3180,18 +3320,8 @@ class DeltaMinGRU(DecayMixin, nn.Module):
             If ``decay`` is enabled without ``delta_t``, or ``delta_t``
             is given without decay enabled; or if ``h_0``'s shape does
             not match ``(B, 1, n_heads*d_k*d_v)``.
-        NotImplementedError
-            If ``delta_t`` is provided (decay active): the gated
-            chunked forward is not yet implemented.
         """
         dt = self._prepare_decay(delta_t, canonical_ndim=2)
-        if dt is not None:
-            raise NotImplementedError(
-                "DeltaMinGRU(decay=...) constructs, but the gated chunked "
-                "forward is not yet implemented; it lands in a follow-up "
-                "task. Construct with decay=None to use the current "
-                "decay-free forward."
-            )
         B, T, _ = x.shape
         expected = (B, 1, self.n_heads * self.d_k * self.d_v)
         if h_0 is None:
@@ -3200,8 +3330,17 @@ class DeltaMinGRU(DecayMixin, nn.Module):
             if tuple(h_0.shape) != expected:
                 raise ValueError(f"h_0 must have shape {expected} (got {tuple(h_0.shape)})")
             H = h_0.reshape(B, self.n_heads, self.d_k, self.d_v)
-        fused = self._delta_fused_forward(x, H)
-        y, H = fused if fused is not None else self._forward_chunked(x, H)
+        if dt is not None:
+            # Decay active: eager-only gated forward (log-space decay-ratio
+            # weighting of the same UT solve). Triton is decay-free, so the fused
+            # path is intentionally bypassed here (spec section 4; the
+            # MINGRU_SCAN warn-once/fail-loud contract for decay lands in a
+            # follow-up task). decay=None keeps its unchanged fused-or-eager
+            # path below, byte-identical to the recorded delta evidence.
+            y, H = self._forward_chunked_gated(x, H, dt)
+        else:
+            fused = self._delta_fused_forward(x, H)
+            y, H = fused if fused is not None else self._forward_chunked(x, H)
         y = y.reshape(B, T, self.n_heads * self.d_v)
         y = self.out_proj(y)
         if return_state:
@@ -3379,9 +3518,9 @@ class MinGRUBlock(nn.Module):
         ``{"n_heads": 4, "nh": 2}`` for ``"delta"``); pass ``decay``,
         ``decay_rate``, ``log1p_delta`` here to enable time decay (see
         ``MinGRU``/``SignedMinGRU``/``RotationMinGRU``/``GivensMinGRU``;
-        ``DeltaMinGRU`` also constructs with decay enabled, but its
-        ``forward``/``step`` currently raise ``NotImplementedError`` if
-        actually called with decay active -- see its class docstring).
+        ``DeltaMinGRU`` gates its per-head matrix state per token in both
+        ``forward`` and ``step`` when decay is active -- see its class
+        docstring).
 
     Notes
     -----
