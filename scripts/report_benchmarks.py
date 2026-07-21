@@ -477,7 +477,9 @@ def _fisher_vs_reference(arm_reports: dict[str, ArmReport]) -> dict[str, dict[st
 
 
 # ------------------------------------------------------------------ report
-def _arm_round_overrides(task_name: str, arms: Iterable[str], primary_tag: str) -> dict[str, str]:
+def _overridden_arm_sources(
+    task_name: str, arms: Iterable[str], primary_tag: str
+) -> dict[str, str]:
     """``{overridden arm: source round}`` for every arm in ``arms`` whose
     resolved source round (`_source_round_for_arm`) differs from
     ``primary_tag`` -- the disclosure record (design spec §4 "Disclosure",
@@ -517,7 +519,7 @@ def build_task_report(task_name: str, all_rows: list[dict[str, Any]]) -> dict[st
         "arms": {arm: asdict(rep) for arm, rep in arm_reports.items()},
         "fisher_vs_reference": _fisher_vs_reference(arm_reports),
         "stratum_labels": _stratum_labels(all_task_rows),
-        "arm_round_overrides": _arm_round_overrides(task_name, MATRIX_ARMS, primary_tag),
+        "arm_round_overrides": _overridden_arm_sources(task_name, MATRIX_ARMS, primary_tag),
         "env": {
             "torch": torch.__version__,
             "git_commit": git_commit_sha(),
@@ -827,7 +829,7 @@ def _build_population_task_report(
         "robustness_thresholds": list(task.robustness),
         "arms": {arm: asdict(rep) for arm, rep in arm_reports.items()},
         "stratum_labels": _stratum_labels(all_task_rows),
-        "arm_round_overrides": _arm_round_overrides(task_name, pop.arms, primary_tag),
+        "arm_round_overrides": _overridden_arm_sources(task_name, pop.arms, primary_tag),
         "env": {
             "torch": torch.__version__,
             "git_commit": git_commit_sha(),
