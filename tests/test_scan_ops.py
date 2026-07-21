@@ -43,7 +43,16 @@ from mingru import (
     triton_scans,
 )
 
+# The float32-stabilization tests below derive their boundary delta_t values
+# from these constants (not hardcoded magnitudes) so a retune of either
+# fails the binding assertions loudly instead of silently staling a premise.
+from mingru.min_gru import _DECAY_SATURATION_WARN_THRESHOLD, _LOG_GAMMA_FLOAT32_FLOOR
+
 SEED = 42
+
+# All float32-robustness layers below use decay_rate=1.0, so lambda == 1 and
+# lambda*dt == dt: the delta_t thresholds equal the lambda*dt thresholds.
+_FLOOR_MAG = -_LOG_GAMMA_FLOAT32_FLOOR  # |floor| in lambda*dt space (clamp engages above this)
 
 
 # ===========================================================================
@@ -982,7 +991,8 @@ class TestDeltaGatedForwardFloat32Robustness:
         dt_inf = 0.2 + 0.6 * torch.rand(self.B, T)
         dt_inf[:, MID_CHUNK_TOKEN] = float("inf")
         dt_huge = dt_inf.clone()
-        dt_huge[:, MID_CHUNK_TOKEN] = 1e6  # huge but finite -> fix is magnitude-based
+        # huge but FINITE gap (no +inf) -> pins that the fix is magnitude-based
+        dt_huge[:, MID_CHUNK_TOKEN] = 100.0 * _DECAY_SATURATION_WARN_THRESHOLD
 
         def run(chunk_size: int, log1p: bool, dt: torch.Tensor) -> torch.Tensor:
             layer = DeltaMinGRU(
@@ -1086,12 +1096,22 @@ class TestDeltaGatedForwardFloat32Robustness:
         T = 16
         x = torch.randn(self.B, T, self.D_IN)
         torch.manual_seed(SEED + 21)
-        dt_base = 0.2 + 0.6 * torch.rand(self.B, T)  # all lambda*dt < 1 (moderate)
+        dt_base = 0.2 + 0.6 * torch.rand(self.B, T)  # moderate; bound below the clamp floor next
 
-        # (1) Extreme float32 (lambda*dt = 1e5 > 1e4): exactly one warning,
-        # and warn-once across two calls.
+        # The "clamp engages but no warning" band (case 3) only exists if the
+        # clamp floor magnitude sits below the warn threshold. Bind it so a
+        # constant retune that inverts them fails here, not silently.
+        assert _FLOOR_MAG < _DECAY_SATURATION_WARN_THRESHOLD, (
+            "clamp-but-no-warn band is empty: _LOG_GAMMA_FLOAT32_FLOOR magnitude "
+            f"{_FLOOR_MAG} must sit below _DECAY_SATURATION_WARN_THRESHOLD "
+            f"{_DECAY_SATURATION_WARN_THRESHOLD}"
+        )
+        assert dt_base.max().item() < _FLOOR_MAG  # case 2 stays a genuine moderate case
+
+        # (1) Extreme float32 (lambda*dt an order past the warn threshold):
+        # exactly one warning, and warn-once across two calls.
         dt_extreme = dt_base.clone()
-        dt_extreme[:, 10] = 1e5
+        dt_extreme[:, 10] = 10.0 * _DECAY_SATURATION_WARN_THRESHOLD
         layer = self._fresh_layer()
         with warnings.catch_warnings(record=True) as rec:
             warnings.simplefilter("always")
@@ -1102,16 +1122,16 @@ class TestDeltaGatedForwardFloat32Robustness:
             f"per instance; saw {self._count_saturation_warnings(rec)}"
         )
 
-        # (2) Moderate float32 (all lambda*dt < 1e4): no saturation warning.
+        # (2) Moderate float32 (all lambda*dt below the clamp floor): no warning.
         with warnings.catch_warnings(record=True) as rec:
             warnings.simplefilter("always")
             self._fresh_layer()(x, delta_t=dt_base)
         assert self._count_saturation_warnings(rec) == 0
 
-        # (3) Below-threshold but clamp-engaging (lambda*dt = 100 in [88, 1e4]):
-        # the clamp fires but the warning does not.
+        # (3) Below the warn threshold but above the clamp floor (midpoint of the
+        # [floor, warn] band): the clamp fires but the warning does not.
         dt_clamp = dt_base.clone()
-        dt_clamp[:, 10] = 100.0
+        dt_clamp[:, 10] = _FLOOR_MAG + 0.5 * (_DECAY_SATURATION_WARN_THRESHOLD - _FLOOR_MAG)
         with warnings.catch_warnings(record=True) as rec:
             warnings.simplefilter("always")
             self._fresh_layer()(x, delta_t=dt_clamp)
@@ -1137,7 +1157,8 @@ class TestDeltaGatedForwardFloat32Robustness:
         torch.manual_seed(SEED + 23)
         x = torch.randn(self.B, T, self.D_IN)
         dt = 0.2 + 0.6 * torch.rand(self.B, T)
-        dt[:, GAP] = 1e6  # huge finite gap -> clamped gamma = 0
+        # huge finite gap -> clamped gamma = 0 (memory wiped)
+        dt[:, GAP] = 100.0 * _DECAY_SATURATION_WARN_THRESHOLD
 
         layer = self._fresh_layer()
         with warnings.catch_warnings():
