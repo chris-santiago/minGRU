@@ -59,6 +59,7 @@ from experiments.benchmark_lab import (
     REF_ARMS,
 )
 from experiments.benchmark_tasks import (
+    BENCH_ARM_ROUND_OVERRIDES,
     BENCH_PROBE_ROUND_TAGS,
     BENCH_REF_ROUND_TAGS,
     BENCH_ROUND_TAGS,
@@ -88,6 +89,8 @@ write_ref_reports = report_benchmarks.write_ref_reports
 write_probe_reports = report_benchmarks.write_probe_reports
 main = report_benchmarks.main
 _load_all_rows = report_benchmarks._load_all_rows
+_source_round_for_arm = report_benchmarks._source_round_for_arm
+ARM_ROUND_OVERRIDES = report_benchmarks.ARM_ROUND_OVERRIDES
 
 
 def _s5_row(seed: int, arm: str, val128: float, t256: float, t512: float, t1024: float) -> dict:
@@ -716,3 +719,99 @@ def test_main_writes_the_probe_report_alongside_matched_and_ref(tmp_path):
     assert exit_code == 0
     assert (tmp_path / "bench_s5_probe.json").exists()
     assert (tmp_path / "bench_s5_probe.md").exists()
+
+
+# ------------------ 11. round-tag correction override (read-side resolver) --
+# (design spec `.claude/output/specs/2026-07-21-round-tag-override-design
+# .md`, §6 "shared read-side resolver"): `_source_round_for_arm` is the
+# READ half of a paired write/read override rule -- `gpu_benchmark_campaign
+# .py`'s `_round_tag_for_arm` is the WRITE half, both resolving the same
+# `BENCH_ARM_ROUND_OVERRIDES` map with the identical override-first rule.
+# `signed-rotation` (all four matrix tasks) and `signed-rotation-k5` (S5
+# only) are the only two arms populated with a correction tag right now;
+# every other arm/task pair falls through to the primary tag unchanged.
+def test_source_round_for_arm_returns_the_override_tag_when_registered():
+    rotation_tags = BENCH_ARM_ROUND_OVERRIDES["signed-rotation"]
+    k5_tags = BENCH_ARM_ROUND_OVERRIDES["signed-rotation-k5"]
+    assert _source_round_for_arm("s5", "signed-rotation", "primary-tag") == rotation_tags["s5"]
+    assert _source_round_for_arm("mqar", "signed-rotation", "primary-tag") == rotation_tags["mqar"]
+    assert _source_round_for_arm("s5", "signed-rotation-k5", "primary-tag") == k5_tags["s5"]
+    # The override tag must differ from the primary tag passed in, or the
+    # test could pass by coincidence rather than by routing.
+    assert rotation_tags["s5"] != "primary-tag"
+
+
+def test_source_round_for_arm_falls_through_to_primary_tag_when_unregistered():
+    """An arm with no override entry (`log`) and an overridden arm on a
+    task it has no override for (`signed-rotation-k5` on `mqar`, which only
+    has an `s5` entry) both fall through to `primary_tag` unchanged."""
+    assert _source_round_for_arm("s5", "log", "primary-tag") == "primary-tag"
+    assert _source_round_for_arm("mqar", "signed-rotation-k5", "primary-tag") == "primary-tag"
+
+
+def test_source_round_for_arm_empty_override_map_is_behavior_neutral(monkeypatch):
+    """With `ARM_ROUND_OVERRIDES` empty, every `(task, arm)` resolves to
+    `primary_tag` -- the mechanism must be inert until a correction round
+    is declared (spec §6 contract, §7 "empty/absent override is
+    behavior-neutral")."""
+    monkeypatch.setattr(report_benchmarks, "ARM_ROUND_OVERRIDES", {})
+    for task_name, arm in (
+        ("s5", "signed-rotation"),
+        ("mqar", "signed-rotation"),
+        ("psmnist", "signed-rotation"),
+        ("pendulum", "signed-rotation"),
+        ("s5", "signed-rotation-k5"),
+        ("s5", "log"),
+    ):
+        assert _source_round_for_arm(task_name, arm, "primary-tag") == "primary-tag"
+
+
+def test_matrix_report_sources_the_overridden_arm_from_its_correction_tag():
+    """`build_task_report` (the matrix path, primary = `ROUND_TAGS`) must
+    read `signed-rotation`'s rows from its correction tag, not the primary
+    `-02` matrix tag: a row under the correction tag counts, a row for the
+    same arm under the superseded primary tag does not. A same-tag
+    non-overridden arm (`log`) is unaffected by any of this."""
+    corrected = _s5_row(0, "signed-rotation", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)
+    corrected["round"] = BENCH_ARM_ROUND_OVERRIDES["signed-rotation"]["s5"]
+    superseded = _s5_row(1, "signed-rotation", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)
+    superseded["round"] = ROUND_TAGS["s5"]  # old primary tag -- must not count
+    unaffected = _s5_row(0, "log", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)
+
+    report = build_task_report("s5", [corrected, superseded, unaffected])
+
+    assert report["arms"]["signed-rotation"]["seeds_present"] == 1
+    assert report["arms"]["signed-rotation"]["present_seeds"] == [0]
+    assert report["arms"]["log"]["seeds_present"] == 1
+
+
+def test_population_report_sources_the_overridden_probe_arm_from_its_correction_tag():
+    """`build_probe_task_report` (the population path, primary =
+    `PROBE_ROUND_TAGS`) must read `signed-rotation-k5`'s S5 rows from its
+    correction tag, mirroring the matrix-path test above. A same-tag
+    non-overridden probe arm (`signed-delta-nh4`) is unaffected."""
+    corrected = _s5_row(0, "signed-rotation-k5", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)
+    corrected["round"] = BENCH_ARM_ROUND_OVERRIDES["signed-rotation-k5"]["s5"]
+    superseded = _s5_row(1, "signed-rotation-k5", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)
+    superseded["round"] = BENCH_PROBE_ROUND_TAGS["s5"]  # old primary probe tag -- must not count
+    unaffected = _s5_row(0, "signed-delta-nh4", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)
+    unaffected["round"] = BENCH_PROBE_ROUND_TAGS["s5"]
+
+    report = build_probe_task_report("s5", [corrected, superseded, unaffected])
+
+    assert report["arms"]["signed-rotation-k5"]["seeds_present"] == 1
+    assert report["arms"]["signed-rotation-k5"]["present_seeds"] == [0]
+    assert report["arms"]["signed-delta-nh4"]["seeds_present"] == 1
+
+
+def test_probe_raise_contract_still_green_under_the_override_fall_through():
+    """The population raise-for-unregistered-task guard
+    (`_build_population_task_report`) must still run before any override
+    use: `signed-rotation-k5` has no override entry for mqar/psmnist/
+    pendulum, and those tasks have no `PROBE_ROUND_TAGS` entry either, so
+    `build_probe_task_report` must still raise for them (spec §7
+    "fall-through preserves fail-loud"; mirrors the existing test at
+    `test_build_probe_task_report_raises_for_a_task_with_no_probe_round_tag`)."""
+    for task_name in ("mqar", "psmnist", "pendulum"):
+        with pytest.raises(ValueError, match="no PROBE_ARMS round tag"):
+            build_probe_task_report(task_name, [])

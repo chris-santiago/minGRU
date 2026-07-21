@@ -151,6 +151,7 @@ from _bench_env import git_commit_sha  # noqa: E402
 from _evidence_stats import fisher_exact_two_sided  # noqa: E402
 from experiments.benchmark_lab import MATRIX_ARMS, PROBE_ARMS, REF_ARMS, build_model  # noqa: E402
 from experiments.benchmark_tasks import (  # noqa: E402
+    BENCH_ARM_ROUND_OVERRIDES,
     BENCH_PROBE_ROUND_TAGS,
     BENCH_REF_ROUND_TAGS,
     BENCH_ROUND_TAGS,
@@ -186,9 +187,38 @@ REF_ROUND_TAGS: dict[str, str] = BENCH_REF_ROUND_TAGS
 # `scripts/gpu_benchmark_campaign.py`'s round-tag resolution also reads).
 PROBE_ROUND_TAGS: dict[str, str] = BENCH_PROBE_ROUND_TAGS
 
+# Per-arm round-tag correction overrides (design spec, `.claude/output/
+# specs/2026-07-21-round-tag-override-design.md`): the read-side half of
+# the paired override rule -- `scripts/gpu_benchmark_campaign.py`'s
+# `_round_tag_for_arm` is the write-side half, both resolving the same
+# `arm -> {task -> correction round tag}` map so the two paths cannot
+# diverge (spec §6). Same binding convention as `ROUND_TAGS`/`REF_ROUND_TAGS`
+# /`PROBE_ROUND_TAGS` above: this module owns its own name, bound directly
+# to the single source of truth in `experiments/benchmark_tasks.py`, never
+# a hardcoded copy.
+ARM_ROUND_OVERRIDES: dict[str, dict[str, str]] = BENCH_ARM_ROUND_OVERRIDES
+
 # "log as the Fisher reference arm" (spec §4/§8): a family-validation round
 # contrasts every arm against the vanilla minGRU baseline.
 FISHER_REFERENCE_ARM = "log"
+
+
+def _source_round_for_arm(task_name: str, arm: str, primary_tag: str) -> str:
+    """The round tag one arm's rows for ``task_name`` are read from: the
+    arm's correction tag if ``ARM_ROUND_OVERRIDES`` registers one for
+    ``(arm, task_name)``, else ``primary_tag`` unchanged (spec §6, "shared
+    read-side resolver"). The paired write-side half is
+    ``gpu_benchmark_campaign.py``'s ``_round_tag_for_arm``, whose override
+    check is the same ``ARM_ROUND_OVERRIDES.get(arm, {}).get(task_name)``
+    lookup -- the two sides must resolve identically so a correction round
+    is written and read under the same tag. Both ``_rows_for_task`` (primary
+    = the matrix tag) and ``_rows_for_population`` (primary = the
+    population's own tag) call this once per arm rather than inlining the
+    lookup, so the resolution rule cannot drift between the two selectors.
+    With an empty override map this always returns ``primary_tag``
+    (behavior-neutral)."""
+    return ARM_ROUND_OVERRIDES.get(arm, {}).get(task_name, primary_tag)
+
 
 _DIRECTION_CMP: dict[str, Callable[[float, float], bool]] = {"ge": operator.ge, "le": operator.le}
 
@@ -240,15 +270,27 @@ def _rows_for_task(all_rows: list[dict[str, Any]], task_name: str) -> dict[str, 
     the three probe arms as permanently "0/seeds missing" (they write
     under a distinct probe round tag, `BENCH_PROBE_ROUND_TAGS`, never
     this task's `-02` tag, so they can never have rows here regardless).
-    See `experiments.benchmark_lab.PROBE_ARMS`'s own comment."""
-    round_tag = ROUND_TAGS[task_name]
+    See `experiments.benchmark_lab.PROBE_ARMS`'s own comment.
+
+    Each arm's source round is resolved through ``_source_round_for_arm``
+    (primary = the matrix tag, ``ROUND_TAGS[task_name]``): an arm with a
+    registered correction override (e.g. ``signed-rotation``) reads its
+    rows from its override tag instead, while every other arm reads from
+    the matrix tag unchanged -- arm *presence* still comes from iterating
+    ``MATRIX_ARMS``, only the round each arm's rows are drawn from
+    differs."""
+    primary_tag = ROUND_TAGS[task_name]
     by_arm: dict[str, list[dict]] = {arm: [] for arm in MATRIX_ARMS}
+    source_round: dict[str, str] = {
+        arm: _source_round_for_arm(task_name, arm, primary_tag) for arm in MATRIX_ARMS
+    }
     for row in all_rows:
-        if row.get("round") != round_tag or row.get("task") != task_name:
-            continue
         variant = row.get("variant")
-        if variant in by_arm:
-            by_arm[variant].append(row)
+        if variant not in by_arm:
+            continue
+        if row.get("round") != source_round[variant] or row.get("task") != task_name:
+            continue
+        by_arm[variant].append(row)
     return by_arm
 
 
@@ -686,15 +728,29 @@ def _rows_for_population(
     non-matched-population counterpart to `_rows_for_task`. Every
     ``pop.arms`` key is present (possibly with an empty list); a row whose
     ``variant`` isn't a recognized arm for this population is silently
-    dropped, mirroring `_rows_for_task`'s contract."""
-    round_tag = pop.round_tags[task_name]
+    dropped, mirroring `_rows_for_task`'s contract.
+
+    Each arm's source round is resolved through ``_source_round_for_arm``
+    (primary = ``pop.round_tags[task_name]``, the population's own tag):
+    an arm with a registered correction override (e.g.
+    ``signed-rotation-k5`` on ``s5``) reads its rows from its override tag
+    instead, while every other arm in ``pop.arms`` reads from the
+    population tag unchanged -- mirroring `_rows_for_task`'s per-arm
+    resolution. Callers must resolve ``task_name not in pop.round_tags``
+    (the raise-loud guard) before calling this, since ``pop.round_tags
+    [task_name]`` is read as the primary tag here."""
+    primary_tag = pop.round_tags[task_name]
     by_arm: dict[str, list[dict]] = {arm: [] for arm in pop.arms}
+    source_round: dict[str, str] = {
+        arm: _source_round_for_arm(task_name, arm, primary_tag) for arm in pop.arms
+    }
     for row in all_rows:
-        if row.get("round") != round_tag or row.get("task") != task_name:
-            continue
         variant = row.get("variant")
-        if variant in by_arm:
-            by_arm[variant].append(row)
+        if variant not in by_arm:
+            continue
+        if row.get("round") != source_round[variant] or row.get("task") != task_name:
+            continue
+        by_arm[variant].append(row)
     return by_arm
 
 
