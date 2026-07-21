@@ -2919,7 +2919,12 @@ class DeltaMinGRU(DecayMixin, nn.Module):
     log1p_delta : bool, default=False
         If True, ``delta_t`` is passed through ``log1p`` before scaling
         by ``lambda`` (compresses large gaps); unused when
-        ``decay=None``.
+        ``decay=None``. Note: negative/NaN/inf ``delta_t`` entries are
+        always sanitized to finite, non-negative values (with a
+        once-per-instance courtesy warning; CPU only), shared with the
+        other mixers via ``_normalize_delta_t``. See ``forward`` for the
+        additional float32 large-gap saturation clamp/warning specific to
+        the gated delta forward.
 
     Raises
     ------
@@ -3435,6 +3440,18 @@ class DeltaMinGRU(DecayMixin, nn.Module):
             fused-or-eager decay-free forward below, dispatched
             unconditionally through ``_delta_scan_should_try``/
             ``_dispatch_delta_scan`` exactly as before.
+
+            Under float32, a token whose ``lambda * delta_t`` is very
+            large (a raw gap of roughly ``1e4`` or more, or a sanitized
+            ``+inf``) saturates the decay: the gated forward then emits a
+            one-time ``UserWarning`` (CPU only) and internally clamps the
+            per-token log-decay to a float32-safe floor. Output stays
+            finite, tiling-invariant, and oracle-matching -- the affected
+            token's memory is fully wiped, exactly as the sequential
+            ``step`` computes it at ``gamma = 0``. Pass
+            ``log1p_delta=True`` or rescale ``delta_t`` to keep very
+            large gaps distinguishable rather than all saturating to a
+            full wipe. fp64 is unaffected (no clamp, no warning).
         return_state : bool, default=False
             If True, also return the final state ``h_T`` (same
             flattened shape as ``h_0``).

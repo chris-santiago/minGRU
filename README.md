@@ -1138,12 +1138,11 @@ Every mixer above assumes evenly-spaced steps: one update per token,
 no notion of how much real time elapsed between events. `decay=` adds
 an optional per-event forgetting term so a gap between events shrinks
 whatever the recurrence was already going to keep, without touching
-how it injects new information. Available on `MinGRU`, `SignedMinGRU`,
-`RotationMinGRU`, and `GivensMinGRU` alike, and threaded through
-`MinGRUBlock` / `MinGRUStack`. `DeltaMinGRU` is the exception: it
-accepts the decay kwargs for signature uniformity but rejects any
-`decay` other than `None` with a `ValueError` (folding per-token decay
-into the delta-rule composition is unimplemented).
+how it injects new information. Available on all five mixers, and threaded through
+`MinGRUBlock` / `MinGRUStack`. `DeltaMinGRU` supports it with a
+distinct mechanism: it gates its carried matrix state once per token
+rather than scaling a per-step transition (see the `DeltaMinGRU`
+bullet under "Mechanism" below, and the float32 note further down).
 
 What follows works mechanism-first: the transition math and the
 `delta_t` contract below, then two experiments — a channel ablation
@@ -1174,6 +1173,15 @@ decayed, in every mixer:
   `RotationMinGRU` — a scalar `gamma` commutes with the orthogonal block
   action, so the composed rotation is recovered unchanged from the
   decayed matrix; only amplitude fades.
+- `DeltaMinGRU` (matrix state, distinct form): rather than scaling a
+  per-step transition coefficient, `gamma` gates the carried per-head
+  matrix state once at each token boundary — `H <- gamma * H` before
+  that token's `nh` undecayed Householder writes — so older memory
+  fades while the token's own writes are undamped. The chunked-WY
+  parallel `forward` reproduces this exactly via a log-space
+  decay-ratio change of variables, so `decay=None` is bit-identical and
+  the decay-active path is eager-only. See the float32 note below for
+  behavior under very large or `+inf` gaps.
 
 Because `lambda >= 0` and `delta_t >= 0`, `gamma` is always in `(0,
 1]` — decay can only shrink the transition, never amplify it.
