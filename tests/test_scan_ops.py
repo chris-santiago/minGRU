@@ -857,17 +857,25 @@ class TestDeltaGatedForwardFloat32Robustness:
         chunk 1 (tokens 8..15), strictly interior to both its chunk and the
         sequence.
 
-        Float32 (the training dtype) only needs the primary finiteness
-        invariant. Float64 additionally checks agreement with the
-        sequential ``step`` oracle, but at a LOOSE tolerance: a mid-chunk
-        gap means a later token within the *same* chunk subtracts two
-        cumulative log-decays that are both near the ``-1e10`` sanitizer
-        cap, losing ~``ulp(1e10) ~ 2e-6`` of the recovered per-token decay.
-        That's a float64 cancellation artifact of the 1e10 cap magnitude
-        (the ``step`` oracle never subtracts near the cap since it forms
-        each token's gamma directly), not a defect of the decay-ratio form
-        itself -- so finiteness is asserted tightly and oracle-agreement
-        loosely (atol=1e-5), unlike the boundary-aligned sibling's 1e-10."""
+        This test asserts only FINITENESS in float32. Float32 mid-chunk
+        ``+inf`` (or any raw gap >~ 1e6) is finite but NOT tiling-invariant
+        or oracle-matching without ``log1p_delta``: the ``+inf`` sanitizes to
+        the frozen cap ``1e10``, and in float32 ``ulp(1e10) ~ 1e3`` swamps a
+        normal per-token ``log_gamma ~ -0.5``, so post-gap tokens within the
+        *same* chunk collapse onto one ``-1e10`` plateau and lose their
+        relative decay (error ~0.1--0.5 abs, chunk-size dependent). Pre-gap
+        memory is still wiped correctly, so output stays finite. See
+        ``test_mid_chunk_plus_inf_float32_tiling_needs_log1p`` below, which
+        pins both that limitation and its ``log1p_delta`` mitigation.
+
+        Float64 additionally checks agreement with the sequential ``step``
+        oracle, but at a LOOSE tolerance (atol=1e-5): even in float64 a later
+        token within the same chunk subtracts two cumulative log-decays both
+        near the ``-1e10`` cap, losing ~``ulp(1e10) ~ 2e-6`` -- a cap-magnitude
+        cancellation artifact (the ``step`` oracle forms each token's gamma
+        directly and never subtracts near the cap), not a defect of the
+        decay-ratio form. So finiteness is asserted tightly and oracle-
+        agreement loosely, unlike the boundary-aligned sibling's 1e-10."""
         CHUNK_SIZE, T = 8, 20
         MID_CHUNK_TOKEN = 10  # inside chunk 1 (tokens 8..15), not a multiple of CHUNK_SIZE
 
@@ -916,3 +924,84 @@ class TestDeltaGatedForwardFloat32Robustness:
         y_ref, hT_ref = _delta_gated_step_oracle(layer_f64, x_f64, h0.reshape(self.B, -1), dt_f64)
         torch.testing.assert_close(y, y_ref, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(hT.reshape(self.B, -1), hT_ref, atol=1e-5, rtol=1e-5)
+
+    def test_mid_chunk_plus_inf_float32_tiling_needs_log1p(self):
+        """Pin the known float32 boundary: a mid-chunk ``+inf`` (or huge raw)
+        ``delta_t`` breaks tiling-invariance in float32 UNLESS ``log1p_delta``.
+
+        A ``+inf`` gap sanitizes to the frozen ``_DELTA_T_POSINF_CAP=1e10``, so
+        ``log_gamma = -lambda * 1e10 ~ -1e10``. In float32, ``ulp(1e10) ~ 1e3``
+        swamps a normal per-token ``log_gamma ~ -0.5``, so post-gap tokens
+        within the *same* chunk collapse onto one ``-1e10`` plateau and lose
+        their relative decay: ``exp(logP_a - logP_b)`` rounds to 1 where the
+        true ratio is < 1. Output stays finite (pre-gap memory is wiped
+        correctly) but becomes chunk-size dependent -- tiling-invariance and
+        step-oracle agreement fail by ~0.1--0.5 absolute. ``log1p_delta=True``
+        maps the gap through ``log1p`` first (``1e10 -> ~23``), keeping ``logP``
+        in a float32-precise range, which restores exact tiling-invariance;
+        this is the documented mitigation for gaps spanning orders of magnitude
+        (README "Time-aware decay"). This test pins BOTH the limitation and its
+        fix so neither can silently change -- a future numerical fix (e.g. a
+        full-decay-boundary sub-chunk reset) would intentionally update the
+        ``> 1e-2`` assertion below.
+
+        Because the cap magnitude is a frozen constant, documentation + this
+        regression guard is the proportionate response (a code fix would need
+        the owner to unfreeze ``_DELTA_T_POSINF_CAP``).
+        """
+        CHUNK_A, CHUNK_B, T, MID_CHUNK_TOKEN = 4, 16, 16, 10
+
+        # One set of weights, reloaded into every (chunk_size, log1p_delta)
+        # variant, so any output difference is purely the tiling/log1p effect.
+        torch.manual_seed(SEED)
+        ref = DeltaMinGRU(
+            self.D_IN,
+            self.D_H,
+            n_heads=self.N_HEADS,
+            nh=1,
+            chunk_size=CHUNK_A,
+            decay="fixed",
+            decay_rate=1.0,
+        )
+        state = ref.state_dict()
+        x = torch.randn(self.B, T, self.D_IN)
+        torch.manual_seed(SEED + 17)
+        dt = 0.2 + 0.6 * torch.rand(self.B, T)
+        dt[:, MID_CHUNK_TOKEN] = float("inf")
+
+        def run(chunk_size: int, log1p: bool) -> torch.Tensor:
+            layer = DeltaMinGRU(
+                self.D_IN,
+                self.D_H,
+                n_heads=self.N_HEADS,
+                nh=1,
+                chunk_size=chunk_size,
+                decay="fixed",
+                decay_rate=1.0,
+                log1p_delta=log1p,
+            )
+            layer.load_state_dict(state)
+            return layer(x, delta_t=dt)
+
+        # Finiteness holds regardless (the spec section 7 safety invariant).
+        for chunk_size in (CHUNK_A, CHUNK_B):
+            for log1p in (False, True):
+                assert torch.isfinite(run(chunk_size, log1p)).all(), (
+                    f"float32 mid-chunk +inf must stay finite (chunk={chunk_size}, log1p={log1p})"
+                )
+
+        # Without log1p: the limitation is real -- float32 tiling-invariance
+        # is lost by a wide margin (pinned so it cannot silently widen, and so
+        # a future numerical fix must consciously retire this assertion).
+        tiling_err_raw = (run(CHUNK_A, log1p=False) - run(CHUNK_B, log1p=False)).abs().max()
+        assert tiling_err_raw > 1e-2, (
+            "expected float32 mid-chunk +inf to VIOLATE tiling-invariance without "
+            f"log1p_delta (known cap-magnitude limitation); got {tiling_err_raw:.3e}"
+        )
+
+        # With log1p_delta: the documented mitigation restores tiling-invariance.
+        tiling_err_log1p = (run(CHUNK_A, log1p=True) - run(CHUNK_B, log1p=True)).abs().max()
+        assert tiling_err_log1p < 1e-4, (
+            "log1p_delta=True must restore float32 tiling-invariance for a "
+            f"mid-chunk +inf gap; got {tiling_err_log1p:.3e}"
+        )

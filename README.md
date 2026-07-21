@@ -1191,9 +1191,17 @@ error; the check runs on CPU tensors only — on CUDA it is skipped
 rather than forcing a host sync, though the clamp always applies).
 `log1p_delta=True` applies `log1p` before scaling by `lambda`
 — useful when raw gaps span orders of magnitude, compressing the
-range `lambda` needs to operate over. Passing `delta_t` with decay
-disabled, or enabling decay without passing `delta_t`, both raise
-`ValueError` at call time.
+range `lambda` needs to operate over. For `DeltaMinGRU` under
+float32, `log1p_delta=True` is *required* when raw gaps can be very
+large or `+inf` (sentinel or corrupted timestamps): its chunked
+forward carries a per-token cumulative log-decay, and an
+uncompressed gap near the `1e10` `+inf`-sanitizer cap loses float32
+precision for tokens sharing a chunk with the gap — output stays
+finite but is no longer chunk-size invariant. `log1p` keeps that
+range float32-safe; the other four mixers apply decay per step with
+no chunk-cumulative log and are unaffected. Passing `delta_t` with
+decay disabled, or enabling decay without passing `delta_t`, both
+raise `ValueError` at call time.
 
 **Two modes**, set via `decay=`:
 
