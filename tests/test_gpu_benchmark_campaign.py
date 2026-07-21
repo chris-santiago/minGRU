@@ -69,6 +69,19 @@ _round_tag_for_arm = gpu_benchmark_campaign._round_tag_for_arm
 _run_selftest_gate = gpu_benchmark_campaign._run_selftest_gate
 _run_arm_kwargs = gpu_benchmark_campaign._run_arm_kwargs
 
+# `scripts/report_benchmarks.py`'s read-side resolver, loaded the same way
+# `tests/test_report_benchmarks.py` loads its own script module -- needed
+# here for the write/read resolver cross-check below
+# (test_round_tag_for_arm_matches_source_round_for_arm_for_every_override_entry).
+_REPORT_SCRIPT_PATH = _REPO_ROOT / "scripts" / "report_benchmarks.py"
+_report_spec = importlib.util.spec_from_file_location("report_benchmarks", _REPORT_SCRIPT_PATH)
+assert _report_spec is not None and _report_spec.loader is not None
+report_benchmarks = importlib.util.module_from_spec(_report_spec)
+sys.modules.setdefault("report_benchmarks", report_benchmarks)
+_report_spec.loader.exec_module(report_benchmarks)
+
+_source_round_for_arm = report_benchmarks._source_round_for_arm
+
 
 # --- round tags: Global Constraints exactness ------------------------------
 
@@ -160,6 +173,32 @@ def test_round_tag_for_arm_override_first_then_falls_through_to_population_routi
     # ordinary probe-tag routing, proving the override doesn't swallow
     # arms it was never told about.
     assert _round_tag_for_arm("s5", "signed-delta-nh3", PROBE_ARMS, REF_ARMS) == "bench-s5-probe-01"
+
+
+def test_round_tag_for_arm_matches_source_round_for_arm_for_every_override_entry():
+    """Cross-check the paired write/read resolvers (round-tag override
+    design spec section 6): the write-side `_round_tag_for_arm` (this
+    module) and the read-side `report_benchmarks._source_round_for_arm`
+    both consult the same `BENCH_ARM_ROUND_OVERRIDES` map, but the
+    override-first lookup RULE is implemented twice -- only the data is
+    shared, so nothing before this test asserted the two paths actually
+    agree. For every populated (arm, task) entry, both resolvers must
+    return the map's own registered tag.
+
+    `primary_tag` is a stand-in deliberately distinct from every override
+    tag: if either resolver ignored the override and fell through to its
+    "no override" branch, it would return `primary_tag` (or, on the write
+    side, a different population tag) instead of the override tag, and the
+    equality below would fail -- this is what makes the test discriminate
+    rather than trivially pass."""
+    from experiments.benchmark_tasks import BENCH_ARM_ROUND_OVERRIDES
+
+    primary_tag = "not-a-real-override-tag"
+    for arm, per_task in BENCH_ARM_ROUND_OVERRIDES.items():
+        for task_name, override_tag in per_task.items():
+            write_side = _round_tag_for_arm(task_name, arm, PROBE_ARMS, REF_ARMS)
+            read_side = _source_round_for_arm(task_name, arm, primary_tag)
+            assert write_side == read_side == override_tag
 
 
 def test_round_tag_for_arm_raises_for_probe_arm_on_a_task_with_no_probe_tag():

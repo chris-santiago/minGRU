@@ -107,7 +107,14 @@ from experiments.benchmark_lab import (
     build_model,
     run_arm,
 )
-from experiments.benchmark_tasks import TASKS, Budget, EvalConfig, TaskSpec, make_mqar
+from experiments.benchmark_tasks import (
+    BENCH_ARM_ROUND_OVERRIDES,
+    TASKS,
+    Budget,
+    EvalConfig,
+    TaskSpec,
+    make_mqar,
+)
 
 SEED = 0
 
@@ -1185,6 +1192,24 @@ def test_gru_large_forward_backward_smoke_regression_pendulum():
     loss, _, _ = _forward_regression(model, x, dt, y, "gru-large")
     loss.backward()
     _assert_gradients_flow(model)
+
+
+# --------------------------------------- BENCH_ARM_ROUND_OVERRIDES integrity
+def test_bench_arm_round_overrides_keys_are_registered_arms_and_tasks():
+    """Referential integrity of the per-arm round-tag correction map
+    (`experiments.benchmark_tasks.BENCH_ARM_ROUND_OVERRIDES`): a typo'd arm
+    key (e.g. "signed-rotaton") or task key would be a silent no-op -- the
+    arm would keep writing/reading under its population tag, quietly
+    polluting the closed round the override exists to protect. Derived
+    set-subset assertions against the live registries, not a hardcoded
+    literal mirror of the map's current populated contents (that exact-value
+    pin already exists, `test_gpu_check.py::
+    test_benchmarks_rounds_also_accepts_the_override_rounds`) -- this test
+    still catches a typo'd key even if the map's populated arms/tasks
+    change."""
+    assert set(BENCH_ARM_ROUND_OVERRIDES) <= set(ARM_REGISTRY)
+    for per_task_tags in BENCH_ARM_ROUND_OVERRIDES.values():
+        assert set(per_task_tags) <= set(TASKS)
 
 
 # ------------------------------------------------------ TaskSpec singletons
