@@ -39,7 +39,7 @@ other eight additionally need Triton, per above).
 from .min_gru import *  # noqa: F401,F403 -- eager public API re-export
 from .min_gru import __all__ as _min_gru_all
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # Names of :mod:`mingru.triton_scans` reachable lazily via `__getattr__`,
 # listed statically so resolving this tuple need not import the Triton module
