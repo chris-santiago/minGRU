@@ -384,8 +384,10 @@ def test_param_counts_are_positive_and_vary_by_task_and_arm():
 
 
 def test_delta_arm_excludes_decay_wiring_on_pendulum():
-    # DeltaMinGRU rejects decay/delta_t unconditionally (frozen contract);
-    # the other four (decay-capable) arms get extra DecayMixin parameters
+    # DeltaMinGRU now supports decay (Gated-DeltaNet-style), but the delta
+    # benchmark arm is deliberately excluded from the decay-capable set here
+    # (decay-arm benchmark evidence is a deferred round); the other four
+    # (decay-capable) arms get extra DecayMixin parameters
     # for the pendulum task specifically. This is an existing
     # `build_model`/`DECAY_CAPABLE_ARMS` invariant this report's param
     # counts must reflect, not something this test invents.

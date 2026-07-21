@@ -15,10 +15,9 @@ non-commuting state via rotations across 8-dimensional blocks instead of
 updated by the delta rule — the most reliably trainable composer measured,
 and the recommended default when per-token state is free to grow). All
 five share one `mixer=` interface on `MinGRUBlock`/`MinGRUStack`, and all
-but `DeltaMinGRU` optionally accept a time-aware decay term for
+five optionally accept a time-aware decay term for
 irregularly-spaced sequences — a real-world gap between events, not just
-a token count (see "Time-aware decay," below; `DeltaMinGRU` rejects
-`decay` by contract). What each variant actually buys you, in measured
+a token count (see "Time-aware decay," below). What each variant actually buys you, in measured
 accuracy, is below.
 
 ## Install
@@ -232,7 +231,7 @@ the "vanilla" minGRU in the paper's Appendix A.
 | `SignedMinGRU` | signed diagonal transitions (linear-space scan, `a_t ∈ (−1,1)`, unconstrained states); `coupled=False` (default, decoupled eigenvalue) or `coupled=True` (legacy reproduction); same API; same time-decay kwargs as `MinGRU` |
 | `RotationMinGRU` | 2x2 block rotation transitions (non-diagonal, matrix scan); `snap` grid manufactures exact-angle attractors; depth is a measured tradeoff, not a fixed limit (see "Rotation variant"); same API; same time-decay kwargs, scaling the whole 2x2 block (direction unaffected) |
 | `GivensMinGRU` | k-dim block-rotation transitions (non-diagonal, `matrix_affine_scan`); each transition is a product of `rounds` brick-wall Givens layers per `block_size`-dim block, special-orthogonal and continuous (no snap) — richer per-token maps than `RotationMinGRU`'s 2x2 at the same per-token state (see "Givens variant"); same API; same time-decay kwargs, scaling the whole block by a scalar (rotation unaffected) |
-| `DeltaMinGRU` | DeltaNet/DeltaProduct delta-rule mixer (`mixer="delta"`): per-head `d_k×d_v` associative-memory matrix state updated by `nh` generalized-Householder rank-1 corrections per token (kwargs `n_heads`, `nh`, `d_k`, `d_v`); parallel chunked-WY `forward` (`chunk_size` is a performance-only knob — results invariant), sequential `step` returns `(y_t, h_t)` since readout ≠ state (`carries_matrix_state=True`); state flattened `(B, n_heads·d_k·d_v)`, zero-init (no learned `h_0`); time-decay unsupported: `decay=` must be `None` and any `delta_t` raises `ValueError` — see "Measured CPU cost" under "Givens variant" for the measured step cost |
+| `DeltaMinGRU` | DeltaNet/DeltaProduct delta-rule mixer (`mixer="delta"`): per-head `d_k×d_v` associative-memory matrix state updated by `nh` generalized-Householder rank-1 corrections per token (kwargs `n_heads`, `nh`, `d_k`, `d_v`); parallel chunked-WY `forward` (`chunk_size` is a performance-only knob — results invariant), sequential `step` returns `(y_t, h_t)` since readout ≠ state (`carries_matrix_state=True`); state flattened `(B, n_heads·d_k·d_v)`, zero-init (no learned `h_0`); time-decay supported (Gated-DeltaNet-style per-token per-head scalar gate; the chunked-WY parallel `forward` is preserved via a decay-ratio change of variables, so `decay=None` stays bit-identical; decay-active forward is eager-only, `torch.compile` for CUDA) — see "Measured CPU cost" under "Givens variant" for the measured step cost |
 | `linear_scan` | Hillis–Steele associative scan for `h_t = a_t·h_{t−1} + b_t` with signed scalar coefficients |
 | `matrix_scan` | Hillis–Steele associative scan for `h_t = M_t @ h_{t−1} + b_t` with 2x2 matrix coefficients (non-commutative composition) |
 | `matrix_affine_scan` | Hillis–Steele associative scan for `h_t = M_t @ h_{t−1} + b_t` with k×k matrix coefficients (the `block_size` generalization of `matrix_scan`, used by `GivensMinGRU`) |
