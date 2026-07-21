@@ -414,9 +414,7 @@ class TestDeltaMinGRU:
         decay=None, so this must hold by construction; this test proves
         it rather than asserting it by argument.
         """
-        fixture = json.loads(
-            (FIXTURES_DIR / "delta_mingru_decay_none_golden.json").read_text()
-        )
+        fixture = json.loads((FIXTURES_DIR / "delta_mingru_decay_none_golden.json").read_text())
         torch.manual_seed(fixture["seed"])
         layer = DeltaMinGRU(
             fixture["D_IN"], fixture["D_H"], n_heads=fixture["n_heads"], nh=fixture["nh"]
