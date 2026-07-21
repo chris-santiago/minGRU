@@ -13,7 +13,7 @@ Task x arm matrix (spec section 1/6)
 Four tasks (``s5``, ``mqar``, ``psmnist``, ``pendulum``), each run by
 default against ``experiments/benchmark_lab.py``'s ``MATRIX_ARMS`` (spec
 section 6 "Arms" fixed ``log``/``signed``/``rotation``/``givens``/
-``delta``; ``rotation-hetero`` was added by amendment, six total; a second
+``delta``; ``signed-rotation`` was added by amendment, six total; a second
 amendment then added ``signed-givens``/``signed-delta``, eight total --
 every matrix arm runs on all four tasks, no per-task arm subset). Unlike
 the GPU 36-seed round's ``gpu_hetero_campaign.py``,
@@ -22,11 +22,11 @@ no arm here forces a distinct backend (no per-arm ``MINGRU_SCAN``/
 ``--device`` this invocation was given; the round's Global Constraints fix
 the training budget per task, not a per-arm backend.
 
-A third amendment (2026-07-20) added ``PROBE_ARMS`` (``rotation-hetero-k5``,
+A third amendment (2026-07-20) added ``PROBE_ARMS`` (``signed-rotation-k5``,
 ``signed-delta-nh3``, ``signed-delta-nh4``) -- an S5-only follow-up probe,
 selectable via ``ARM_REGISTRY`` (``MATRIX_ARMS`` union ``PROBE_ARMS``) but
 NOT in the default ``--arms`` list: probe arms run only when named
-explicitly (e.g. ``--arms rotation-hetero-k5 signed-delta-nh3
+explicitly (e.g. ``--arms signed-rotation-k5 signed-delta-nh3
 signed-delta-nh4``).
 
 A fourth amendment (2026-07-20, "standard GRU control arm") added ``gru``
@@ -469,8 +469,8 @@ def main(argv: list[str] | None = None) -> int:
         choices=sorted(benchmark_lab.ARM_REGISTRY),
         default=list(benchmark_lab.MATRIX_ARMS),
         help="arm subset (default: the nine MATRIX_ARMS -- "
-        "log/signed/rotation/rotation-hetero/givens/delta/signed-givens/signed-delta/gru; "
-        "the three S5-only PROBE_ARMS -- rotation-hetero-k5/signed-delta-nh3/"
+        "log/signed/rotation/signed-rotation/givens/delta/signed-givens/signed-delta/gru; "
+        "the three S5-only PROBE_ARMS -- signed-rotation-k5/signed-delta-nh3/"
         "signed-delta-nh4 -- and the psMNIST-only REF_ARMS grounding reference "
         "-- gru-large -- are choosable but never run unless named explicitly, "
         "and write under their own bench-s5-probe-01 / bench-psmnist-ref-01 "

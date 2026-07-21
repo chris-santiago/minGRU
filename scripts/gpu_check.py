@@ -82,7 +82,7 @@ Job modes (``--job``, default ``check``, existing invocations unaffected):
   Runs ``scripts/gpu_benchmark_campaign.py`` instead: the four-task x
   six-arm benchmark validation round (S5, MQAR, psMNIST, pendulum -- see
   ``.claude/output/specs/2026-07-19-benchmark-round-design.md`` sections 4
-  and 6, plus the amended sixth ``rotation-hetero`` arm recorded in the
+  and 6, plus the amended sixth ``signed-rotation`` arm recorded in the
   intent ledger's Amendments). Same clone/checkout/triton-install preamble
   as ``hetero36``, plus a ``torchvision`` install (psMNIST downloads MNIST
   inside the job -- see ``build_benchmarks_command``) and an

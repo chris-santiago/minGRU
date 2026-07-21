@@ -25,10 +25,12 @@ Sections
    row around the sentinel metric when no checkpoint was ever selected
    (step-based: `eval_every` never divides a step in `[1, steps]`;
    epoch-based: `epochs=0`).
-7. `rotation-hetero` arm (evidence-phase-gate amendment) -- registered as a
-   `["rotation", "signed"]` hetero stack (mirroring probes.py's
-   `minGRU-hetero-rs`), this repo's evidenced fix for rotation-stack STE
-   compounding (not a snap on/off comparison -- both arms' rotation block
+7. `signed-rotation` arm (evidence-phase-gate amendment) -- registered as a
+   `["signed", "rotation"]` hetero stack (mirroring probes.py's
+   `minGRU-hetero-sr`), this repo's evidenced fix for rotation-stack STE
+   compounding, in the signed-first (extract-then-compose) block order
+   shared with the `signed-givens`/`signed-delta` siblings (not a snap
+   on/off comparison -- both arms' rotation block
    snaps identically by default). It avoids `MinGRUStack`'s multi-rotation
    `UserWarning` (unlike `rotation`, unchanged, which still emits it),
    excludes pendulum decay wiring (mirrors `delta`'s feature-channel-only
@@ -40,9 +42,9 @@ Sections
    evidenced as `hetero_lab.py`'s `hetero-pg8`; and `hetero_lab.py`'s
    `hetero-pd1024` at the delta mechanism's native config), run on ALL
    FOUR tasks like every other arm (no per-task arm subset exists).
-   Neither is decay-capable, mirroring `rotation-hetero`'s treatment.
+   Neither is decay-capable, mirroring `signed-rotation`'s treatment.
 9. `PROBE_ARMS` (third amendment, S5-only follow-up probe) --
-   `rotation-hetero-k5` (the `rotation-hetero` stack with the rotation
+   `signed-rotation-k5` (the `signed-rotation` stack with the rotation
    block's snap grid widened to `(2, 3, 4, 5, 6)`, K=5 included; `signed`
    block untouched) and `signed-delta-nh3`/`signed-delta-nh4` (the
    `signed-delta` stack with the delta block's `nh` raised from this
@@ -519,33 +521,35 @@ def test_run_arm_raises_on_epoch_based_task_with_zero_epochs():
         )
 
 
-# ----------------------------------------------- 7. rotation-hetero arm (amendment)
-def test_rotation_hetero_arm_registered_as_rotation_signed_hetero_stack():
-    """`rotation-hetero` (evidence-phase-gate amendment, sixth arm) is a
-    single `"rotation"` block (default snap grid) composed with a single
-    `"signed"` block, `mixer_kwargs=None` -- byte-identical to probes.py's
-    `MIXER_REGISTRY["minGRU-hetero-rs"]`, this repo's evidenced fix for
-    rotation-stack STE compounding. A same-type second `"rotation"`
-    reading was tried first and rejected: it would be architecturally
-    identical to the existing `rotation` arm (same param count, same
-    per-seed training trajectory -- RotationMinGRU's `snap` is a
-    registered buffer, not a parameter, and `mixer_kwargs={}` already
-    resolves to the class's own default snap grid), caught by
+# ----------------------------------------------- 7. signed-rotation arm (amendment)
+def test_signed_rotation_arm_registered_as_signed_rotation_hetero_stack():
+    """`signed-rotation` (evidence-phase-gate amendment, sixth arm) is a
+    single `"signed"` block composed with a single `"rotation"` block
+    (default snap grid), `mixer_kwargs=None` -- byte-identical to probes.py's
+    `MIXER_REGISTRY["minGRU-hetero-sr"]`, this repo's evidenced fix for
+    rotation-stack STE compounding, in the signed-first (extract-then-
+    compose) block order shared with the sibling arms `signed-givens` and
+    `signed-delta`. A same-type second `"rotation"` reading was tried
+    first and rejected: it would be architecturally identical to the
+    existing `rotation` arm (same param count, same per-seed training
+    trajectory -- RotationMinGRU's `snap` is a registered buffer, not a
+    parameter, and `mixer_kwargs={}` already resolves to the class's own
+    default snap grid), caught by
     `tests/test_report_benchmarks.py`'s "every arm's param count is
     distinct" invariant. See `ARM_REGISTRY`'s comment in
     `benchmark_lab.py` for the full rationale."""
-    assert "rotation-hetero" in ARM_REGISTRY
-    mixer, kwargs = ARM_REGISTRY["rotation-hetero"]
-    assert mixer == ["rotation", "signed"]
+    assert "signed-rotation" in ARM_REGISTRY
+    mixer, kwargs = ARM_REGISTRY["signed-rotation"]
+    assert mixer == ["signed", "rotation"]
     assert kwargs is None
 
 
-def test_rotation_hetero_does_not_emit_the_multi_rotation_warning_unlike_rotation():
+def test_signed_rotation_does_not_emit_the_multi_rotation_warning_unlike_rotation():
     """`rotation` (unchanged, run "as is") builds a 2-block, single-mixer-
     type `"rotation"` stack -- `MinGRUStack`'s multi-rotation `UserWarning`
     fires unconditionally on rotation-block COUNT
     (`mixer_list.count("rotation") > 1`), so it warns every construction.
-    `rotation-hetero`'s hetero stack has only ONE `"rotation"` entry
+    `signed-rotation`'s hetero stack has only ONE `"rotation"` entry
     (mixed with `"signed"`), and a single `"rotation"` entry in a mixed
     stack does not warn (see `MinGRUStack`'s docstring) -- this is the
     concrete, checkable difference between the documented broken baseline
@@ -555,24 +559,24 @@ def test_rotation_hetero_does_not_emit_the_multi_rotation_warning_unlike_rotatio
         build_model(task, "rotation")
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        build_model(task, "rotation-hetero")
+        build_model(task, "signed-rotation")
 
 
-def test_rotation_hetero_pendulum_wiring_matches_delta_feature_channel_only():
-    """`rotation-hetero` is deliberately excluded from `DECAY_CAPABLE_ARMS`
+def test_signed_rotation_pendulum_wiring_matches_delta_feature_channel_only():
+    """`signed-rotation` is deliberately excluded from `DECAY_CAPABLE_ARMS`
     (no established repo precedent for splitting decay across a hetero
     rotation+signed stack -- see `ARM_REGISTRY`'s comment): on the
     pendulum task it must reach `dt` only via the `log1p(dt)` feature-
     concat channel, the same treatment `delta` gets, never mechanically
     through the stack's decay path."""
-    assert "rotation-hetero" not in DECAY_CAPABLE_ARMS
+    assert "signed-rotation" not in DECAY_CAPABLE_ARMS
     task = TASKS["pendulum"]
-    model = build_model(task, "rotation-hetero")
+    model = build_model(task, "signed-rotation")
     for block in model.stack.blocks:
         assert block.mingru.decay is None
 
 
-def test_rotation_and_rotation_hetero_have_distinct_param_counts():
+def test_rotation_and_signed_rotation_have_distinct_param_counts():
     """Direct local pin of the same invariant
     `tests/test_report_benchmarks.py::test_param_counts_are_positive_and_vary_by_task_and_arm`
     checks at the report layer: the two rotation-family arms must build
@@ -580,10 +584,10 @@ def test_rotation_and_rotation_hetero_have_distinct_param_counts():
     names."""
     task = TASKS["s5"]
     rotation_params = sum(p.numel() for p in build_model(task, "rotation").parameters())
-    rotation_hetero_params = sum(
-        p.numel() for p in build_model(task, "rotation-hetero").parameters()
+    signed_rotation_params = sum(
+        p.numel() for p in build_model(task, "signed-rotation").parameters()
     )
-    assert rotation_params != rotation_hetero_params
+    assert rotation_params != signed_rotation_params
 
 
 # ------------------------- 8. signed-givens / signed-delta arms (2nd amendment)
@@ -678,9 +682,9 @@ def test_all_matrix_arms_have_distinct_param_counts():
     under a new name.
 
     Deliberately scoped to `MATRIX_ARMS`, NOT `ARM_REGISTRY`: `PROBE_ARMS`'s
-    `rotation-hetero-k5` is BY CONSTRUCTION param-count-identical to
-    `rotation-hetero` (`snap` is a registered buffer, not a parameter --
-    see `test_rotation_hetero_k5_and_rotation_hetero_have_equal_param_counts`
+    `signed-rotation-k5` is BY CONSTRUCTION param-count-identical to
+    `signed-rotation` (`snap` is a registered buffer, not a parameter --
+    see `test_signed_rotation_k5_and_signed_rotation_have_equal_param_counts`
     below), so this invariant would falsely fail if it included
     `ARM_REGISTRY`'s three probe arms."""
     task = TASKS["s5"]
@@ -700,24 +704,24 @@ def test_matrix_and_probe_arms_are_disjoint_and_union_to_arm_registry():
     assert len(PROBE_ARMS) == 3
 
 
-def test_rotation_hetero_k5_registered_with_widened_snap_grid_signed_untouched():
-    """`rotation-hetero-k5` is the same `["rotation", "signed"]` stack as
-    `rotation-hetero`, with the rotation block's snap grid widened to
+def test_signed_rotation_k5_registered_with_widened_snap_grid_signed_untouched():
+    """`signed-rotation-k5` is the same `["signed", "rotation"]` stack as
+    `signed-rotation`, with the rotation block's snap grid widened to
     include K=5 (S5's element orders are {2, 3, 4, 5, 6}; a 5-cycle needs
     an order-5 rotation) -- the `signed` block gets no per-type override
     (omitted key resolves to its own class defaults, per `MinGRUStack`'s
     type-keyed-kwargs convention)."""
-    assert "rotation-hetero-k5" in PROBE_ARMS
-    mixer, kwargs = PROBE_ARMS["rotation-hetero-k5"]
-    assert mixer == ["rotation", "signed"]
+    assert "signed-rotation-k5" in PROBE_ARMS
+    mixer, kwargs = PROBE_ARMS["signed-rotation-k5"]
+    assert mixer == ["signed", "rotation"]
     assert kwargs == {"rotation": {"snap": (2, 3, 4, 5, 6)}}
     assert "signed" not in kwargs
 
 
-def test_rotation_hetero_k5_block_composition_routes_snap_to_rotation_block_only():
+def test_signed_rotation_k5_block_composition_routes_snap_to_rotation_block_only():
     task = TASKS["s5"]
-    model = build_model(task, "rotation-hetero-k5")
-    rotation_block, signed_block = model.stack.blocks
+    model = build_model(task, "signed-rotation-k5")
+    signed_block, rotation_block = model.stack.blocks
     assert type(rotation_block.mingru).__name__ == "RotationMinGRU"
     assert type(signed_block.mingru).__name__ == "SignedMinGRU"
     assert rotation_block.mingru.snap == (2, 3, 4, 5, 6)
@@ -726,21 +730,21 @@ def test_rotation_hetero_k5_block_composition_routes_snap_to_rotation_block_only
     assert not hasattr(signed_block.mingru, "snap")
 
 
-def test_rotation_hetero_k5_and_rotation_hetero_have_equal_param_counts():
+def test_signed_rotation_k5_and_signed_rotation_have_equal_param_counts():
     """`snap` is a registered buffer on `RotationMinGRU`, not a
     `nn.Parameter` -- widening the snap grid changes NO tensor shape, so
-    `rotation-hetero-k5` and `rotation-hetero` must build models with
+    `signed-rotation-k5` and `signed-rotation` must build models with
     IDENTICAL parameter counts. This is the documented exception to
     `test_all_matrix_arms_have_distinct_param_counts`'s invariant, by
     construction, not a bug -- see that test's own docstring."""
     task = TASKS["s5"]
-    rotation_hetero_params = sum(
-        p.numel() for p in build_model(task, "rotation-hetero").parameters()
+    signed_rotation_params = sum(
+        p.numel() for p in build_model(task, "signed-rotation").parameters()
     )
-    rotation_hetero_k5_params = sum(
-        p.numel() for p in build_model(task, "rotation-hetero-k5").parameters()
+    signed_rotation_k5_params = sum(
+        p.numel() for p in build_model(task, "signed-rotation-k5").parameters()
     )
-    assert rotation_hetero_k5_params == rotation_hetero_params
+    assert signed_rotation_k5_params == signed_rotation_params
 
 
 @pytest.mark.parametrize("arm,expected_nh", [("signed-delta-nh3", 3), ("signed-delta-nh4", 4)])
@@ -780,7 +784,7 @@ def test_signed_delta_nh_probe_arms_block_composition_matches_registered_nh(arm,
 
 
 def test_signed_delta_nh_probe_arms_have_distinct_param_counts():
-    """Unlike `rotation-hetero-k5`'s snap widening, `nh` IS a real
+    """Unlike `signed-rotation-k5`'s snap widening, `nh` IS a real
     constructor-time shape parameter (more Householder reflections per
     delta step) -- `signed-delta`, `signed-delta-nh3`, and
     `signed-delta-nh4` must build three genuinely different models."""
@@ -792,7 +796,7 @@ def test_signed_delta_nh_probe_arms_have_distinct_param_counts():
     assert len(set(params.values())) == 3
 
 
-@pytest.mark.parametrize("arm", ["rotation-hetero-k5", "signed-delta-nh3", "signed-delta-nh4"])
+@pytest.mark.parametrize("arm", ["signed-rotation-k5", "signed-delta-nh3", "signed-delta-nh4"])
 def test_probe_arms_excluded_from_decay_capable_arms(arm):
     assert arm not in DECAY_CAPABLE_ARMS
     task = TASKS["pendulum"]

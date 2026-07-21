@@ -44,7 +44,7 @@ A further, later addition (task-11a, S5 design-correction probe write-up)
 regenerates ``experiments/bench/bench_s5_probe.json``/``.md`` for every
 task in ``experiments.benchmark_tasks.BENCH_PROBE_ROUND_TAGS`` (currently
 just ``s5``): a PROBE-labeled report for ``experiments.benchmark_lab
-.PROBE_ARMS`` rows (``rotation-hetero-k5``/``signed-delta-nh3``/
+.PROBE_ARMS`` rows (``signed-rotation-k5``/``signed-delta-nh3``/
 ``signed-delta-nh4``, round tag ``bench-s5-probe-01``) -- a descriptive
 design-correction population, not a competing arm, so it shares the
 REFERENCE report's no-Fisher, no-matched-accounting treatment (both flow
@@ -56,7 +56,7 @@ additive: the matched ``bench_<task>.{json,md}`` and the REFERENCE
 untouched by it.
 
 Per task, per arm (``experiments.benchmark_lab.MATRIX_ARMS``:
-log/signed/rotation/rotation-hetero/givens/delta/signed-givens/signed-delta/gru
+log/signed/rotation/signed-rotation/givens/delta/signed-givens/signed-delta/gru
 -- ``gru`` is the depth-matched classical ``nn.GRU`` external control arm,
 added by a fourth amendment; not a ``MinGRUStack`` mixer, but a normal
 ``MATRIX_ARMS`` row like the other eight, so it flows through this
@@ -234,7 +234,7 @@ def _rows_for_task(all_rows: list[dict[str, Any]], task_name: str) -> dict[str, 
 
     Deliberately ``MATRIX_ARMS`` here, NOT ``experiments.benchmark_lab
     .ARM_REGISTRY`` (matrix arms unioned with the S5-only ``PROBE_ARMS``,
-    e.g. ``rotation-hetero-k5``): this ``-02`` matrix report's planned-arm
+    e.g. ``signed-rotation-k5``): this ``-02`` matrix report's planned-arm
     accounting must stay exactly the nine clean seed-matrix arms --
     widening it to ``ARM_REGISTRY`` would make every ``-02`` report show
     the three probe arms as permanently "0/seeds missing" (they write
@@ -648,7 +648,7 @@ def _probe_banner_note(report: dict[str, Any]) -> str:
     return (
         f"**S5 design-correction probe arm(s) -- NOT part of the matched "
         f"`{ROUND_TAGS[report['task']]}` seed-matrix accounting.** Tests whether two "
-        "suspected experiment-design artifacts -- `rotation-hetero`'s missing K=5 snap "
+        "suspected experiment-design artifacts -- `signed-rotation`'s missing K=5 snap "
         "order and `signed-delta`'s low nh=2 product count -- rather than a genuine "
         "mechanism limit, explain S5's 0/36 rows for those families (see "
         "`experiments.benchmark_lab.PROBE_ARMS`'s own comment). No Fisher-exact "
@@ -753,7 +753,7 @@ def build_ref_task_report(task_name: str, all_rows: list[dict[str, Any]]) -> dic
 
 def build_probe_task_report(task_name: str, all_rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Assemble the ``bench_s5_probe.json`` payload for ``task_name``'s
-    ``PROBE_ARMS`` rows (``rotation-hetero-k5``/``signed-delta-nh3``/
+    ``PROBE_ARMS`` rows (``signed-rotation-k5``/``signed-delta-nh3``/
     ``signed-delta-nh4``) -- an explicitly NON-matched, descriptive
     design-correction population, never the matched population
     `build_task_report` reports (module docstring's "further, later
@@ -763,7 +763,7 @@ def build_probe_task_report(task_name: str, all_rows: list[dict[str, Any]]) -> d
     Deliberately no Fisher-vs-``log`` comparison here either: unlike
     `REF_ARMS`, the probe arms run under the SAME matched ``TaskSpec.budget``
     (no ``PROBE_ARM_BUDGETS`` override exists), but the probe is a
-    diagnostic for whether `rotation-hetero`/`signed-delta`'s matrix configs
+    diagnostic for whether `signed-rotation`/`signed-delta`'s matrix configs
     themselves were under-specified (see `experiments.benchmark_lab
     .PROBE_ARMS`'s own comment) -- a descriptive design-correction readout,
     not a claim to be tested against `log`'s matched fit rate."""

@@ -121,7 +121,7 @@ def test_round_tag_for_arm_raises_for_probe_arm_on_a_task_with_no_probe_tag():
     # than silently falling back to that task's matrix tag.
     for task_name in ("mqar", "psmnist", "pendulum"):
         with pytest.raises(ValueError, match="no round tag"):
-            _round_tag_for_arm(task_name, "rotation-hetero-k5", PROBE_ARMS, REF_ARMS)
+            _round_tag_for_arm(task_name, "signed-rotation-k5", PROBE_ARMS, REF_ARMS)
 
 
 # --- ref round tags + _round_tag_for_arm: gru-large reference routing ------
@@ -263,7 +263,7 @@ def test_main_arms_choices_still_include_probe_arms_for_explicit_selection(monke
             "--tasks",
             "s5",
             "--arms",
-            "rotation-hetero-k5",
+            "signed-rotation-k5",
             "signed-delta-nh3",
             "signed-delta-nh4",
             "--seeds",
@@ -425,7 +425,7 @@ def test_cpu_smoke_emits_valid_row_and_touches_no_ledger():
 
 def test_cpu_smoke_probe_arms_emit_rows_tagged_with_the_probe_round():
     """Task's stated local-smoke verification: `--arms
-    rotation-hetero-k5 signed-delta-nh3 signed-delta-nh4` on `s5` emits
+    signed-rotation-k5 signed-delta-nh3 signed-delta-nh4` on `s5` emits
     three rows, all tagged `bench-s5-probe-01` -- never the matrix
     `bench-s5-02` tag."""
     ledger = _REPO_ROOT / "experiments" / "lab_results.jsonl"
@@ -438,7 +438,7 @@ def test_cpu_smoke_probe_arms_emit_rows_tagged_with_the_probe_round():
             "--tasks",
             "s5",
             "--arms",
-            "rotation-hetero-k5",
+            "signed-rotation-k5",
             "signed-delta-nh3",
             "signed-delta-nh4",
             "--seeds",
@@ -463,7 +463,7 @@ def test_cpu_smoke_probe_arms_emit_rows_tagged_with_the_probe_round():
     assert len(row_lines) == 3, result.stdout
     rows = [json.loads(line[len(gpu_benchmark_campaign._ROW_PREFIX) :]) for line in row_lines]
     assert {row["variant"] for row in rows} == {
-        "rotation-hetero-k5",
+        "signed-rotation-k5",
         "signed-delta-nh3",
         "signed-delta-nh4",
     }

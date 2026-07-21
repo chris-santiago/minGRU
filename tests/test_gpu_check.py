@@ -835,11 +835,11 @@ def test_build_benchmarks_command_still_single_foreground_chain():
 
 def test_build_benchmarks_command_passthrough_args_unaffected_by_triton_export():
     command = build_benchmarks_command(
-        "git@example.com/repo.git", "deadbeef", ["s5"], ["log", "rotation-hetero"], [0, 1]
+        "git@example.com/repo.git", "deadbeef", ["s5"], ["log", "signed-rotation"], [0, 1]
     )
     assert "export MINGRU_SCAN=triton" in command
     assert "--tasks s5" in command
-    assert "--arms log rotation-hetero" in command
+    assert "--arms log signed-rotation" in command
     assert "--seeds 0 1" in command
     assert "--steps" not in command
 
@@ -904,11 +904,11 @@ def test_benchmarks_rounds_also_accepts_the_ref_round():
 
 
 def test_valid_benchmarks_key_accepts_a_probe_round_and_variant_row():
-    row = _bench_row("bench-s5-probe-01", "s5", "rotation-hetero-k5", 99)
+    row = _bench_row("bench-s5-probe-01", "s5", "signed-rotation-k5", 99)
     assert gpu_check._valid_benchmarks_key(row, _BENCH_ROUNDS) == (
         "bench-s5-probe-01",
         "s5",
-        "rotation-hetero-k5",
+        "signed-rotation-k5",
         99,
     )
 
@@ -920,15 +920,15 @@ def test_append_benchmarks_rows_dedups_probe_round_rows_by_full_key(tmp_path):
     # not duplicates of each other).
     ledger = tmp_path / "lab_results.jsonl"
     rows = [
-        _bench_row("bench-s5-probe-01", "s5", "rotation-hetero-k5", 99),
+        _bench_row("bench-s5-probe-01", "s5", "signed-rotation-k5", 99),
         _bench_row("bench-s5-probe-01", "s5", "signed-delta-nh3", 99),
-        _bench_row("bench-s5-probe-01", "s5", "rotation-hetero-k5", 99),  # duplicate
+        _bench_row("bench-s5-probe-01", "s5", "signed-rotation-k5", 99),  # duplicate
     ]
     result = gpu_check._append_benchmarks_rows(ledger, rows, _BENCH_ROUNDS)
     assert (result.appended, result.skipped_duplicate, result.skipped_invalid) == (2, 0, 0)
     assert result.deduped_in_batch == 1
     written = {json.loads(line)["variant"] for line in ledger.read_text().splitlines()}
-    assert written == {"rotation-hetero-k5", "signed-delta-nh3"}
+    assert written == {"signed-rotation-k5", "signed-delta-nh3"}
 
 
 def test_valid_benchmarks_key_rejects_non_dict_payload():

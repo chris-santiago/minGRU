@@ -462,7 +462,7 @@ def test_matrix_arms_planned_set_is_exactly_the_nine_matrix_arms():
         "log",
         "signed",
         "rotation",
-        "rotation-hetero",
+        "signed-rotation",
         "givens",
         "delta",
         "signed-givens",
@@ -485,14 +485,14 @@ def test_probe_round_rows_never_appear_in_a_minus02_matrix_report():
     report: `_rows_for_task` filters by round tag FIRST (the probe tag
     never equals `ROUND_TAGS["s5"]`), so the row is dropped before variant
     matching is even attempted."""
-    probe_row = _s5_row(0, "rotation-hetero-k5", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)
+    probe_row = _s5_row(0, "signed-rotation-k5", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)
     probe_row["round"] = BENCH_PROBE_ROUND_TAGS["s5"]
     matrix_row = _s5_row(0, "log", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)
 
     report = build_task_report("s5", [probe_row, matrix_row])
 
     assert set(report["arms"]) == set(MATRIX_ARMS)
-    assert "rotation-hetero-k5" not in report["arms"]
+    assert "signed-rotation-k5" not in report["arms"]
     assert report["arms"]["log"]["seeds_present"] == 1
 
 
@@ -670,7 +670,7 @@ def test_build_probe_task_report_raises_for_a_task_with_no_probe_round_tag():
 
 def test_probe_round_matches_the_three_probe_arms_exactly():
     report = build_probe_task_report("s5", [])
-    assert set(report["arms"]) == {"rotation-hetero-k5", "signed-delta-nh3", "signed-delta-nh4"}
+    assert set(report["arms"]) == {"signed-rotation-k5", "signed-delta-nh3", "signed-delta-nh4"}
 
 
 def test_render_probe_markdown_labels_probe_and_omits_fisher_section():
@@ -681,7 +681,7 @@ def test_render_probe_markdown_labels_probe_and_omits_fisher_section():
     assert "bench-s5-probe-01" in md
     assert "signed-delta-nh3" in md
     assert "Fisher exact" not in md
-    assert "0 rows found for arm `rotation-hetero-k5`" in md
+    assert "0 rows found for arm `signed-rotation-k5`" in md
 
 
 def test_write_probe_reports_writes_distinct_filenames_from_matched_and_ref(tmp_path):

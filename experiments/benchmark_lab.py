@@ -19,19 +19,21 @@ pattern): `ARM_REGISTRY` fixes the registered arms' configs -- five from
 the round's Global Constraints (`log`, `signed`, `rotation`, `givens` at
 block_size=8/rounds=3, `delta` at its promoted native-state default
 nh=2/n_heads=4/d_k=16/d_v=16), d_model=64, 2 pre-norm blocks, plus a sixth
-arm, `rotation-hetero`, added by amendment at the evidence-phase gate
+arm, `signed-rotation`, added by amendment at the evidence-phase gate
 (`.claude/output/intent/2026-07-19-benchmark-round-intent.md`, Amendments):
 `rotation`'s pure 2-block stack is `MinGRUStack`'s documented STE-
 compounding broken baseline (more than one `"rotation"` block always
 warns once at construction, unconditional on `snap` -- see
 `MinGRUStack`'s docstring); the round runs it as-is AND adds
-`rotation-hetero` -- one `"rotation"` block (default snap grid) composed
-with one `"signed"` block, mirroring `probes.py`'s `"minGRU-hetero-rs"`
-row -- this repo's evidenced fix for rotation-stack STE compounding
-(not a snap on/off comparison against `rotation`: both arms' rotation
-block uses the same default snap grid; the fix is the composition, not
-the snap setting), which avoids the multi-rotation warning (a single
-`"rotation"` entry in a mixed stack doesn't warn). See `ARM_REGISTRY`'s
+`signed-rotation` -- one `"signed"` block composed with one `"rotation"`
+block (default snap grid), mirroring `probes.py`'s `"minGRU-hetero-sr"`
+row (`(["signed", "rotation"], None)`) -- this repo's evidenced fix for
+rotation-stack STE compounding, in the extract-then-compose (signed-
+first) block order shared with its sibling arms `signed-givens` and
+`signed-delta` (not a snap on/off comparison against `rotation`: both
+arms' rotation block uses the same default snap grid; the fix is the
+composition, not the snap setting), which avoids the multi-rotation
+warning (a single `"rotation"` entry in a mixed stack doesn't warn). See `ARM_REGISTRY`'s
 own comment for the full rationale, including why a same-type second
 reading was tried and rejected (byte-identical to `rotation`, caught by
 `tests/test_report_benchmarks.py`'s distinct-param-count invariant).
@@ -57,10 +59,10 @@ code -- every arm is an existing packaged class, called through
 `MinGRUStack`'s `mixer=`/`mixer_kwargs=` contract.
 
 A third amendment (same intent-ledger file, 2026-07-20 entry) added three
-more arms, `PROBE_ARMS` (`rotation-hetero-k5`, `signed-delta-nh3`,
+more arms, `PROBE_ARMS` (`signed-rotation-k5`, `signed-delta-nh3`,
 `signed-delta-nh4`) -- an S5-only follow-up probe testing whether two
 suspected experiment-design artifacts, not a mechanism limit, explain
-S5's 0/36 rows for `rotation-hetero` and `signed-delta`. Unlike the
+S5's 0/36 rows for `signed-rotation` and `signed-delta`. Unlike the
 first two amendments, these do NOT join the eight-arm seed-matrix
 population: `ARM_REGISTRY` (this module's `build_model`/CLI lookup) is
 `MATRIX_ARMS` unioned with `PROBE_ARMS`, but `scripts
@@ -202,27 +204,33 @@ RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lab_results.
 # sixth arm below, plus two more `list[str]` hetero arms (`signed-givens`,
 # `signed-delta`) added by a second amendment -- see the module docstring's
 # "Two more arms" paragraph. mixer is a `str` (one type, every block, flat
-# kwargs) for five of the eight arms; `rotation-hetero`/`signed-givens`/
+# kwargs) for five of the eight arms; `signed-rotation`/`signed-givens`/
 # `signed-delta` are the three `list[str]` arms (per-block mixer types,
 # kwargs keyed by type name or `None` -- see `MinGRUStack`'s own docstring
 # for this schema). Every arm here runs on all four tasks -- there is no
 # per-task arm subset; `scripts/report_benchmarks.py` and
 # `scripts/gpu_benchmark_campaign.py` both iterate this same dict.
 #
-# rotation-hetero: a single "rotation" block (RotationMinGRU's own default
-# snap grid, (2, 3, 4, 6) -- the same default the plain "rotation" arm's
-# blocks already use) composed with a single "signed" block (decoupled
-# tanh default -- same config as this round's own "signed" arm), mirroring
-# probes.py's "minGRU-hetero-rs" MIXER_REGISTRY row exactly
-# (`(["rotation", "signed"], None)`). This is NOT a snap on/off comparison
-# against "rotation" -- both arms' rotation block snaps identically by
-# default; the difference is the composition. It is this repo's evidenced
-# fix for the rotation-stack STE-compounding problem: a homogeneous
-# 2-block "rotation" stack (this round's plain "rotation" arm, unchanged,
-# run "as is") is `MinGRUStack`'s documented broken baseline (more than
-# one "rotation" block always warns, unconditional on `snap` -- see its
-# docstring); pairing rotation-hetero with a SECOND identical rotation
-# block instead of "signed" would be architecturally byte-identical to
+# signed-rotation: a single "signed" block (decoupled tanh default -- same
+# config as this round's own "signed" arm) composed with a single
+# "rotation" block (RotationMinGRU's own default snap grid, (2, 3, 4, 6) --
+# the same default the plain "rotation" arm's blocks already use), mirroring
+# probes.py's "minGRU-hetero-sr" MIXER_REGISTRY row exactly
+# (`(["signed", "rotation"], None)`). The signed-first (extract-then-
+# compose) block order is the one shared with this round's sibling hetero
+# arms `signed-givens` (`["signed", "givens"]`) and `signed-delta`
+# (`["signed", "delta"]`): keeping the rotation composer in the same
+# architecture as its siblings is what makes the composer comparison
+# clean, rather than testing the rotation composer rotation-first while the
+# others run signed-first. This is NOT a snap on/off comparison against "rotation" --
+# both arms' rotation block snaps identically by default; the difference
+# is the composition. It is this repo's evidenced fix for the
+# rotation-stack STE-compounding problem: a homogeneous 2-block "rotation"
+# stack (this round's plain "rotation" arm, unchanged, run "as is") is
+# `MinGRUStack`'s documented broken baseline (more than one "rotation"
+# block always warns, unconditional on `snap` -- see its docstring);
+# pairing the "rotation" block with a SECOND identical rotation block
+# instead of "signed" would be architecturally byte-identical to
 # "rotation" (same param count, same per-seed training trajectory, zero
 # new information for real GPU spend -- caught by
 # tests/test_report_benchmarks.py's "every arm's param count is distinct"
@@ -236,7 +244,7 @@ RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lab_results.
 # hetero-mixer + decay row to mirror (its hetero-sr/-rs rows only ever run
 # on S3/S3-hier, never the timestamped tasks), so inventing a decay split
 # across two mixer types for the pendulum task would be new, unauthorized
-# design -- rotation-hetero is therefore treated like "delta" on pendulum:
+# design -- signed-rotation is therefore treated like "delta" on pendulum:
 # dt reaches it only via the log1p(dt) feature-concat channel, never
 # mechanically.
 #
@@ -246,7 +254,7 @@ RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lab_results.
 # -- confirmed against GivensMinGRU's constructor defaults in
 # src/mingru/min_gru.py, the same config this round's own "givens" arm
 # passes explicitly). mixer_kwargs=None: the list-mixer schema applies
-# every type's default kwargs, exactly like rotation-hetero above.
+# every type's default kwargs, exactly like signed-rotation above.
 # Byte-identical to probes.py's "minGRU-hetero-sg8" MIXER_REGISTRY row
 # (`(["signed", "givens"], None)`) -- the S3-hier promoted fit-rate
 # winner, GPU-re-evidenced as hetero_lab.py's "hetero-pg8" arm
@@ -268,18 +276,18 @@ RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lab_results.
 # is the promoted packaged SignedMinGRU class this whole round's registry
 # path builds every arm from (the promoted packaged equivalent, not a
 # byte-identical carryover the way signed-givens/hetero-sg8 is above).
-# Unlike rotation-hetero/signed-givens, mixer_kwargs here is NOT `None`:
+# Unlike signed-rotation/signed-givens, mixer_kwargs here is NOT `None`:
 # the delta block needs its native config explicitly, so this is a
 # type-keyed dict (`{"delta": {...}}`) with "signed" omitted (defaults to
 # `None`, i.e. the class's own default kwargs -- see MinGRUStack's
 # docstring for the omitted-key-defaults-to-None resolution rule).
 #
 # Neither signed-givens nor signed-delta is decay-capable (see
-# DECAY_CAPABLE_ARMS below): same rationale as rotation-hetero -- no
+# DECAY_CAPABLE_ARMS below): same rationale as signed-rotation -- no
 # established repo precedent for splitting decay wiring across a hetero
 # stack's two mixer types, so this round doesn't invent one for either
 # new arm. Both receive dt only via the log1p(dt) feature-concat channel
-# on the pendulum task, like delta and rotation-hetero.
+# on the pendulum task, like delta and signed-rotation.
 #
 # gru: the classical external control arm (fourth amendment, module
 # docstring's "standard GRU control arm" paragraph) -- a depth-matched
@@ -297,7 +305,7 @@ MATRIX_ARMS: dict[str, tuple[str | list[str], dict | None]] = {
     "log": ("log", {}),
     "signed": ("signed", {}),
     "rotation": ("rotation", {}),
-    "rotation-hetero": (["rotation", "signed"], None),
+    "signed-rotation": (["signed", "rotation"], None),
     "givens": ("givens", {"block_size": 8, "rounds": 3}),
     "delta": ("delta", {"nh": 2, "n_heads": 4, "d_k": 16, "d_v": 16}),
     "signed-givens": (["signed", "givens"], None),
@@ -308,11 +316,11 @@ MATRIX_ARMS: dict[str, tuple[str | list[str], dict | None]] = {
 # Probe arms (Amendments, `.claude/output/intent/2026-07-19-benchmark-round-
 # intent.md`, 2026-07-20 entry): three corrected-config S5-only follow-up
 # arms testing whether two suspected experiment-design artifacts -- not a
-# mechanism limit -- explain S5's 0/36 rows for `rotation-hetero` and
+# mechanism limit -- explain S5's 0/36 rows for `signed-rotation` and
 # `signed-delta`.
 #
-# rotation-hetero-k5: byte-identical to `rotation-hetero` above (same
-# `["rotation", "signed"]` stack) except the rotation block's snap grid is
+# signed-rotation-k5: byte-identical to `signed-rotation` above (same
+# `["signed", "rotation"]` stack) except the rotation block's snap grid is
 # widened to include K=5 -- S5's element orders are {2, 3, 4, 5, 6} (a
 # 5-cycle needs an order-5 rotation to land an exact attractor), but
 # `RotationMinGRU`'s own default snap grid, `(2, 3, 4, 6)`, is missing it.
@@ -320,7 +328,7 @@ MATRIX_ARMS: dict[str, tuple[str | list[str], dict | None]] = {
 # order[s]" -- this arm is the grid corrected to match S5's actual group,
 # not a new comparison axis. `snap` is a registered buffer, not a
 # parameter (`RotationMinGRU.__init__`), so this arm's param count is
-# IDENTICAL to `rotation-hetero`'s (see `PROBE_ARMS`'s param-count
+# IDENTICAL to `signed-rotation`'s (see `PROBE_ARMS`'s param-count
 # invariant note below and `tests/test_benchmark_lab.py`'s pinned test) --
 # the all-arms-distinct-param-count invariant that holds across
 # `MATRIX_ARMS` does NOT extend to this arm, by construction, not by bug.
@@ -345,7 +353,7 @@ MATRIX_ARMS: dict[str, tuple[str | list[str], dict | None]] = {
 # probe. (The matrix `signed-delta` arm keeps chunk_size=64: nh=2 -> 128,
 # on the envelope edge, which the kernel allows.)
 PROBE_ARMS: dict[str, tuple[str | list[str], dict | None]] = {
-    "rotation-hetero-k5": (["rotation", "signed"], {"rotation": {"snap": (2, 3, 4, 5, 6)}}),
+    "signed-rotation-k5": (["signed", "rotation"], {"rotation": {"snap": (2, 3, 4, 5, 6)}}),
     "signed-delta-nh3": (
         ["signed", "delta"],
         {"delta": {"nh": 3, "n_heads": 4, "d_k": 16, "d_v": 16, "chunk_size": 32}},
@@ -412,7 +420,7 @@ ARM_REGISTRY: dict[str, tuple[str | list[str], dict | None]] = {
 # "learnable"/"fixed" and a delta_t argument). DeltaMinGRU is deliberately
 # excluded: its constructor rejects any decay is not None (frozen contract,
 # see its class docstring) -- pendulum's dt reaches it only via the
-# feature-concat channel below, never mechanically. rotation-hetero,
+# feature-concat channel below, never mechanically. signed-rotation,
 # signed-givens, and signed-delta are excluded for the same reason (see
 # MATRIX_ARMS's comment): no established repo precedent for splitting
 # decay wiring across either mixer type of a hetero stack, so this round
@@ -608,7 +616,7 @@ def build_model(task: TaskSpec, arm: str) -> nn.Module:
     `GRU_LARGE_D_MODEL` (256, literature scale) -- both are 2-layer
     (`N_LAYERS`, unchanged).
 
-    `arm_kwargs` is `None` for `rotation-hetero` (the one list-mixer arm --
+    `arm_kwargs` is `None` for `signed-rotation` (the one list-mixer arm --
     `MinGRUStack`'s own convention for "no per-type overrides", see its
     docstring); every other arm's `arm_kwargs` is a flat dict, possibly
     empty. `dict(x) if x else {}` normalizes both to a real dict here
@@ -1311,9 +1319,9 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--model",
         choices=sorted(ARM_REGISTRY),
-        help="log | signed | rotation | rotation-hetero | givens | delta | "
+        help="log | signed | rotation | signed-rotation | givens | delta | "
         "signed-givens | signed-delta | gru (the nine MATRIX_ARMS) | "
-        "rotation-hetero-k5 | signed-delta-nh3 | signed-delta-nh4 "
+        "signed-rotation-k5 | signed-delta-nh3 | signed-delta-nh4 "
         "(the three S5-only PROBE_ARMS) | gru-large (the REF_ARMS "
         "grounding-only reference, psMNIST only)",
     )

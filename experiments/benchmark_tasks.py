@@ -786,7 +786,7 @@ BENCH_ROUND_TAGS: dict[str, str] = {
 
 # Probe round tags (Amendments, `.claude/output/intent/2026-07-19-benchmark-
 # round-intent.md`, 2026-07-20 entry): a follow-up S5-only probe testing
-# whether two suspected experiment-design artifacts -- `rotation-hetero`'s
+# whether two suspected experiment-design artifacts -- `signed-rotation`'s
 # missing K=5 snap order and `signed-delta`'s low nh=2 product count --
 # rather than a genuine mechanism limit, explain S5's 0/36 rows for those
 # families. The three probe arms (`experiments.benchmark_lab.PROBE_ARMS`)
