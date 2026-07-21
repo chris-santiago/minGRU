@@ -53,14 +53,20 @@ VENV_PY="$VENV_DIR/bin/python"
 echo "==> Installing wheel + pytest into the fresh venv (CPU torch)"
 uv pip install --python "$VENV_PY" --torch-backend cpu "$WHEEL" pytest
 
-echo "==> Import + shape smoke (installed package, src/ NOT on path)"
-"$VENV_PY" - <<'PY'
+EXPECTED_VERSION="$(grep -E '^__version__' src/mingru/__init__.py | sed -E 's/.*"([^"]+)".*/\1/')"
+echo "==> Import + shape smoke (installed package, src/ NOT on path); expecting version ${EXPECTED_VERSION}"
+EXPECTED_VERSION="$EXPECTED_VERSION" "$VENV_PY" - <<'PY'
+import os
 import mingru
 import torch
 
 # Prove `mingru` came from the installed wheel, not a src/ checkout.
 assert "site-packages" in mingru.__file__, mingru.__file__
-assert mingru.__version__ == "0.1.0", mingru.__version__
+# Prove the installed wheel carries the current source version (guards against a
+# stale/mismatched wheel). Derived from src/mingru/__init__.py, so it tracks the
+# version bump automatically instead of hardcoding a value that goes stale each release.
+_expected = os.environ["EXPECTED_VERSION"]
+assert mingru.__version__ == _expected, f"{mingru.__version__} != {_expected}"
 
 from mingru import MinGRU
 

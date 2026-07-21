@@ -4,6 +4,40 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-07-21
+
+Adds the `DeltaMinGRU` delta-rule composer and its ecosystem. Backward
+compatible: the four existing mixers are unchanged.
+
+### Added
+
+- **`DeltaMinGRU` mixer (`mixer="delta"`).** A DeltaNet/DeltaProduct delta-rule
+  composer on the shared `mixer=` interface: a per-head `d_k × d_v` matrix
+  associative-memory state updated by `nh` generalized-Householder rank-one
+  corrections per token, a chunked-WY parallel `forward` (`chunk_size` is a
+  performance-only knob; results are invariant), and a recurrent `step` that
+  returns `(y_t, h_t)` since the readout is not the carried state. State
+  capacity (`n_heads`, `nh`, `d_k`, `d_v`) is independent of `d_model`.
+- **Time decay on `DeltaMinGRU`.** The shared decay contract (`decay="fixed"` /
+  `"learnable"`, `decay_rate`, `log1p_delta`): a Gated-DeltaNet-style per-token
+  per-head gate folded into the chunked-WY parallel form via a log-space
+  decay-ratio reparameterization, so `decay=None` stays bit-identical to the
+  decay-free path. Very large or `+inf` gaps under float32 are handled by an
+  internal saturation clamp plus a once-per-instance warning. The decay-active
+  forward is eager-only; `torch.compile` is the recommended CUDA path.
+- **Delta Triton kernel.** A hand-written chunked-WY forward kernel, gated under
+  `MINGRU_SCAN=auto` to a measured win region (long sequences, narrow head
+  dims); `torch.compile` is recommended outside it, and explicit
+  `MINGRU_SCAN=triton` fails loud where unsupported.
+- **Benchmark validation.** An accepted-benchmark round on four public tasks
+  (MQAR associative recall, psMNIST, S5 group composition, and a pendulum
+  irregular-time control) with a depth-matched GRU control, published as a
+  results page and choose-a-mixer tables, with CPU and L4-GPU strata disclosed.
+- **Documentation.** A dedicated Delta variant section, a "time-aware decay on
+  the delta-rule memory" explanation, an "enable time decay" how-to, a "your
+  first delta model" tutorial, the benchmark-validation results page, and a
+  benchmark-reproduction guide.
+
 ## [0.1.0] - 2026-07-17
 
 Initial release of `mingru-scans`.
@@ -41,4 +75,5 @@ Initial release of `mingru-scans`.
   conformance (590/590), benchmark, and memory artifacts.
 - **Slides.** The parallel-GRUs deck and appendix published on the docs site.
 
+[0.2.0]: https://github.com/chris-santiago/minGRU/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/chris-santiago/minGRU/releases/tag/v0.1.0
