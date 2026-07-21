@@ -2842,22 +2842,18 @@ class DeltaMinGRU(DecayMixin, nn.Module):
     ordered rank-1 updates are processed ``chunk_size`` tokens at a
     time, each chunk's cumulative transition carried via one
     unit-lower-triangular solve (the UT transform) instead of a
-    per-token loop. Both forms are exactly the same function
-    (semantically identical within floating-point tolerance,
-    ``chunk_size`` has no effect on the result) and neither ever
-    materializes a per-token (or per-chunk) ``d_k x d_k`` transition
-    matrix: each micro-step is a rank-1 correction, and the chunked
-    form's UT transform operates on ``nh * chunk_size``-sized matrices
-    built from ``k``/``v``/``beta``, never on an explicit ``d_k x d_k``
-    matrix. The fp32 agreement is chunk-size-bounded at large ``T``,
-    though: at ``T = 1024`` with the default ``chunk_size = 64`` the
-    sequential/chunked deviation is ~3e-6, but a single-chunk run
-    (``chunk_size >= T``) at the same ``T`` accumulates to ~1.2e-5
-    through the one ``(nh * C)``-deep forward substitution the UT
-    transform solves in a single shot rather than ``T`` separate
-    ``nh``-deep ones -- still inside the repo's ``atol=1e-5`` forward
-    tolerance, but close enough to it that the default (not an
-    oversized) chunk size is recommended for long sequences.
+    per-token loop. Both forms are exactly the same function:
+    ``chunk_size`` does not change the result up to floating-point
+    rounding (the gated forward below is likewise tiling-invariant),
+    including ``C=1``, ``C >= T``, and ragged final chunks, and
+    neither ever materializes a per-token (or per-chunk) ``d_k x d_k``
+    transition matrix -- each micro-step is a rank-1 correction, and
+    the chunked form's UT transform operates on ``nh *
+    chunk_size``-sized matrices built from ``k``/``v``/``beta``, never
+    on an explicit ``d_k x d_k`` matrix. See the "Givens & Delta"
+    explanation deep dive (``docs/explanation/givens-delta.md``) for
+    the measured sequential-vs-chunked tolerance figures and the chunk
+    size guidance they support.
 
     Time decay is supported (``decay="fixed"``/``"learnable"``, via the
     shared ``DecayMixin`` contract -- see ``MinGRU`` for the ``gamma =
@@ -2953,16 +2949,16 @@ class DeltaMinGRU(DecayMixin, nn.Module):
     return_state=True)`` equals ``forward(cat(x1, x2))`` on both outputs
     and gradients.
 
-    On CUDA, ``torch.compile`` is the recommended execution path (it
-    recovers most of the chunked-WY forward's fusion headroom with no
-    engineering). A hand-written Triton kernel for the forward also
-    exists: under ``MINGRU_SCAN=auto`` it engages only in a narrow,
-    measured win region (long sequences with narrow head dims), where it
-    is faster than eager and lighter on memory; ``MINGRU_SCAN=triton``
-    forces the full kernel envelope; ``MINGRU_SCAN=eager`` disables it.
-    The kernel does not reach ``torch.compile``-class speed and is not a
-    substitute for it -- see the docs' "Choose a mixer" guide (GPU
-    execution path) for the full picture.
+    On CUDA, ``torch.compile`` is the recommended execution path. A
+    hand-written Triton kernel for the forward also exists and is
+    dispatch-controlled by ``MINGRU_SCAN`` like the other mixers:
+    ``auto`` engages it only in a narrow win region, ``triton`` forces
+    the full kernel envelope, and ``eager`` disables it. See the
+    "Givens & Delta" explanation deep dive
+    (``docs/explanation/givens-delta.md``) for the measured GPU
+    execution-path comparison (chunked-WY eager vs. ``torch.compile``
+    vs. the Triton kernel) and the "Choose a mixer" how-to for the
+    recommendation itself.
 
     References
     ----------

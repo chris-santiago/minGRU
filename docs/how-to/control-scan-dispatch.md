@@ -70,6 +70,38 @@ print(mingru.available())
 
 An invalid value (anything other than `auto`/`eager`/`triton`) raises `ValueError` from the scan call, so a typo fails loudly rather than being treated as `auto`.
 
+## Handle decay-active `DeltaMinGRU`
+
+The three modes above govern the four scan ops. `DeltaMinGRU`'s time decay (`decay=`) sits on a separate seam with a narrower contract: there is no Triton kernel for decay yet (deferred), so a decay-active forward is eager-only no matter which mixer state size or head count you pick.
+
+| `MINGRU_SCAN` | Decay-active `DeltaMinGRU` forward |
+|---|---|
+| `auto` (default) | eager; warns once per process on a CUDA input, silent on CPU |
+| `eager` | eager |
+| `triton` | **raises** `RuntimeError` naming decay as unsupported |
+
+```python
+import os
+os.environ["MINGRU_SCAN"] = "triton"
+import torch
+from mingru import DeltaMinGRU
+
+layer = DeltaMinGRU(input_size=16, hidden_size=32, decay="fixed").cuda()
+x = torch.randn(2, 8, 16, device="cuda")
+delta_t = torch.rand(2, 8, device="cuda")
+layer(x, delta_t=delta_t)
+```
+
+```
+RuntimeError: MINGRU_SCAN=triton requested for DeltaMinGRU's decay-active forward, but decay has no Triton kernel (deferred; torch.compile is the documented CUDA path for decay -- see the project docs)
+```
+
+`torch.compile` is the recommended CUDA path for `mixer="delta"`, with or without decay active; see [Choose a mixer](choose-a-mixer.md#the-three-dials) for the full GPU execution guidance.
+
+**This is delta-specific, not decay-general.** `RotationMinGRU` and `GivensMinGRU` also accept `decay=`, and their fused angle-scan Triton path threads decay through the forward and backward directly (a `has_decay` flag carried through the kernel), so `MINGRU_SCAN=triton` still runs on Triton for those two mixers with decay active. Only `DeltaMinGRU`'s decay path lacks a kernel today; nothing here forces eager on the other mixers.
+
+For the float32 large-gap saturation behavior (`log1p_delta=`) and when to reach for `decay=` at all, see the README's "Time-aware decay" section and [Choose a mixer](choose-a-mixer.md#the-three-dials).
+
 ## You have now
 
-forced the eager or Triton backend per process, made the Triton path mandatory where you need proof it is live, and know how `auto` decides and warns. For the GPU-side walkthrough, see [Triton on GPU](../tutorials/triton-on-gpu.md).
+forced the eager or Triton backend per process, made the Triton path mandatory where you need proof it is live, know how `auto` decides and warns, and know why a decay-active `DeltaMinGRU` stays eager-only under `MINGRU_SCAN=triton` while `RotationMinGRU`/`GivensMinGRU` do not. For the GPU-side walkthrough, see [Triton on GPU](../tutorials/triton-on-gpu.md).

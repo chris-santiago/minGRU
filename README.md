@@ -43,7 +43,7 @@ The optional Triton scan backend is imported lazily on first use of a Triton-bac
 
 An optional Triton backend supplies fused forward+backward GPU kernels for all four scan primitives (`linear_scan`, `matrix_scan`, `matrix_affine_scan`, `parallel_scan_log`) plus an angle-fused rotation path for `GivensMinGRU`. It sits behind a zero-config dispatch seam set by `MINGRU_SCAN`: `auto` (default: use Triton when a CUDA GPU and a working Triton install are present, else the pure-PyTorch eager path), `eager`, or `triton` (force it). CPU-only installs never import Triton.
 
-The win is concentrated in the matrix/block ops. Measured on an NVIDIA L4 (torch 2.8.0+cu128, Triton 3.4.0), forward+backward the Triton kernels run 39x–168x faster than eager on `matrix_scan`/`matrix_affine_scan`, and the angle-fused `GivensMinGRU` backward cuts peak memory from 395 MB to 38 MB. The log-space `parallel_scan_log` is the exception. Its recompute-in-backward kernel is 0.70x–0.80x *slower* than eager forward+backward, so eager stays the right default for the baseline `MinGRU`/`SignedMinGRU` mixers. All 590 CPU-vs-GPU parity checks pass. `DeltaMinGRU`'s chunked-WY `forward` is not one of these scan ops: it has its own Triton kernel (forward trio + torch-composed backward, gated separately), but `torch.compile` — not this kernel — is the recommended CUDA path for `mixer="delta"`. A GPU probe found `torch.compile` recovers 68–89% of the available fusion headroom, while the kernel runs 1.85x–3.79x slower than compile on every probed shape; under `MINGRU_SCAN=auto` the kernel therefore engages only in a narrow measured win region (long sequences, narrow head dims), where it beats eager and saves ~3x memory, and stays eager everywhere else (see "Givens variant," below). Kernel design and the full benchmark tables are in the [Triton scan kernels explanation](https://chris-santiago.github.io/minGRU/explanation/triton-scans/) and `experiments/bench/` (`scan_bench.md`, `scan_memory.md`, `scan_parity.md`).
+The win is concentrated in the matrix/block ops. Measured on an NVIDIA L4 (torch 2.8.0+cu128, Triton 3.4.0), forward+backward the Triton kernels run 39x–168x faster than eager on `matrix_scan`/`matrix_affine_scan`, and the angle-fused `GivensMinGRU` backward cuts peak memory from 395 MB to 38 MB. The log-space `parallel_scan_log` is the exception. Its recompute-in-backward kernel is 0.70x–0.80x *slower* than eager forward+backward, so eager stays the right default for the baseline `MinGRU`/`SignedMinGRU` mixers. All 590 CPU-vs-GPU parity checks pass. `DeltaMinGRU`'s chunked-WY `forward` is not one of these scan ops: it has its own Triton kernel (forward trio + torch-composed backward, gated separately), but `torch.compile` — not this kernel — is the recommended CUDA path for `mixer="delta"`. A GPU probe found `torch.compile` recovers 68–89% of the available fusion headroom, while the kernel runs 1.85x–3.79x slower than compile on every probed shape; under `MINGRU_SCAN=auto` the kernel therefore engages only in a narrow measured win region (long sequences, narrow head dims), where it beats eager and saves ~3x memory, and stays eager everywhere else (see "Delta variant," below). Kernel design and the full benchmark tables are in the [Triton scan kernels explanation](https://chris-santiago.github.io/minGRU/explanation/triton-scans/) and `experiments/bench/` (`scan_bench.md`, `scan_memory.md`, `scan_parity.md`).
 
 ## Benchmark validation
 
@@ -114,18 +114,20 @@ task from 1 of 12 seeds to 8 of 12 (Fisher exact p ≈ 0.009), at a matched
 though, like the other continuous composers here, it buys no attractor at
 length and still decays by T=1024. See "The hierarchical task: S3-hier,"
 below, for the task's construction and the full cross-mechanism evidence
-table, and "Givens variant" for the mechanism, the measured decay, and
-the fuller two-axis picture against the delta-rule composer
-(`DeltaMinGRU`, `mixer="delta"`). That picture has since resolved into a
-recommendation conditioned on two axes rather than a single winner:
-**state free to grow → `mixer="delta"` at native state is the promoted
-default** (the most reliable trained composer measured, on both CPU and
-GPU, with cost and memory that stay flat as state grows — see "Measured
-CPU cost" under "Givens variant"), while **state that must stay small (a
-matched 64-element budget) → `GivensMinGRU` remains decisively more
-reliable**, and its small-state fit cohort also extrapolates further at
-extreme lengths than the full-state delta cohort does. Full evidence for
-both branches is in "Givens variant," below, and at the docs site's
+table, and "Givens variant" for the mechanism and the measured decay,
+and "Delta variant" for the fuller two-axis picture against the
+delta-rule composer (`DeltaMinGRU`, `mixer="delta"`). That picture has
+since resolved into a recommendation conditioned on two axes rather
+than a single winner: **state free to grow → `mixer="delta"` at
+native state is the promoted default** (the most reliable trained
+composer measured, on both CPU and GPU, with cost and memory that
+stay flat as state grows — see "Measured CPU cost" under "Delta
+variant"), while **state that must stay small (a matched 64-element
+budget) → `GivensMinGRU` remains decisively more reliable**, and its
+small-state fit cohort also extrapolates further at extreme lengths
+than the full-state delta cohort does. Full evidence for both
+branches is in "Givens variant" and "Delta variant," below, and at
+the docs site's
 [Choose a mixer](https://chris-santiago.github.io/minGRU/how-to/choose-a-mixer/#the-two-axis-guidance)
 guide.
 
@@ -231,7 +233,7 @@ the "vanilla" minGRU in the paper's Appendix A.
 | `SignedMinGRU` | signed diagonal transitions (linear-space scan, `a_t ∈ (−1,1)`, unconstrained states); `coupled=False` (default, decoupled eigenvalue) or `coupled=True` (legacy reproduction); same API; same time-decay kwargs as `MinGRU` |
 | `RotationMinGRU` | 2x2 block rotation transitions (non-diagonal, matrix scan); `snap` grid manufactures exact-angle attractors; depth is a measured tradeoff, not a fixed limit (see "Rotation variant"); same API; same time-decay kwargs, scaling the whole 2x2 block (direction unaffected) |
 | `GivensMinGRU` | k-dim block-rotation transitions (non-diagonal, `matrix_affine_scan`); each transition is a product of `rounds` brick-wall Givens layers per `block_size`-dim block, special-orthogonal and continuous (no snap) — richer per-token maps than `RotationMinGRU`'s 2x2 at the same per-token state (see "Givens variant"); same API; same time-decay kwargs, scaling the whole block by a scalar (rotation unaffected) |
-| `DeltaMinGRU` | DeltaNet/DeltaProduct delta-rule mixer (`mixer="delta"`): per-head `d_k×d_v` associative-memory matrix state updated by `nh` generalized-Householder rank-1 corrections per token (kwargs `n_heads`, `nh`, `d_k`, `d_v`); parallel chunked-WY `forward` (`chunk_size` is a performance-only knob — results invariant), sequential `step` returns `(y_t, h_t)` since readout ≠ state (`carries_matrix_state=True`); state flattened `(B, n_heads·d_k·d_v)`, zero-init (no learned `h_0`); time-decay supported (Gated-DeltaNet-style per-token per-head scalar gate; the chunked-WY parallel `forward` is preserved via a decay-ratio change of variables, so `decay=None` stays bit-identical; decay-active forward is eager-only, `torch.compile` for CUDA) — see "Measured CPU cost" under "Givens variant" for the measured step cost |
+| `DeltaMinGRU` | DeltaNet/DeltaProduct delta-rule mixer (`mixer="delta"`): per-head `d_k×d_v` associative-memory matrix state updated by `nh` generalized-Householder rank-1 corrections per token (kwargs `n_heads`, `nh`, `d_k`, `d_v`); parallel chunked-WY `forward` (`chunk_size` is a performance-only knob — results invariant), sequential `step` returns `(y_t, h_t)` since readout ≠ state (`carries_matrix_state=True`); state flattened `(B, n_heads·d_k·d_v)`, zero-init (no learned `h_0`); time-decay supported (Gated-DeltaNet-style per-token per-head scalar gate; the chunked-WY parallel `forward` is preserved via a decay-ratio change of variables, so `decay=None` stays bit-identical; decay-active forward is eager-only, `torch.compile` for CUDA) — see "Measured CPU cost" under "Delta variant" for the measured step cost |
 | `linear_scan` | Hillis–Steele associative scan for `h_t = a_t·h_{t−1} + b_t` with signed scalar coefficients |
 | `matrix_scan` | Hillis–Steele associative scan for `h_t = M_t @ h_{t−1} + b_t` with 2x2 matrix coefficients (non-commutative composition) |
 | `matrix_affine_scan` | Hillis–Steele associative scan for `h_t = M_t @ h_{t−1} + b_t` with k×k matrix coefficients (the `block_size` generalization of `matrix_scan`, used by `GivensMinGRU`) |
@@ -1049,11 +1051,49 @@ shrunk to the same 64-element state (which fits 4 of 12 seeds), the
 comparison is parameter-unmatched (14,624 vs 3,306) and reads as
 suggestive only (p ≈ 0.22).
 
-**Measured CPU cost.** The parallel k×k scan is not the cheap path on
-CPU, and neither is any sequential loop: the cheap path is
-`DeltaMinGRU`'s chunked-WY `forward` (`mixer="delta"`), the DeltaNet
-literature's parallel form of the delta rule, implemented in this
-package. Under the pinned bench (`experiments/bench/delta_paths.md`;
+Cost, packaged-mixer trainability, and the two-axis recommendation
+that follows from them now live under "Delta variant," below,
+alongside `DeltaMinGRU`'s own cost profile and GPU story.
+
+Practical differences from the other mixers: 3 linear heads (theta, z, h)
+vs. `RotationMinGRU`'s 4 / `SignedMinGRU`'s 3 (mind parameter-matched
+comparisons); `hidden_size` must be a multiple of `block_size` and
+`block_size` must be even (`ValueError` otherwise); `h_0` is an intrinsic
+learned parameter with no `learnable_h0` flag (see "State conventions");
+stacks holding more than one Givens block construct without the
+multi-rotation warning, since the continuous transition has no
+straight-through snap to compound. The scan is O(T log T) work / O(log T)
+depth in pure torch ops. Numerical agreement vs. the sequential path is
+covered in "Implementation notes," above.
+
+## Delta variant (`DeltaMinGRU`)
+
+The promoted default when per-token state is free to grow. Where the
+rotation family carries a per-token vector through a non-commutative
+scan, `DeltaMinGRU` carries a per-head `d_k×d_v` matrix as its state:
+a real associative memory, not a rotated vector, updated at each
+token by `nh` generalized-Householder rank-1 corrections. That is the
+DeltaNet (Yang et al., 2024) / DeltaProduct (Siems et al., NeurIPS
+2025) delta rule, implemented here as a packaged mixer rather than a
+lab reimplementation (contrast the mechanism-level `DeltaNetMixer`
+reimplementation under "Rotation variant," above, used only for the
+S3/parity incumbent comparison). The parallel `forward` computes the
+update through the chunked-WY transform, the DeltaNet literature's
+parallel form of the delta rule (`chunk_size` is a performance-only
+knob; results are invariant to it); the sequential `step` returns
+`(y_t, h_t)` rather than `h_t` alone, since readout and carried state
+differ (`carries_matrix_state=True`). Capacity is set through four
+kwargs, `n_heads`, `nh`, `d_k`, `d_v`, flattened to `(B,
+n_heads·d_k·d_v)` and zero-initialized (no learned `h_0`); as the
+"Measured CPU cost" note below covers, this per-token state is a
+capacity knob independent of `d_model`, and cost/memory stay nearly
+flat as it grows.
+
+**Measured CPU cost.** The parallel k×k scan (`GivensMinGRU`'s) is not
+the cheap path on CPU, and neither is any sequential loop: the cheap
+path is `DeltaMinGRU`'s chunked-WY `forward` (`mixer="delta"`), the
+DeltaNet literature's parallel form of the delta rule, implemented in
+this package. Under the pinned bench (`experiments/bench/delta_paths.md`;
 torch 2.5.1, the same machine as every number in this README), one
 uncontended forward+backward step at `B = 128, T = 64` (min of three
 runs) costs 0.0577s for the chunked-WY delta against 0.1617s for the
@@ -1121,16 +1161,9 @@ composers are at the docs site's
 and in `experiments/EXPERIMENTS.md` (rounds `hetero-loop-20-pd64`,
 `hetero-loop-21-pd1024`, `hetero-gpu36-*`).
 
-Practical differences from the other mixers: 3 linear heads (theta, z, h)
-vs. `RotationMinGRU`'s 4 / `SignedMinGRU`'s 3 (mind parameter-matched
-comparisons); `hidden_size` must be a multiple of `block_size` and
-`block_size` must be even (`ValueError` otherwise); `h_0` is an intrinsic
-learned parameter with no `learnable_h0` flag (see "State conventions");
-stacks holding more than one Givens block construct without the
-multi-rotation warning, since the continuous transition has no
-straight-through snap to compound. The scan is O(T log T) work / O(log T)
-depth in pure torch ops. Numerical agreement vs. the sequential path is
-covered in "Implementation notes," above.
+`DeltaMinGRU`'s time-decay support — a per-token gate on the carried
+matrix state, distinct from the other mixers' per-step scalar decay —
+is covered in "Time-aware decay," below.
 
 ## Time-aware decay
 
