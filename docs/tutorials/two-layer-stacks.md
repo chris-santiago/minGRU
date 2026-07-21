@@ -88,32 +88,9 @@ Treat that warning as a signal to prefer a `GivensMinGRU` composer over stacked 
 
 ## Why this order? The measured evidence
 
-Layer order on `S3-hier` is not a matter of taste. It is measured. All figures below are multi-seed means at the standard 1600-step budget with best-val@128 checkpoint selection (best-val@128 = keep the checkpoint that scored highest on held-out length-128 validation), from `experiments/EXPERIMENTS.md` (rounds `hetero-legB-v2`, `hetero-loop-17-sg8`) and the README's `S3-hier` table. Chance is $\approx 0.167$.
+Layer order on `S3-hier` is not a matter of taste. It is measured: extract-then-compose beats the reverse, and a `GivensMinGRU` composer beats a stacked-rotation one at matched state. Putting the extractor first (`signed → givens`) holds well above chance out past $4\times$ training length, while reversing the order (`rotation → signed`) collapses toward chance, and stacking two rotation blocks trails a single Givens composer decisively at the same 64-element per-token state. That said, the rule is *extract-then-compose*, not *signed-always-first*: on the simpler `S3` probe, where each token already **is** the operation and there is nothing to extract, the ordering flips and `rotation → signed` matches or beats `signed → rotation`. Choose the order from the task's structure, not a fixed preference for either mixer.
 
-| stack (`mixer=`) | seeds | acc@64 | acc@256 | acc@512 | acc@1024 |
-|---|---|---|---|---|---|
-| `["signed", "givens"]` (extract → compose) | 12 | 0.949 | 0.885 | 0.787 | 0.613 |
-| `["signed", "rotation"]` (extract → 2D compose) | 6 | 0.572 | 0.442 | 0.375 | 0.309 |
-| `["rotation", "signed"]` (compose → extract) | 3 | 0.448 | 0.325 | 0.247 | 0.206 |
-| `["rotation", "rotation"]` | 3 | 0.365 | 0.256 | 0.212 | 0.189 |
-
-Two facts drive the recommendation:
-
-- **Extract before you compose.** Putting the extractor first (`signed → …`) beats the reverse (`rotation → signed`, near chance). Composing raw sub-tokens first builds a mixture that nothing downstream is observed to take apart.
-- **Use a Givens composer, not a stacked-rotation one.** At a matched 64-element per-token state, swapping the 2D-rotation composer for `GivensMinGRU` raises the fit rate from **1 of 12 seeds to 8 of 12** (Fisher exact $p \approx 0.009$), for under +2.2% of full-stack parameters. The rounds ablation (`hetero-loop-19-rounds`) confirms this is the coupling: `rounds=1` (disjoint commuting planes) fits 0 of 12, `rounds=2` fits 6 of 12, `rounds=3` fits 8 of 12.
-
-Like every continuous composer here, `signed → givens` still decays with length (0.613 @1024) rather than forming an exact length-invariant attractor. The large gaps — fit versus chance — are the trustworthy signal, not small differences between adjacent rows.
-
-## Order is task-dependent
-
-The rule is *extract-then-compose*, not *signed-always-first*. On the simpler `S3` probe, where each token **is** an operation (no extraction stage), there is nothing to extract first, and the ordering flips: `rotation → signed` matches or slightly beats `signed → rotation` (round `hetero-legA`, task `S3`, best-val@128, 3 seeds):
-
-| stack (`mixer=`, task `S3`) | acc@64 | acc@256 | acc@512 | acc@1024 |
-|---|---|---|---|---|
-| `["rotation", "signed"]` | 1.000 | 1.000 | 0.9986 | 0.9663 |
-| `["signed", "rotation"]` | 0.999 | 0.976 | 0.9403 | 0.8626 |
-
-So: choose the order from the *task's* structure. If raw tokens carry the operation, compose directly; if the operation is buried and must be recovered first, extract in the lower layer and compose above it.
+The full multi-seed tables, the Fisher-exact significance tests, and the round tags behind these numbers live in [Choose a mixer](../how-to/choose-a-mixer.md#the-two-axis-guidance) and the [Givens & Delta deep dive](../explanation/givens-delta.md); both link back to the same underlying `experiments/EXPERIMENTS.md` rounds.
 
 ## Reproduce the full fit
 
@@ -121,10 +98,11 @@ The `signed → givens` numbers above are reproducible from a repo checkout. The
 
 ## What you built
 
-You constructed a hierarchical stack (a `SignedMinGRU` extractor feeding a `GivensMinGRU` composer, the small-state option for extract-then-compose problems), configured each layer through the type-keyed `mixer_kwargs` schema, saw the warning that flags a fragile stacked-rotation ordering, and grounded the ordering choice in the measured `S3-hier` and `S3` evidence. Swap the composer for `mixer=["signed", "delta"]` with `mixer_kwargs={"delta": {...}}` if your per-token state is free to grow; see [How-to: choose a mixer](../how-to/choose-a-mixer.md#the-two-axis-guidance) for when to make that swap.
+You constructed a hierarchical stack (a `SignedMinGRU` extractor feeding a `GivensMinGRU` composer, the small-state option for extract-then-compose problems), configured each layer through the type-keyed `mixer_kwargs` schema, saw the warning that flags a fragile stacked-rotation ordering, and grounded the ordering choice in the measured `S3-hier` and `S3` evidence. Swap the composer for `mixer=["signed", "delta"]` with `mixer_kwargs={"delta": {"n_heads": 4, "nh": 2}}` instead if your per-token state is free to grow: [Your first delta model](first-delta-model.md) builds and trains exactly that stack.
 
 ## Next steps
 
+- [Your first delta model](first-delta-model.md): swap the composer for `DeltaMinGRU` when your per-token state is free to grow, and learn its `(y_t, h_t)` step return.
 - [Choose a mixer](../how-to/choose-a-mixer.md): the per-mixer decision table.
 - [Reproduce the evidence](../how-to/reproduce-the-evidence.md): run the ordering experiment yourself.
 - [Givens & Delta deep dive](../explanation/givens-delta.md): the brick-wall Givens parameterization, the chunked-WY delta-rule composer, and the evidence that separates them.

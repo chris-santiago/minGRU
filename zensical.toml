@@ -26,12 +26,14 @@ nav = [
         { "Overview"          = "tutorials/index.md" },
         { "Getting started"   = "tutorials/getting-started.md" },
         { "Two-layer stacks"  = "tutorials/two-layer-stacks.md" },
+        { "Your first delta model" = "tutorials/first-delta-model.md" },
         { "Triton on GPU"     = "tutorials/triton-on-gpu.md" },
     ] },
 
     { "How-to" = [
         { "Overview"                = "how-to/index.md" },
         { "Choose a mixer"          = "how-to/choose-a-mixer.md" },
+        { "Enable time decay"       = "how-to/enable-time-decay.md" },
         { "Control scan dispatch"   = "how-to/control-scan-dispatch.md" },
         { "Run the benchmarks"      = "how-to/run-the-benchmarks.md" },
         { "Reproduce the evidence"  = "how-to/reproduce-the-evidence.md" },
