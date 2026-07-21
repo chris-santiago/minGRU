@@ -815,3 +815,78 @@ def test_probe_raise_contract_still_green_under_the_override_fall_through():
     for task_name in ("mqar", "psmnist", "pendulum"):
         with pytest.raises(ValueError, match="no PROBE_ARMS round tag"):
             build_probe_task_report(task_name, [])
+
+
+# --------------------------- 12. disclosure (payload key + provenance line) --
+# (design spec §4 "Disclosure", §6 "disclosure record"): a report whose arm
+# set includes an overridden arm must record `arm_round_overrides` in its
+# JSON payload and render a provenance line naming the arm, its correction
+# round, and the primary round every other arm came from; a report with no
+# overridden arm must serialize/render exactly as before (empty payload
+# key, no provenance line). Both cases must discriminate -- a test that
+# passes regardless of whether the override is disclosed proves nothing.
+def test_matrix_report_discloses_the_overridden_arm_present_case():
+    """PRESENT case: `signed-rotation` (a real, currently-populated
+    override) is in `MATRIX_ARMS`, so a matrix report's
+    `arm_round_overrides` must be non-empty and name it, and the rendered
+    Markdown must carry a provenance line naming the arm, its correction
+    round, and the primary `-02` round."""
+    row = _s5_row(0, "signed-rotation", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)
+    row["round"] = BENCH_ARM_ROUND_OVERRIDES["signed-rotation"]["s5"]
+
+    report = build_task_report("s5", [row])
+
+    assert report["arm_round_overrides"] == {"signed-rotation": row["round"]}
+    md = render_markdown(report)
+    assert "signed-rotation" in md
+    assert row["round"] in md
+    assert ROUND_TAGS["s5"] in md
+    assert "Provenance" in md
+
+
+def test_matrix_report_discloses_nothing_absent_case(monkeypatch):
+    """ABSENT case: with the override map emptied (no overridden arm in
+    the arm set), `arm_round_overrides` must be empty and the rendered
+    Markdown must carry no provenance line -- output otherwise unchanged
+    from the pre-disclosure shape."""
+    monkeypatch.setattr(report_benchmarks, "ARM_ROUND_OVERRIDES", {})
+    row = _s5_row(0, "log", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)
+
+    report = build_task_report("s5", [row])
+
+    assert report["arm_round_overrides"] == {}
+    md = render_markdown(report)
+    assert "Provenance" not in md
+
+
+def test_probe_report_discloses_the_overridden_arm_present_case():
+    """PRESENT case for the population-report path: `signed-rotation-k5`
+    is a real, currently-populated override on `s5`, so the probe report's
+    `arm_round_overrides` must be non-empty and name it, and the rendered
+    Markdown must carry a provenance line."""
+    row = _s5_row(0, "signed-rotation-k5", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)
+    row["round"] = BENCH_ARM_ROUND_OVERRIDES["signed-rotation-k5"]["s5"]
+
+    report = build_probe_task_report("s5", [row])
+
+    assert report["arm_round_overrides"] == {"signed-rotation-k5": row["round"]}
+    md = render_probe_markdown(report)
+    assert "signed-rotation-k5" in md
+    assert row["round"] in md
+    assert "Provenance" in md
+
+
+def test_probe_report_discloses_nothing_absent_case(monkeypatch):
+    """ABSENT case for the population-report path: with the override map
+    emptied, `signed-delta-nh4` (no override entry regardless) resolves
+    from the population's own probe tag, so `arm_round_overrides` must be
+    empty and the rendered Markdown must carry no provenance line."""
+    monkeypatch.setattr(report_benchmarks, "ARM_ROUND_OVERRIDES", {})
+    row = _s5_row(0, "signed-delta-nh4", val128=1.0, t256=1.0, t512=1.0, t1024=1.0)
+    row["round"] = BENCH_PROBE_ROUND_TAGS["s5"]
+
+    report = build_probe_task_report("s5", [row])
+
+    assert report["arm_round_overrides"] == {}
+    md = render_probe_markdown(report)
+    assert "Provenance" not in md

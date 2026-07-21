@@ -131,7 +131,7 @@ import argparse
 import json
 import operator
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -477,18 +477,38 @@ def _fisher_vs_reference(arm_reports: dict[str, ArmReport]) -> dict[str, dict[st
 
 
 # ------------------------------------------------------------------ report
+def _arm_round_overrides(task_name: str, arms: Iterable[str], primary_tag: str) -> dict[str, str]:
+    """``{overridden arm: source round}`` for every arm in ``arms`` whose
+    resolved source round (`_source_round_for_arm`) differs from
+    ``primary_tag`` -- the disclosure record (design spec §4 "Disclosure",
+    §6 "disclosure record"). Empty when no arm in ``arms`` is overridden
+    for ``task_name`` (e.g. the empty-override-map case, or a task/arm set
+    with no registered correction). Shared by both `build_task_report`
+    (arms = ``MATRIX_ARMS``, primary = the matrix tag) and
+    `_build_population_task_report` (arms = ``pop.arms``, primary = the
+    population's own tag) so the disclosure rule cannot drift between the
+    two payload builders, mirroring how both already share
+    `_source_round_for_arm` itself."""
+    return {
+        arm: source
+        for arm in arms
+        if (source := _source_round_for_arm(task_name, arm, primary_tag)) != primary_tag
+    }
+
+
 def build_task_report(task_name: str, all_rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Assemble the full ``bench_<task>.json`` payload for ``task_name``
     from ``all_rows`` (already-loaded ledger rows, any round) -- pure
     function of its inputs, no file I/O, so tests can pass synthetic rows
     directly."""
     task = TASKS[task_name]
+    primary_tag = ROUND_TAGS[task_name]
     by_arm_rows = _rows_for_task(all_rows, task_name)
     arm_reports = {arm: _build_arm_report(task, arm, rows) for arm, rows in by_arm_rows.items()}
     all_task_rows = [row for rows in by_arm_rows.values() for row in rows]
     return {
         "task": task_name,
-        "round": ROUND_TAGS[task_name],
+        "round": primary_tag,
         "fit_metric": task.fit_metric,
         "fit_threshold": task.fit_threshold,
         "fit_direction": task.fit_direction,
@@ -497,6 +517,7 @@ def build_task_report(task_name: str, all_rows: list[dict[str, Any]]) -> dict[st
         "arms": {arm: asdict(rep) for arm, rep in arm_reports.items()},
         "fisher_vs_reference": _fisher_vs_reference(arm_reports),
         "stratum_labels": _stratum_labels(all_task_rows),
+        "arm_round_overrides": _arm_round_overrides(task_name, MATRIX_ARMS, primary_tag),
         "env": {
             "torch": torch.__version__,
             "git_commit": git_commit_sha(),
@@ -535,6 +556,28 @@ def _render_stratum_line(stratum_labels: list[dict[str, Any]]) -> str:
         else " -- MULTIPLE DISTINCT STRATA OBSERVED (never mix silently)"
     )
     return f"Stratum(s) observed: {strata_str}{anomaly}"
+
+
+def _render_provenance_lines(report: dict[str, Any]) -> list[str]:
+    """Mixed-provenance disclosure line(s) (design spec §4 "Disclosure",
+    §6 "disclosure record"), shared by `render_markdown` and
+    `_render_population_markdown` so the provenance block is never inlined
+    twice. Returns ``[]`` -- no line rendered -- when
+    ``report["arm_round_overrides"]`` is empty (the common case today: no
+    overridden arm present), so a report with no overridden arm renders
+    exactly as before this key existed. Otherwise returns one line naming
+    each overridden arm, its correction round, and the primary round every
+    other arm in this report was read from."""
+    overrides = report["arm_round_overrides"]
+    if not overrides:
+        return []
+    primary = report["round"]
+    corrections = "; ".join(f"{arm} <- `{source}`" for arm, source in overrides.items())
+    return [
+        "",
+        f"Provenance: {corrections} (other arms: `{primary}`) -- this report mixes rounds; "
+        "see `arm_round_overrides` in the JSON payload.",
+    ]
 
 
 def _render_fits_table_lines(arms: dict[str, dict[str, Any]]) -> list[str]:
@@ -626,8 +669,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"Env: torch {env['torch']}, commit {env['git_commit']}, generated {env['generated']}.",
         "",
         _render_stratum_line(report["stratum_labels"]),
-        "",
     ]
+    lines += _render_provenance_lines(report)
+    lines.append("")
 
     lines += _render_fits_table_lines(arms)
     lines += _render_robustness_lines(arms, report["robustness_thresholds"])
@@ -769,12 +813,13 @@ def _build_population_task_report(
             f"{pop.round_tags_name} only covers {sorted(pop.round_tags)}"
         )
     task = TASKS[task_name]
+    primary_tag = pop.round_tags[task_name]
     by_arm_rows = _rows_for_population(all_rows, task_name, pop)
     arm_reports = {arm: _build_arm_report(task, arm, rows) for arm, rows in by_arm_rows.items()}
     all_task_rows = [row for rows in by_arm_rows.values() for row in rows]
     return {
         "task": task_name,
-        "round": pop.round_tags[task_name],
+        "round": primary_tag,
         pop.payload_key: True,  # non-matched arm(s) -- never in the matched -02 accounting
         "fit_metric": task.fit_metric,
         "fit_threshold": task.fit_threshold,
@@ -782,6 +827,7 @@ def _build_population_task_report(
         "robustness_thresholds": list(task.robustness),
         "arms": {arm: asdict(rep) for arm, rep in arm_reports.items()},
         "stratum_labels": _stratum_labels(all_task_rows),
+        "arm_round_overrides": _arm_round_overrides(task_name, pop.arms, primary_tag),
         "env": {
             "torch": torch.__version__,
             "git_commit": git_commit_sha(),
@@ -850,8 +896,9 @@ def _render_population_markdown(report: dict[str, Any], pop: _AuxPopulation) -> 
         f"Env: torch {env['torch']}, commit {env['git_commit']}, generated {env['generated']}.",
         "",
         _render_stratum_line(report["stratum_labels"]),
-        "",
     ]
+    lines += _render_provenance_lines(report)
+    lines.append("")
     lines += _render_fits_table_lines(arms)
     lines += _render_robustness_lines(arms, report["robustness_thresholds"])
     lines += _render_completeness_lines(arms)
