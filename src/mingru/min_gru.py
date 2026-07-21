@@ -2716,7 +2716,7 @@ class GivensMinGRU(DecayMixin, nn.Module):
         )
 
 
-class DeltaMinGRU(nn.Module):
+class DeltaMinGRU(DecayMixin, nn.Module):
     """DeltaNet/DeltaProduct generalized-Householder delta-rule mixer.
 
     Departs from the other four mixers' diagonal/rotation-scan
@@ -2773,11 +2773,17 @@ class DeltaMinGRU(nn.Module):
     tolerance, but close enough to it that the default (not an
     oversized) chunk size is recommended for long sequences.
 
-    Time decay is not supported: the constructor rejects any ``decay is
-    not None`` (``decay``/``decay_rate``/``log1p_delta`` are accepted
-    only for signature uniformity with the other mixers -- folding a
-    per-token decay into the delta-rule composition is unimplemented),
-    and both ``forward``/``step`` reject any ``delta_t`` unconditionally.
+    Time decay construction is supported (``decay="fixed"``/
+    ``"learnable"``, via the shared ``DecayMixin`` contract -- see
+    ``MinGRU`` for the ``gamma = exp(-lambda * f(delta_t))`` mechanics,
+    one rate per head here), but folding a per-token decay into the
+    delta-rule computation is not yet implemented: ``forward``/``step``
+    construct and accept a paired ``delta_t`` without error, but raise
+    ``NotImplementedError`` when actually called with decay active (a
+    follow-up task lands the gated computation). ``decay=None`` (the
+    default) is unaffected: construction, ``forward``, and ``step`` stay
+    byte-identical to this mixer before it gained the ``DecayMixin``
+    contract.
 
     Parameters
     ----------
@@ -2808,25 +2814,39 @@ class DeltaMinGRU(nn.Module):
         and ``C >= T`` and ragged final chunks). Validated at
         construction (must be positive).
     decay : {"fixed", "learnable", None}, default=None
-        Must be ``None`` -- time decay is not implemented for the
-        delta-rule transition. Accepted for signature uniformity with
-        the other mixers only.
+        Exponential time decay of the carried associative-memory state,
+        via the shared ``DecayMixin`` contract (see ``MinGRU`` for the
+        ``gamma = exp(-lambda * f(delta_t))`` mechanics); one rate per
+        head (``num_channels=n_heads``). ``None`` disables decay:
+        ``delta_t`` must then be omitted, and construction/forward/step
+        are byte-identical to the module without this feature.
+        Construction with ``"fixed"``/``"learnable"`` is supported now;
+        calling ``forward``/``step`` with decay active currently raises
+        ``NotImplementedError`` (the gated computation lands in a
+        follow-up task).
     decay_rate : float, default=1.0
-        Unused (``decay`` must be ``None``); accepted for signature
-        uniformity.
+        Fixed decay rate, or the learnable rate's init target
+        (``softplus(rho) == decay_rate`` at construction); unused when
+        ``decay=None``.
     log1p_delta : bool, default=False
-        Unused (``decay`` must be ``None``); accepted for signature
-        uniformity.
+        If True, ``delta_t`` is passed through ``log1p`` before scaling
+        by ``lambda`` (compresses large gaps); unused when
+        ``decay=None``.
 
     Raises
     ------
     ValueError
         If ``n_heads``, ``nh``, or ``chunk_size`` is not positive; if
         ``d_k`` is not given and ``hidden_size`` is not divisible by
-        ``n_heads``; or if ``decay`` is not ``None`` (at construction).
-        If ``delta_t`` is given (``forward``/``step``, decay can never
-        be enabled) or ``h_0``/``h_prev`` has the wrong shape (at call
+        ``n_heads``; or if ``decay`` is not one of ``None``, ``"fixed"``,
+        ``"learnable"`` (at construction). If ``decay`` is enabled
+        without ``delta_t``, or ``delta_t`` is given without decay
+        enabled, or ``h_0``/``h_prev`` has the wrong shape (at call
         time).
+    NotImplementedError
+        If ``forward``/``step`` is called with decay active (a
+        non-``None`` ``delta_t``): the gated computation is not yet
+        implemented (see class docstring).
 
     Notes
     -----
@@ -2895,14 +2915,6 @@ class DeltaMinGRU(nn.Module):
             raise ValueError(f"nh must be positive (got {nh})")
         if chunk_size <= 0:
             raise ValueError(f"chunk_size must be positive (got {chunk_size})")
-        if decay is not None:
-            raise ValueError(
-                f"DeltaMinGRU does not support time decay (got decay={decay!r}); "
-                "construct with decay=None. Folding per-token decay into the "
-                "delta-rule composition is not implemented; decay/decay_rate/"
-                "log1p_delta are accepted only for signature uniformity with "
-                "the other mixers."
-            )
         if d_k is None and hidden_size % n_heads != 0:
             raise ValueError(
                 f"hidden_size ({hidden_size}) must be divisible by n_heads "
@@ -2917,13 +2929,6 @@ class DeltaMinGRU(nn.Module):
         self.d_k = d_k if d_k is not None else hidden_size // n_heads
         self.d_v = d_v if d_v is not None else self.d_k
         self.chunk_size = chunk_size
-        # decay is always None here (validated above); decay_rate/
-        # log1p_delta are stored unused, for attribute-shape parity with
-        # the other mixers (e.g. MinGRUStack's `block.mingru.decay`
-        # routing check reads `.decay` on every mixer generically).
-        self.decay = decay
-        self.decay_rate = decay_rate
-        self.log1p_delta = log1p_delta
         # RNG-draw order mirrors experiments/variants.py's DeltaNetMixer:
         # linear_q, then linear_k/linear_v/linear_beta (each an
         # nh-length ModuleList, in micro-step order), then out_proj.
@@ -2938,6 +2943,7 @@ class DeltaMinGRU(nn.Module):
             nn.Linear(input_size, n_heads, bias=bias) for _ in range(nh)
         )
         self.out_proj = nn.Linear(n_heads * self.d_v, hidden_size, bias=bias)
+        self._init_decay(decay, decay_rate, log1p_delta, num_channels=self.n_heads)
 
     def _coeffs(
         self, x: torch.Tensor
@@ -3148,8 +3154,16 @@ class DeltaMinGRU(nn.Module):
             ``(B, 1, n_heads*d_k*d_v)`` in ``(n_heads, d_k, d_v)``
             row-major order. Defaults to zero (empty memory).
         delta_t : torch.Tensor, optional
-            Must be ``None`` -- ``DeltaMinGRU`` never enables decay, so
-            any non-``None`` value raises ``ValueError``.
+            Time gaps preceding each event, shape ``(B, T)`` or
+            ``(B, T, 1)``; required iff ``decay`` is enabled, following
+            the same pairing contract as the other mixers (``ValueError``
+            in either direction -- see ``DecayMixin._prepare_decay``).
+            Decay-active construction is supported, but the gated
+            chunked forward itself is not yet implemented: a non-
+            ``None`` ``delta_t`` currently raises
+            ``NotImplementedError`` (a follow-up task lands the
+            computation); ``decay=None`` (the default) runs the
+            unchanged decay-free forward below.
         return_state : bool, default=False
             If True, also return the final state ``h_T`` (same
             flattened shape as ``h_0``).
@@ -3163,13 +3177,20 @@ class DeltaMinGRU(nn.Module):
         Raises
         ------
         ValueError
-            If ``delta_t`` is not None, or ``h_0``'s shape does not
-            match ``(B, 1, n_heads*d_k*d_v)``.
+            If ``decay`` is enabled without ``delta_t``, or ``delta_t``
+            is given without decay enabled; or if ``h_0``'s shape does
+            not match ``(B, 1, n_heads*d_k*d_v)``.
+        NotImplementedError
+            If ``delta_t`` is provided (decay active): the gated
+            chunked forward is not yet implemented.
         """
-        if delta_t is not None:
-            raise ValueError(
-                "delta_t was provided but DeltaMinGRU never supports time "
-                "decay (decay is always None); omit delta_t."
+        dt = self._prepare_decay(delta_t, canonical_ndim=2)
+        if dt is not None:
+            raise NotImplementedError(
+                "DeltaMinGRU(decay=...) constructs, but the gated chunked "
+                "forward is not yet implemented; it lands in a follow-up "
+                "task. Construct with decay=None to use the current "
+                "decay-free forward."
             )
         B, T, _ = x.shape
         expected = (B, 1, self.n_heads * self.d_k * self.d_v)
@@ -3260,8 +3281,16 @@ class DeltaMinGRU(nn.Module):
             Previous per-head associative-memory state, flattened shape
             ``(B, n_heads*d_k*d_v)``. Defaults to zero (empty memory).
         delta_t : torch.Tensor, optional
-            Must be ``None`` -- ``DeltaMinGRU`` never enables decay, so
-            any non-``None`` value raises ``ValueError``.
+            Time gap preceding this event, shape ``(B,)`` or ``(B, 1)``;
+            required iff ``decay`` is enabled, following the same
+            pairing contract as the other mixers (``ValueError`` in
+            either direction -- see ``DecayMixin._prepare_decay``).
+            Decay-active construction is supported, but the gated
+            sequential step itself is not yet implemented: a non-
+            ``None`` ``delta_t`` currently raises
+            ``NotImplementedError`` (a follow-up task lands the
+            computation); ``decay=None`` (the default) runs the
+            unchanged decay-free step below.
 
         Returns
         -------
@@ -3276,13 +3305,20 @@ class DeltaMinGRU(nn.Module):
         Raises
         ------
         ValueError
-            If ``delta_t`` is not None, or ``h_prev``'s shape does not
-            match ``(B, n_heads*d_k*d_v)``.
+            If ``decay`` is enabled without ``delta_t``, or ``delta_t``
+            is given without decay enabled; or if ``h_prev``'s shape
+            does not match ``(B, n_heads*d_k*d_v)``.
+        NotImplementedError
+            If ``delta_t`` is provided (decay active): the gated
+            sequential step is not yet implemented.
         """
-        if delta_t is not None:
-            raise ValueError(
-                "delta_t was provided but DeltaMinGRU never supports time "
-                "decay (decay is always None); omit delta_t."
+        dt = self._prepare_decay(delta_t, canonical_ndim=1)
+        if dt is not None:
+            raise NotImplementedError(
+                "DeltaMinGRU(decay=...) constructs, but the gated "
+                "sequential step is not yet implemented; it lands in a "
+                "follow-up task. Construct with decay=None to use the "
+                "current decay-free step."
             )
         B = x_t.size(0)
         expected = (B, self.n_heads * self.d_k * self.d_v)
@@ -3350,7 +3386,9 @@ class MinGRUBlock(nn.Module):
         ``{"n_heads": 4, "nh": 2}`` for ``"delta"``); pass ``decay``,
         ``decay_rate``, ``log1p_delta`` here to enable time decay (see
         ``MinGRU``/``SignedMinGRU``/``RotationMinGRU``/``GivensMinGRU``;
-        ``DeltaMinGRU`` rejects non-``None`` ``decay``).
+        ``DeltaMinGRU`` also constructs with decay enabled, but its
+        ``forward``/``step`` currently raise ``NotImplementedError`` if
+        actually called with decay active -- see its class docstring).
 
     Notes
     -----

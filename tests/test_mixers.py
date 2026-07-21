@@ -22,8 +22,10 @@ Sections
 
 from __future__ import annotations
 
+import json
 import math
 import warnings
+from pathlib import Path
 
 import pytest
 import torch
@@ -42,6 +44,7 @@ from mingru import (
 
 SEED = 42
 B, T, D_IN, D_H = 2, 5, 8, 6
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 
 def _step_sequence(mixer, x):
@@ -395,6 +398,48 @@ class TestDeltaMinGRU:
         assert DeltaMinGRU.carries_matrix_state is True
         assert getattr(MinGRU, "carries_matrix_state", False) is False
 
+    # -- decay=None bit-identity regression (non-negotiable) -------------
+
+    def test_decay_none_bit_identical_to_pre_decay_mixin(self):
+        """decay=None must stay byte-identical after DeltaMinGRU gained the
+        DecayMixin contract.
+
+        The golden fixture (tests/fixtures/delta_mingru_decay_none_golden.json)
+        was generated from the pre-DecayMixin DeltaMinGRU (the version at
+        HEAD before this change): same seed, same input, its state_dict
+        (values and key order -- no decay_rate_buf/rho keys), forward
+        output, and gradients. JSON round-trips float32 exactly (widening
+        to Python's double loses no bits, and the values never leave the
+        float32 grid). _init_decay draws no RNG and registers nothing when
+        decay=None, so this must hold by construction; this test proves
+        it rather than asserting it by argument.
+        """
+        fixture = json.loads(
+            (FIXTURES_DIR / "delta_mingru_decay_none_golden.json").read_text()
+        )
+        torch.manual_seed(fixture["seed"])
+        layer = DeltaMinGRU(
+            fixture["D_IN"], fixture["D_H"], n_heads=fixture["n_heads"], nh=fixture["nh"]
+        )
+
+        state_dict = layer.state_dict()
+        assert list(state_dict.keys()) == fixture["state_dict_keys"]
+        for key, golden in fixture["state_dict"].items():
+            assert torch.equal(state_dict[key], torch.tensor(golden)), (
+                f"state_dict[{key!r}] diverged"
+            )
+
+        x = torch.tensor(fixture["x"], requires_grad=True)
+        output = layer(x)
+        assert torch.equal(output, torch.tensor(fixture["output"]))
+
+        output.sum().backward()
+        assert torch.equal(x.grad, torch.tensor(fixture["x_grad"]))
+        for name, param in layer.named_parameters():
+            assert torch.equal(param.grad, torch.tensor(fixture["param_grads"][name])), (
+                f"gradient for {name!r} diverged"
+            )
+
     # -- constructor validation ---------------------------------------
 
     def test_nonpositive_n_heads_rejected(self):
@@ -409,9 +454,48 @@ class TestDeltaMinGRU:
         with pytest.raises(ValueError):
             DeltaMinGRU(D_IN, D_H, chunk_size=0)
 
-    def test_decay_rejected(self):
+    def test_fixed_decay_constructs_and_registers_buffer_last(self):
+        """DeltaMinGRU inherits DecayMixin: decay="fixed" must construct
+        (the old hard rejection is gone) and register decay_rate_buf as
+        the LAST direct buffer, per the construct-decay-last invariant.
+        """
+        torch.manual_seed(SEED)
+        layer = DeltaMinGRU(D_IN, D_H, n_heads=2, decay="fixed", decay_rate=1.0)
+        assert layer.decay == "fixed"
+        assert torch.equal(layer.decay_rate_buf, torch.tensor(1.0))
+        buf_keys = list(layer._buffers.keys())
+        assert buf_keys and buf_keys[-1] == "decay_rate_buf"
+
+    def test_learnable_decay_constructs_and_registers_rho_last(self):
+        """decay="learnable" must construct and register a per-head rho
+        (shape (n_heads,), not (hidden_size,) -- num_channels=n_heads is
+        the per-head gate), LAST among direct parameters.
+        """
+        torch.manual_seed(SEED)
+        layer = DeltaMinGRU(D_IN, D_H, n_heads=2, decay="learnable", decay_rate=1.0)
+        assert layer.decay == "learnable"
+        assert layer.rho.shape == (layer.n_heads,)
+        assert layer.rho.requires_grad
+        param_keys = list(layer._parameters.keys())
+        assert param_keys and param_keys[-1] == "rho"
+
+    def test_invalid_decay_mode_rejected(self):
         with pytest.raises(ValueError):
-            DeltaMinGRU(D_IN, D_H, n_heads=2, decay="fixed")
+            DeltaMinGRU(D_IN, D_H, n_heads=2, decay="sometimes")
+
+    def test_decay_enabled_requires_delta_t_in_forward(self):
+        torch.manual_seed(SEED)
+        layer = DeltaMinGRU(D_IN, D_H, n_heads=2, decay="fixed")
+        x = torch.randn(B, T, D_IN)
+        with pytest.raises(ValueError):
+            layer(x)
+
+    def test_decay_enabled_requires_delta_t_in_step(self):
+        torch.manual_seed(SEED)
+        layer = DeltaMinGRU(D_IN, D_H, n_heads=2, decay="fixed")
+        x_t = torch.randn(B, D_IN)
+        with pytest.raises(ValueError):
+            layer.step(x_t)
 
     def test_hidden_size_not_divisible_by_n_heads_rejected(self):
         """D_H (6) is not divisible by n_heads=4, and d_k is defaulted."""
