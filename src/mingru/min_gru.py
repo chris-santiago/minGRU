@@ -115,6 +115,7 @@ _VALID_SCAN_MODES = ("auto", "eager", "triton")
 _warned_scan_fallback = False
 _warned_angle_fallback = False
 _warned_delta_fallback = False
+_warned_delta_decay_fallback = False
 
 # DeltaMinGRU chunked-WY kernel: the measured win region for `MINGRU_SCAN=auto`.
 # Basis (stated here directly; measured on an NVIDIA L4, fwd+bwd medians,
@@ -601,6 +602,65 @@ def _dispatch_delta_scan(
         )
         _warned_delta_fallback = True
     return None
+
+
+def _delta_decay_dispatch_guard(is_cuda: bool) -> None:
+    """Apply the ``MINGRU_SCAN`` contract to ``DeltaMinGRU``'s decay-active
+    forward, which has no Triton kernel at all (deferred; see spec section 4).
+
+    ``DeltaMinGRU.forward`` calls this once, immediately before
+    ``_forward_chunked_gated``, only on the decay-active branch (``dt is not
+    None``) -- the decay-free branch keeps calling ``_delta_scan_should_try``/
+    ``_dispatch_delta_scan`` exactly as before, unaffected by this guard.
+    Reuses ``_resolve_scan_mode`` (frozen; call only) for the identical
+    ``MINGRU_SCAN`` validation and eager/CPU-``auto`` short-circuit every
+    other dispatch seam in this module shares, so the contract stays
+    consistent even though there's no kernel to attempt here: ``"triton"``
+    fails loud (never a silent eager downgrade -- decay is Triton-unsupported
+    today, not merely out of envelope), ``"auto"`` on CUDA warns once then
+    proceeds eager (there is nothing else to fall back to), and ``None``
+    (``"eager"``, or CPU-resident ``"auto"``) proceeds eager silently,
+    matching ``_resolve_scan_mode``'s own established convention.
+
+    Parameters
+    ----------
+    is_cuda : bool
+        Whether the mixer's input is CUDA-resident.
+
+    Returns
+    -------
+    None
+        Always returns ``None``; the caller runs ``_forward_chunked_gated``
+        unconditionally afterward on any non-raising return.
+
+    Raises
+    ------
+    ValueError
+        If ``MINGRU_SCAN`` is not one of ``"auto"``, ``"eager"``, ``"triton"``.
+    RuntimeError
+        If ``MINGRU_SCAN=triton`` -- decay has no Triton kernel (deferred),
+        so explicit ``triton`` can never be satisfied, on any device.
+    """
+    mode = _resolve_scan_mode(is_cuda)
+    if mode is None:
+        return  # eager, or auto with CPU inputs: silent eager, unchanged.
+    if mode == "triton":
+        raise RuntimeError(
+            "MINGRU_SCAN=triton requested for DeltaMinGRU's decay-active forward, "
+            "but decay has no Triton kernel (deferred; torch.compile is the "
+            "documented CUDA path for decay -- see the project docs)"
+        )
+    # mode == "auto" with CUDA-resident inputs: warn once, then run eager
+    # (there is no kernel to fall back from -- this is the only path).
+    global _warned_delta_decay_fallback
+    if not _warned_delta_decay_fallback:
+        warnings.warn(
+            "MINGRU_SCAN=auto is running DeltaMinGRU's decay-active forward "
+            "eagerly on CUDA input: no Triton kernel exists for decay yet "
+            "(deferred); torch.compile is the documented CUDA path for decay.",
+            stacklevel=3,
+        )
+        _warned_delta_decay_fallback = True
 
 
 def _cached_plane_meta_per_device(obj, attr: str, device: torch.device, build):
@@ -3301,9 +3361,17 @@ class DeltaMinGRU(DecayMixin, nn.Module):
             When decay is active, a non-``None`` ``delta_t`` routes to
             the eager gated chunked forward (``_forward_chunked_gated``),
             which threads the per-token gate through the same UT solve
-            and is tiling-invariant like the decay-free path;
-            ``decay=None`` (the default) runs the unchanged
-            fused-or-eager decay-free forward below.
+            and is tiling-invariant like the decay-free path. Triton has
+            no decay kernel (deferred), so this branch applies the
+            ``MINGRU_SCAN`` contract via ``_delta_decay_dispatch_guard``
+            before running eager: explicit ``MINGRU_SCAN=triton`` raises
+            ``RuntimeError`` (fails loud, never a silent eager downgrade);
+            ``auto`` on CUDA input warns once per process then proceeds
+            eager; ``eager``, or ``auto`` on a CPU input, proceeds eager
+            silently. ``decay=None`` (the default) runs the unchanged
+            fused-or-eager decay-free forward below, dispatched
+            unconditionally through ``_delta_scan_should_try``/
+            ``_dispatch_delta_scan`` exactly as before.
         return_state : bool, default=False
             If True, also return the final state ``h_T`` (same
             flattened shape as ``h_0``).
@@ -3332,11 +3400,13 @@ class DeltaMinGRU(DecayMixin, nn.Module):
             H = h_0.reshape(B, self.n_heads, self.d_k, self.d_v)
         if dt is not None:
             # Decay active: eager-only gated forward (log-space decay-ratio
-            # weighting of the same UT solve). Triton is decay-free, so the fused
-            # path is intentionally bypassed here (spec section 4; the
-            # MINGRU_SCAN warn-once/fail-loud contract for decay lands in a
-            # follow-up task). decay=None keeps its unchanged fused-or-eager
+            # weighting of the same UT solve). Triton is decay-free, so the
+            # fused path is intentionally bypassed here (spec section 4) --
+            # the guard below applies the MINGRU_SCAN contract (fail-loud
+            # triton, warn-once CUDA-auto, silent eager/CPU-auto) before
+            # running eager. decay=None keeps its unchanged fused-or-eager
             # path below, byte-identical to the recorded delta evidence.
+            _delta_decay_dispatch_guard(x.is_cuda)
             y, H = self._forward_chunked_gated(x, H, dt)
         else:
             fused = self._delta_fused_forward(x, H)

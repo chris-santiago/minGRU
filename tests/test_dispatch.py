@@ -31,6 +31,12 @@ Sections
    ``_dispatch_delta_scan`` assembles, and per-coordinate-unique marker
    values pin both the inbound permute and the outbound restore +
    reshape + ``out_proj``
+9. DeltaMinGRU decay-active dispatch guard -- ``_delta_decay_dispatch_guard``
+   applies the same ``MINGRU_SCAN`` contract to the decay-active
+   ``forward`` branch, which has no Triton kernel at all: ``triton`` fails
+   loud (any device), ``auto`` on CUDA input warns once then proceeds
+   eager, ``eager``/CPU-``auto`` proceed eager silently; ``decay=None``
+   dispatch is unaffected
 """
 
 from __future__ import annotations
@@ -71,6 +77,7 @@ def _isolate_dispatch(monkeypatch):
     monkeypatch.setattr(mg, "_warned_scan_fallback", False)
     monkeypatch.setattr(mg, "_warned_angle_fallback", False)
     monkeypatch.setattr(mg, "_warned_delta_fallback", False)
+    monkeypatch.setattr(mg, "_warned_delta_decay_fallback", False)
     sys.modules.pop(_TRITON_MODULE, None)
     yield
     sys.modules.pop(_TRITON_MODULE, None)
@@ -590,3 +597,140 @@ class TestDeltaSeamLayoutRoundTrip:
         y_flat = y_restored.reshape(B, T, n_heads * d_v)
         expected_out = layer.out_proj(y_flat)
         assert torch.equal(out, expected_out)
+
+
+# ===========================================================================
+# 9. DeltaMinGRU decay-active dispatch guard
+# ===========================================================================
+#
+# The decay-active `forward` branch (`dt is not None`) has no Triton kernel
+# at all -- Triton decay is deferred, so `_delta_decay_dispatch_guard` never
+# attempts one. It still owns the full `MINGRU_SCAN` contract: `triton`
+# fails loud (there is nothing to fall back to), `auto` on CUDA warns once
+# then proceeds eager (the only path available), and `eager`/CPU-`auto`
+# proceed silently, mirroring `_resolve_scan_mode`'s own convention. Driven
+# through real `DeltaMinGRU(decay=...)` forward calls (not the private
+# `_dispatch_delta_scan` stand-in) since the guard takes only `is_cuda`.
+
+
+class TestDeltaDecayDispatchGuard:
+    def _decay_layer(self):
+        torch.manual_seed(SEED)
+        return mg.DeltaMinGRU(input_size=6, hidden_size=8, n_heads=2, decay="fixed", decay_rate=1.0)
+
+    def test_triton_raises_runtime_error_naming_decay_unavailable(self, monkeypatch):
+        monkeypatch.setenv("MINGRU_SCAN", "triton")
+        layer = self._decay_layer()
+        x = torch.randn(2, 5, 6)
+        dt = torch.rand(2, 5)
+        with pytest.raises(RuntimeError) as exc:
+            layer(x, delta_t=dt)
+        message = str(exc.value).lower()
+        assert "decay" in message
+        assert "triton" in message
+
+    def test_eager_mode_runs_and_matches_plain_call(self, monkeypatch):
+        monkeypatch.setenv("MINGRU_SCAN", "eager")
+        layer = self._decay_layer()
+        x = torch.randn(2, 5, 6)
+        dt = torch.rand(2, 5)
+        with warnings.catch_warnings(record=True) as records:
+            warnings.simplefilter("always")
+            y = layer(x, delta_t=dt)
+        assert y.shape == (2, 5, 8)
+        assert records == []
+
+        monkeypatch.delenv("MINGRU_SCAN", raising=False)
+        H0 = x.new_zeros(2, layer.n_heads, layer.d_k, layer.d_v)
+        dt_prepared = layer._prepare_decay(dt, canonical_ndim=2)
+        y_expected, _ = layer._forward_chunked_gated(x, H0, dt_prepared)
+        y_expected = layer.out_proj(y_expected.reshape(2, 5, layer.n_heads * layer.d_v))
+        assert torch.equal(y, y_expected)
+
+    def test_auto_on_cpu_stays_silent_and_matches_eager(self, monkeypatch):
+        # MINGRU_SCAN unset -> defaults to auto; CPU input -> silent eager.
+        layer = self._decay_layer()
+        x = torch.randn(2, 5, 6)
+        dt = torch.rand(2, 5)
+        with warnings.catch_warnings(record=True) as records:
+            warnings.simplefilter("always")
+            y_auto = layer(x, delta_t=dt)
+        assert records == []
+
+        monkeypatch.setenv("MINGRU_SCAN", "eager")
+        y_eager = layer(x, delta_t=dt)
+        assert torch.equal(y_auto, y_eager)
+
+    def test_invalid_mode_raises_value_error(self, monkeypatch):
+        monkeypatch.setenv("MINGRU_SCAN", "turbo")
+        layer = self._decay_layer()
+        x = torch.randn(2, 5, 6)
+        dt = torch.rand(2, 5)
+        with pytest.raises(ValueError):
+            layer(x, delta_t=dt)
+
+    def test_cuda_auto_warns_once_via_direct_guard_call(self, monkeypatch):
+        """Mirrors `TestDeltaAutoWarnOnceFallback`: the guard is exercised
+        directly with a CUDA-residency stand-in bool (no real CUDA tensor
+        needed, since the guard takes only `is_cuda`), the same CPU-runnable
+        trick as the other fused-path warn-once tests in this file.
+        """
+        monkeypatch.setenv("MINGRU_SCAN", "auto")
+        with warnings.catch_warnings(record=True) as records:
+            warnings.simplefilter("always")
+            first = mg._delta_decay_dispatch_guard(True)
+            second = mg._delta_decay_dispatch_guard(True)
+        assert first is None
+        assert second is None
+        user_warnings = [w for w in records if issubclass(w.category, UserWarning)]
+        assert len(user_warnings) == 1
+        assert "decay" in str(user_warnings[0].message).lower()
+
+    def test_cuda_auto_warning_independent_of_other_fallback_flags(self, monkeypatch):
+        """The decay guard's warn-once flag is its own global, distinct from
+        `_warned_delta_fallback`/`_warned_scan_fallback`/`_warned_angle_fallback`."""
+        monkeypatch.setenv("MINGRU_SCAN", "auto")
+        q = _FakeCudaTensor()
+        with warnings.catch_warnings(record=True) as records:
+            warnings.simplefilter("always")
+            mg._dispatch_delta_scan(q, None, None, None, None, chunk_size=64)
+            mg._delta_decay_dispatch_guard(True)
+        user_warnings = [w for w in records if issubclass(w.category, UserWarning)]
+        assert len(user_warnings) == 2
+
+
+class TestDeltaDecayNoneDispatchUnchanged:
+    """`decay=None` dispatch must be completely unaffected by the new guard."""
+
+    def test_decay_none_auto_region_gate_still_engages(self, monkeypatch):
+        monkeypatch.setenv("MINGRU_SCAN", "auto")
+        assert mg._delta_scan_should_try(True, T=16 * 16, chunk_size=16, d_k=16) is True
+
+    def test_decay_none_forward_never_calls_the_decay_guard(self, monkeypatch):
+        """Poison the new guard so any call raises, then confirm decay=None
+        forward never reaches it under any `MINGRU_SCAN` mode -- the
+        decay=None branch (`_delta_fused_forward`/`_forward_chunked`) is
+        untouched, so it must never invoke `_delta_decay_dispatch_guard`.
+        """
+
+        def _poisoned(is_cuda):
+            raise AssertionError("decay guard must not run on the decay=None path")
+
+        monkeypatch.setattr(mg, "_delta_decay_dispatch_guard", _poisoned)
+        torch.manual_seed(SEED)
+        layer = mg.DeltaMinGRU(input_size=6, hidden_size=8, n_heads=2, nh=1)
+        x = torch.randn(2, 5, 6)
+        for mode in ("eager", "auto", "triton"):
+            monkeypatch.setenv("MINGRU_SCAN", mode)
+            if mode == "triton":
+                # Pre-existing, unrelated-to-this-task contract: explicit
+                # triton fails loud for the decay=None kernel path too on
+                # CPU (no CUDA available) -- confirms the RuntimeError comes
+                # from the unchanged `_dispatch_delta_scan` seam, not the
+                # poisoned decay guard (an AssertionError would surface
+                # instead if the guard were wrongly reached).
+                with pytest.raises(RuntimeError, match="chunked-WY"):
+                    layer(x)
+            else:
+                y = layer(x)
+                assert y.shape == (2, 5, 8)
