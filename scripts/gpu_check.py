@@ -138,6 +138,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))  # `experiments.*` (namespace package, no __init__.py)
 from experiments.benchmark_tasks import (  # noqa: E402
+    BENCH_ARM_ROUND_OVERRIDES,
     BENCH_PROBE_ROUND_TAGS,
     BENCH_REF_ROUND_TAGS,
     BENCH_ROUND_TAGS,
@@ -184,17 +185,27 @@ _BENCHMARKS_ENV_PREFIX = "MINGRU_LAB_ENV "
 # truth binding as `gpu_benchmark_campaign.py`'s `_PROBE_ROUND_TAGS`), AND
 # the psMNIST-only reference tag(s) from `BENCH_REF_ROUND_TAGS`
 # (`gpu_benchmark_campaign.py`'s `_REF_ROUND_TAGS`, the `gru-large`
-# grounding reference) -- the finish handler's dedup key already includes
-# `variant` (`_valid_benchmarks_key`), so a probe or ref arm's rows dedup
-# correctly on their own round tag without any further change here. One
-# round per task, independent of which arms/seeds that task's cell
-# selects.
+# grounding reference), AND the per-arm correction tags from
+# `BENCH_ARM_ROUND_OVERRIDES` (design spec, `.claude/output/specs/
+# 2026-07-21-round-tag-override-design.md` §4 Ingest: the override tags
+# join this allow-list so corrected rows are accepted, while every prior
+# tag -- including the now-superseded `bench-*-02` rotation-hetero rows
+# and the `bench-s5-probe-01` row -- stays parseable) -- the finish
+# handler's dedup key already includes `variant` (`_valid_benchmarks_key`),
+# so a probe, ref, or corrected arm's rows dedup correctly on their own
+# round tag without any further change here. One round per task,
+# independent of which arms/seeds that task's cell selects.
 _BENCHMARKS_ROUNDS_PILOT = ("bench-s5-01", "bench-mqar-01", "bench-psmnist-01", "bench-pendulum-01")
 _BENCHMARKS_ROUNDS = (
     _BENCHMARKS_ROUNDS_PILOT
     + tuple(BENCH_ROUND_TAGS.values())
     + tuple(BENCH_PROBE_ROUND_TAGS.values())
     + tuple(BENCH_REF_ROUND_TAGS.values())
+    + tuple(
+        tag
+        for per_task_tags in BENCH_ARM_ROUND_OVERRIDES.values()
+        for tag in per_task_tags.values()
+    )
 )
 
 

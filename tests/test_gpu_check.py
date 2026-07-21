@@ -862,19 +862,32 @@ def test_benchmarks_rounds_accepts_both_pilot_and_current_generations():
     for tag in BENCH_ROUND_TAGS.values():
         assert tag in _BENCH_ROUNDS
     # No accidental collision between the two generations (the S5-only
-    # probe round and the psMNIST-only ref round are two further,
-    # separately-counted generations -- see
-    # test_benchmarks_rounds_also_accepts_the_probe_round and
-    # test_benchmarks_rounds_also_accepts_the_ref_round below).
-    from experiments.benchmark_tasks import BENCH_PROBE_ROUND_TAGS, BENCH_REF_ROUND_TAGS
+    # probe round, the psMNIST-only ref round, and the per-arm correction
+    # overrides are three further, separately-counted generations -- see
+    # test_benchmarks_rounds_also_accepts_the_probe_round,
+    # test_benchmarks_rounds_also_accepts_the_ref_round, and
+    # test_benchmarks_rounds_also_accepts_the_override_rounds below).
+    from experiments.benchmark_tasks import (
+        BENCH_ARM_ROUND_OVERRIDES,
+        BENCH_PROBE_ROUND_TAGS,
+        BENCH_REF_ROUND_TAGS,
+    )
 
+    n_override_tags = sum(
+        len(per_task_tags) for per_task_tags in BENCH_ARM_ROUND_OVERRIDES.values()
+    )
     n_generations = (
         len(pilot_tags)
         + len(BENCH_ROUND_TAGS)
         + len(BENCH_PROBE_ROUND_TAGS)
         + len(BENCH_REF_ROUND_TAGS)
+        + n_override_tags
     )
     assert len(_BENCH_ROUNDS) == n_generations
+    # Pinned to the design spec's populated values (4 rotfix + 1
+    # probe-rotfix): this count must grow by exactly the override-tag
+    # generation, not drift silently if the override map's shape changes.
+    assert n_override_tags == 5
 
 
 def test_benchmarks_rounds_also_accepts_the_probe_round():
@@ -901,6 +914,46 @@ def test_benchmarks_rounds_also_accepts_the_ref_round():
     assert BENCH_REF_ROUND_TAGS == {"psmnist": "bench-psmnist-ref-01"}
     for tag in BENCH_REF_ROUND_TAGS.values():
         assert tag in _BENCH_ROUNDS
+
+
+def test_benchmarks_rounds_also_accepts_the_override_rounds():
+    """`_BENCHMARKS_ROUNDS` must additionally accept every per-arm
+    correction tag (`experiments.benchmark_tasks.BENCH_ARM_ROUND_OVERRIDES`,
+    round-tag override design spec §4 Ingest) -- the finish handler must
+    recognize corrected `signed-rotation`/`signed-rotation-k5` rows as this
+    job mode's own data too, alongside the pilot, matrix, probe, and ref
+    generations, while every superseded prior tag remains accepted
+    (spec's non-collision/never-mutated invariants)."""
+    from experiments.benchmark_tasks import BENCH_ARM_ROUND_OVERRIDES
+
+    assert BENCH_ARM_ROUND_OVERRIDES == {
+        "signed-rotation": {
+            "s5": "bench-s5-rotfix-01",
+            "mqar": "bench-mqar-rotfix-01",
+            "psmnist": "bench-psmnist-rotfix-01",
+            "pendulum": "bench-pendulum-rotfix-01",
+        },
+        "signed-rotation-k5": {
+            "s5": "bench-s5-probe-rotfix-01",
+        },
+    }
+    for per_task_tags in BENCH_ARM_ROUND_OVERRIDES.values():
+        for tag in per_task_tags.values():
+            assert tag in _BENCH_ROUNDS
+
+
+def test_valid_benchmarks_key_accepts_a_row_carrying_an_override_tag():
+    """A row whose round is a correction tag (not a pilot/matrix/probe/ref
+    tag) is accepted by the ingest key/allow-list -- the concrete
+    behavioral proof behind
+    test_benchmarks_rounds_also_accepts_the_override_rounds above."""
+    row = _bench_row("bench-s5-rotfix-01", "s5", "signed-rotation", 0)
+    assert gpu_check._valid_benchmarks_key(row, _BENCH_ROUNDS) == (
+        "bench-s5-rotfix-01",
+        "s5",
+        "signed-rotation",
+        0,
+    )
 
 
 def test_valid_benchmarks_key_accepts_a_probe_round_and_variant_row():
