@@ -3285,11 +3285,12 @@ class DeltaMinGRU(DecayMixin, nn.Module):
             required iff ``decay`` is enabled, following the same
             pairing contract as the other mixers (``ValueError`` in
             either direction -- see ``DecayMixin._prepare_decay``).
-            Decay-active construction is supported, but the gated
-            sequential step itself is not yet implemented: a non-
-            ``None`` ``delta_t`` currently raises
-            ``NotImplementedError`` (a follow-up task lands the
-            computation); ``decay=None`` (the default) runs the
+            When decay is active, the incoming state is decayed by this
+            token's per-head gamma once, at the token boundary
+            (``H <- gamma_t * H``), before the token's ``nh``
+            micro-steps run unchanged: carried memory decays, this
+            token's own writes do not (spec "Sequential gated
+            recurrence"). ``decay=None`` (the default) runs the
             unchanged decay-free step below.
 
         Returns
@@ -3308,18 +3309,8 @@ class DeltaMinGRU(DecayMixin, nn.Module):
             If ``decay`` is enabled without ``delta_t``, or ``delta_t``
             is given without decay enabled; or if ``h_prev``'s shape
             does not match ``(B, n_heads*d_k*d_v)``.
-        NotImplementedError
-            If ``delta_t`` is provided (decay active): the gated
-            sequential step is not yet implemented.
         """
         dt = self._prepare_decay(delta_t, canonical_ndim=1)
-        if dt is not None:
-            raise NotImplementedError(
-                "DeltaMinGRU(decay=...) constructs, but the gated "
-                "sequential step is not yet implemented; it lands in a "
-                "follow-up task. Construct with decay=None to use the "
-                "current decay-free step."
-            )
         B = x_t.size(0)
         expected = (B, self.n_heads * self.d_k * self.d_v)
         if h_prev is None:
@@ -3328,6 +3319,8 @@ class DeltaMinGRU(DecayMixin, nn.Module):
             if tuple(h_prev.shape) != expected:
                 raise ValueError(f"h_prev must have shape {expected} (got {tuple(h_prev.shape)})")
             H = h_prev.reshape(B, self.n_heads, self.d_k, self.d_v)
+        if dt is not None:
+            H = self._decay_gamma(dt).unsqueeze(-1).unsqueeze(-1) * H
         q, ks, vs, betas = self._coeffs(x_t)
         for j in range(self.nh):
             H = self._micro_step(H, ks[j], vs[j], betas[j])

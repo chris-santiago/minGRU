@@ -440,6 +440,78 @@ class TestDeltaMinGRU:
                 f"gradient for {name!r} diverged"
             )
 
+    # -- gated step (decay active; this is Task 3's correctness oracle) --
+
+    def test_gated_step_gamma_one_matches_ungated_fixed(self):
+        """gamma = exp(-lambda*0) = 1 exactly: gated step at delta_t=0 must
+        reduce to decay=None step bit-for-bit (decay="fixed").
+        """
+        torch.manual_seed(SEED)
+        decayed = DeltaMinGRU(D_IN, D_H, n_heads=2, decay="fixed", decay_rate=1.0)
+        torch.manual_seed(SEED)
+        plain = DeltaMinGRU(D_IN, D_H, n_heads=2)
+        x_t = torch.randn(B, D_IN)
+        h_prev = torch.randn(B, plain.n_heads * plain.d_k * plain.d_v)
+
+        y_decayed, h_decayed = decayed.step(x_t, h_prev=h_prev, delta_t=torch.zeros(B))
+        y_plain, h_plain = plain.step(x_t, h_prev=h_prev)
+        assert torch.equal(y_decayed, y_plain)
+        assert torch.equal(h_decayed, h_plain)
+
+    def test_gated_step_gamma_one_matches_ungated_learnable(self):
+        """Same gamma->1 reduction, decay="learnable" (softplus(rho) at init
+        equals decay_rate, so exp(-lambda*0) = 1 exactly, same as "fixed").
+        """
+        torch.manual_seed(SEED)
+        decayed = DeltaMinGRU(D_IN, D_H, n_heads=2, decay="learnable", decay_rate=1.0)
+        torch.manual_seed(SEED)
+        plain = DeltaMinGRU(D_IN, D_H, n_heads=2)
+        x_t = torch.randn(B, D_IN)
+        h_prev = torch.randn(B, plain.n_heads * plain.d_k * plain.d_v)
+
+        y_decayed, h_decayed = decayed.step(x_t, h_prev=h_prev, delta_t=torch.zeros(B))
+        y_plain, h_plain = plain.step(x_t, h_prev=h_prev)
+        assert torch.equal(y_decayed, y_plain)
+        assert torch.equal(h_decayed, h_plain)
+
+    def test_gated_step_attenuates_carried_state_monotonically(self):
+        """Larger delta_t -> smaller gamma -> less influence from h_prev:
+        the readout's distance to the h_prev=None (empty-memory) baseline
+        must shrink monotonically as delta_t grows (spec section 9 "Gate
+        semantics"), and a large delta_t must drive the readout arbitrarily
+        close to that baseline -- ``H <- gamma*H`` with ``gamma -> 0``
+        washes out carried memory without touching this token's own writes.
+        """
+        torch.manual_seed(SEED)
+        layer = DeltaMinGRU(D_IN, D_H, n_heads=2, decay="fixed", decay_rate=1.0)
+        x_t = torch.randn(B, D_IN)
+        h_prev = torch.randn(B, layer.n_heads * layer.d_k * layer.d_v)
+
+        y_empty, _ = layer.step(x_t, h_prev=None, delta_t=torch.zeros(B))
+        dists = []
+        for gap in (0.0, 1.0, 3.0, 10.0, 50.0):
+            y_gap, _ = layer.step(x_t, h_prev=h_prev, delta_t=torch.full((B,), gap))
+            dists.append((y_gap - y_empty).norm().item())
+        assert all(earlier > later for earlier, later in zip(dists, dists[1:], strict=False))
+        assert dists[-1] < 1e-4
+
+    def test_decay_none_step_matches_golden_fixture(self):
+        """decay=None step must reproduce the pre-DecayMixin golden
+        fixture's forward output via the step-sequence (forward == step
+        token-by-token for decay=None, per
+        ``test_forward_matches_step_nh1``/``nh3``): guards that step's
+        decay=None path stays byte-unchanged now that ``step`` also carries
+        a gated branch.
+        """
+        fixture = json.loads((FIXTURES_DIR / "delta_mingru_decay_none_golden.json").read_text())
+        torch.manual_seed(fixture["seed"])
+        layer = DeltaMinGRU(
+            fixture["D_IN"], fixture["D_H"], n_heads=fixture["n_heads"], nh=fixture["nh"]
+        )
+        x = torch.tensor(fixture["x"])
+        y_seq = _delta_step_sequence(layer, x)
+        assert torch.allclose(y_seq, torch.tensor(fixture["output"]), atol=1e-5)
+
     # -- constructor validation ---------------------------------------
 
     def test_nonpositive_n_heads_rejected(self):
