@@ -830,6 +830,32 @@ _DELTA_T_POSINF_CAP = 1e10
 # last-layer-only decay.
 _DECAY_MIXER_KWARGS = ("decay", "decay_rate", "log1p_delta")
 
+# Float32 stabilization floor for the gated DeltaMinGRU forward's per-token
+# log_gamma (= -lambda * dt) before the per-chunk cumulative sum (see
+# DeltaMinGRU._forward_chunked_gated). A token whose lambda*dt is enormous
+# (raw gap >~ 1e6, or a sanitized +inf -> the frozen _DELTA_T_POSINF_CAP of
+# 1e10) makes one log_gamma term so large that, in float32, it destroys the
+# cumulative-log precision of its chunk-mates -- their post-gap RELATIVE
+# decay collapses, breaking tiling-invariance and step-oracle agreement by
+# ~0.1-0.5 (finiteness still holds). Because exp(-88) ~ 6e-39 is already
+# float32-zero, clamping log_gamma to this floor is a log-sum-exp-style
+# stabilization: the clamped token's memory is wiped exactly as the
+# sequential oracle wipes it (gamma = 0), while the bounded intermediate
+# keeps the cumsum precise (restores oracle agreement to ~6e-7). -88 measured
+# best in a sweep (safe band [-1000, -40]; deeper re-plateaus). fp64 needs no
+# clamp -- its exponent range absorbs the 1e10 cap -- so it is left unclamped
+# and bit-identical.
+_LOG_GAMMA_FLOAT32_FLOOR = -88.0
+
+# Pathological-saturation warn threshold on lambda*dt for the float32 gated
+# DeltaMinGRU forward (see DeltaMinGRU._forward_chunked_gated). float32 error
+# crosses 1e-3 at lambda*dt ~ 1e5; this threshold sits one decade below that
+# knee. Past it, a once-per-instance warning advises log1p_delta=True or gap
+# rescaling. The clamp above already keeps the result correct; the warning is
+# a modeling signal, not a correctness crutch. fp64's equivalent knee is
+# ~1e14 (safe under the 1e10 cap for moderate lambda), so fp64 never warns.
+_DECAY_SATURATION_WARN_THRESHOLD = 1e4
+
 
 def _normalize_delta_t(
     delta_t: torch.Tensor, canonical_ndim: int, log1p_delta: bool = False
@@ -3001,6 +3027,11 @@ class DeltaMinGRU(DecayMixin, nn.Module):
             nn.Linear(input_size, n_heads, bias=bias) for _ in range(nh)
         )
         self.out_proj = nn.Linear(n_heads * self.d_v, hidden_size, bias=bias)
+        # Warn-once flag for the float32 gated-forward saturation guard (see
+        # _forward_chunked_gated). A plain bool attr, not a param/buffer, so it
+        # never touches the decay=None state_dict layout or bit-identity. Set
+        # BEFORE _init_decay to preserve the construct-decay-last discipline.
+        self._warned_fp32_decay_saturation = False
         self._init_decay(decay, decay_rate, log1p_delta, num_channels=self.n_heads)
 
     def _coeffs(
@@ -3273,6 +3304,38 @@ class DeltaMinGRU(DecayMixin, nn.Module):
         # decay ratio exp(diff) with diff <= 0 lies in (0, 1].
         lam = self._decay_lambda()  # () (fixed) or (n_heads,) (learnable)
         log_gamma = -lam.reshape(1, -1, 1) * dt.unsqueeze(1)  # (B, H_dim, T)
+
+        # Float32 stabilization (spec sections 6/8). One token whose lambda*dt
+        # is enormous (raw gap >~ 1e6, or a sanitized +inf -> the frozen 1e10
+        # cap) makes a single log_gamma term large enough to wipe the
+        # cumulative-log precision of its chunk-mates in float32, collapsing
+        # their post-gap relative decay (breaks tiling-invariance / oracle
+        # agreement by ~0.1-0.5; finiteness still holds). On the low-precision
+        # (non-fp64) path: (1) warn once on the PRE-clamp magnitude -- it must
+        # see the raw huge value -- CPU-only to avoid a CUDA host sync (the
+        # same posture as _normalize_delta_t); (2) clamp the already-saturated
+        # (float32-zero) term to a representable floor before the cumsum, a
+        # log-sum-exp stabilization returning the correct fully-decayed answer.
+        # fp64 is left bit-identical: its exponent range absorbs the 1e10 cap,
+        # so neither the warn nor the clamp engages.
+        if log_gamma.dtype != torch.float64:
+            if (
+                not self._warned_fp32_decay_saturation
+                and log_gamma.device.type == "cpu"
+                and bool((log_gamma < -_DECAY_SATURATION_WARN_THRESHOLD).any())
+            ):
+                warnings.warn(
+                    "delta_t gaps are large enough that lambda*delta_t exceeds "
+                    f"{_DECAY_SATURATION_WARN_THRESHOLD:g}, saturating the gated "
+                    "float32 forward: the affected tokens fully wipe memory "
+                    "(handled correctly via an internal clamp) but very large "
+                    "gaps become indistinguishable from one another. Pass "
+                    "log1p_delta=True or rescale delta_t to keep large gaps "
+                    "distinguishable.",
+                    stacklevel=2,
+                )
+                self._warned_fp32_decay_saturation = True
+            log_gamma = log_gamma.clamp(min=_LOG_GAMMA_FLOAT32_FLOOR)
 
         chunk_size = self.chunk_size
         y_chunks = []

@@ -1192,14 +1192,22 @@ rather than forcing a host sync, though the clamp always applies).
 `log1p_delta=True` applies `log1p` before scaling by `lambda`
 — useful when raw gaps span orders of magnitude, compressing the
 range `lambda` needs to operate over. For `DeltaMinGRU` under
-float32, `log1p_delta=True` is *required* when raw gaps can be very
-large or `+inf` (sentinel or corrupted timestamps): its chunked
-forward carries a per-token cumulative log-decay, and an
-uncompressed gap near the `1e10` `+inf`-sanitizer cap loses float32
-precision for tokens sharing a chunk with the gap — output stays
-finite but is no longer chunk-size invariant. `log1p` keeps that
-range float32-safe; the other four mixers apply decay per step with
-no chunk-cumulative log and are unaffected. Passing `delta_t` with
+float32, very large or `+inf` gaps (sentinel or corrupted
+timestamps) are handled correctly automatically: its chunked forward
+carries a per-token cumulative log-decay, and an internal float32
+clamp on that log-decay keeps output finite, chunk-size invariant,
+and matching the sequential `step` oracle even when a gap saturates
+(the affected token's memory is fully wiped, exactly as the oracle
+wipes it at `gamma = 0`). When a gap is large enough to saturate, the
+module emits a once-per-instance warning naming `log1p_delta` (on CPU
+inputs only; the correctness clamp always applies, but the warning is
+skipped on CUDA to avoid a host sync).
+`log1p_delta=True` is then *recommended* — not required for
+correctness — if you want very large gaps to stay *distinguishable*
+from one another rather than all saturating to a full wipe: it maps
+the gap through `log1p` first (`1e10 -> ~23`), keeping distinct large
+gaps distinct. The other four mixers apply decay per step with no
+chunk-cumulative log and are unaffected. Passing `delta_t` with
 decay disabled, or enabling decay without passing `delta_t`, both
 raise `ValueError` at call time.
 
