@@ -4,7 +4,7 @@
 
 Fit metric: `ckpt.val_acc` >= 0.9 (robustness triple: 0.88, 0.9, 0.92). Computed from `experiments/lab_results.jsonl` (rows matching this reference round's tag); regenerated whole by `scripts/report_benchmarks.py`, never hand-edited.
 
-Env: torch 2.13.0, commit e91944201560019e4bb24485f004bde56665af73, generated 2026-07-20T20:52:33.326719+00:00.
+Env: torch 2.13.0, commit 67653323f22a5db6a2e32113ec6e18e1eb975cf5, generated 2026-07-22T14:27:14.544686+00:00.
 
 Stratum(s) observed: device=cuda, torch=2.8.0+cu128, scan=triton, compile=None
 

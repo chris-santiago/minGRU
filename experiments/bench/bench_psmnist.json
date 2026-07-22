@@ -110,8 +110,8 @@
       },
       "params": 92682
     },
-    "rotation-hetero": {
-      "arm": "rotation-hetero",
+    "signed-rotation": {
+      "arm": "signed-rotation",
       "seeds_present": 12,
       "seeds_planned": 12,
       "present_seeds": [
@@ -131,12 +131,12 @@
       "missing_seeds": [],
       "fits": 0,
       "robustness": {
-        "0.88": 3,
+        "0.88": 0,
         "0.9": 0,
         "0.92": 0
       },
       "mean_acc": {
-        "test": 0.8679833333333334
+        "test": 0.7362000000000001
       },
       "fit_only_acc": {
         "test": null
@@ -320,7 +320,7 @@
       "fits": "0/12",
       "reference_fits": "0/12"
     },
-    "rotation-hetero": {
+    "signed-rotation": {
       "p": 1.0,
       "fits": "0/12",
       "reference_fits": "0/12"
@@ -359,9 +359,12 @@
       "compile": null
     }
   ],
+  "arm_round_overrides": {
+    "signed-rotation": "bench-psmnist-rotfix-01"
+  },
   "env": {
     "torch": "2.13.0",
-    "git_commit": "e91944201560019e4bb24485f004bde56665af73",
-    "generated": "2026-07-20T20:52:33.287492+00:00"
+    "git_commit": "67653323f22a5db6a2e32113ec6e18e1eb975cf5",
+    "generated": "2026-07-22T14:27:14.510731+00:00"
   }
 }

@@ -2,9 +2,11 @@
 
 Fit metric: `ckpt.val_acc` >= 0.9 (robustness triple: 0.88, 0.9, 0.92). Fisher reference arm: `log`. Computed from `experiments/lab_results.jsonl` (rows matching this round's tag); regenerated whole by `scripts/report_benchmarks.py`, never hand-edited.
 
-Env: torch 2.13.0, commit e91944201560019e4bb24485f004bde56665af73, generated 2026-07-20T20:52:33.287492+00:00.
+Env: torch 2.13.0, commit 67653323f22a5db6a2e32113ec6e18e1eb975cf5, generated 2026-07-22T14:27:14.510731+00:00.
 
 Stratum(s) observed: device=cuda, torch=2.8.0+cu128, scan=triton, compile=None
+
+Provenance: signed-rotation <- `bench-psmnist-rotfix-01` (other arms: `bench-psmnist-02`) -- this report mixes rounds; see `arm_round_overrides` in the JSON payload.
 
 ## Fits and generalization accuracy (raw / fit-only)
 
@@ -13,7 +15,7 @@ Stratum(s) observed: device=cuda, torch=2.8.0+cu128, scan=triton, compile=None
 | log | 12/12 | 0/12 | 0.784 / n/a | 84,234 |
 | signed | 12/12 | 0/12 | 0.857 / n/a | 92,554 |
 | rotation | 12/12 | 0/12 | 0.571 / n/a | 92,682 |
-| rotation-hetero | 12/12 | 0/12 | 0.868 / n/a | 92,618 |
+| signed-rotation | 12/12 | 0/12 | 0.736 / n/a | 92,618 |
 | givens | 12/12 | 0/12 | 0.290 / n/a | 96,842 |
 | delta | 12/12 | 10/12 | 0.905 / 0.908 | 118,554 |
 | signed-givens | 12/12 | 0/12 | 0.651 / n/a | 94,698 |
@@ -27,7 +29,7 @@ Stratum(s) observed: device=cuda, torch=2.8.0+cu128, scan=triton, compile=None
 | log | 0/12 | 0/12 | 0/12 |
 | signed | 0/12 | 0/12 | 0/12 |
 | rotation | 0/12 | 0/12 | 0/12 |
-| rotation-hetero | 3/12 | 0/12 | 0/12 |
+| signed-rotation | 0/12 | 0/12 | 0/12 |
 | givens | 0/12 | 0/12 | 0/12 |
 | delta | 12/12 | 10/12 | 2/12 |
 | signed-givens | 0/12 | 0/12 | 0/12 |
@@ -38,7 +40,7 @@ Stratum(s) observed: device=cuda, torch=2.8.0+cu128, scan=triton, compile=None
 
 - signed (0/12) vs log (0/12): p = 1
 - rotation (0/12) vs log (0/12): p = 1
-- rotation-hetero (0/12) vs log (0/12): p = 1
+- signed-rotation (0/12) vs log (0/12): p = 1
 - givens (0/12) vs log (0/12): p = 1
 - delta (10/12) vs log (0/12): p = 6.73e-05
 - signed-givens (0/12) vs log (0/12): p = 1
@@ -50,7 +52,7 @@ Stratum(s) observed: device=cuda, torch=2.8.0+cu128, scan=triton, compile=None
 - log: 12/12 present; complete
 - signed: 12/12 present; complete
 - rotation: 12/12 present; complete
-- rotation-hetero: 12/12 present; complete
+- signed-rotation: 12/12 present; complete
 - givens: 12/12 present; complete
 - delta: 12/12 present; complete
 - signed-givens: 12/12 present; complete

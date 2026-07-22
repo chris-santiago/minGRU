@@ -12,7 +12,7 @@ Every number on this page is the **L4 stratum**: NVIDIA L4, torch 2.8.0+cu128, t
 
 ### How to read a "fit"
 
-Nine arms run on each task: the six packaged single-stack mixers (`log`, `signed`, `rotation`, `rotation-hetero`, `givens`, `delta`), the two promoted heterogeneous stacks (`signed-givens`, `signed-delta`), and a depth-matched classical `gru` control (2-layer `nn.GRU`, $d_{model}=64$). Seed budget is tiered: 36 seeds for S5/MQAR/pendulum, 12 for psMNIST. Each task's fit bar was fixed before the matrices ran: S5 `val128` $\ge 0.99$, MQAR `val_qacc` $\ge 0.99$, psMNIST `val_acc` $\ge 0.90$, pendulum `val_mse` $\le 0.0014$. The Fisher reference arm is `log` throughout.
+Nine arms run on each task: the six packaged single-stack mixers (`log`, `signed`, `rotation`, `signed-rotation`, `givens`, `delta`), the two promoted heterogeneous stacks (`signed-givens`, `signed-delta`), and a depth-matched classical `gru` control (2-layer `nn.GRU`, $d_{model}=64$). Seed budget is tiered: 36 seeds for S5/MQAR/pendulum, 12 for psMNIST. Each task's fit bar was fixed before the matrices ran: S5 `val128` $\ge 0.99$, MQAR `val_qacc` $\ge 0.99$, psMNIST `val_acc` $\ge 0.90$, pendulum `val_mse` $\le 0.0014$. The Fisher reference arm is `log` throughout.
 
 On the generator tasks (S5, MQAR, pendulum) a "fit" is **trainability** — the seed reached its own validation-metric bar — not length generalization. The raw and fit-only accuracy columns carry the generalization read separately: raw pools all seeds, fit-only conditions on the fitting seeds. Both are always reported together.
 
@@ -25,7 +25,7 @@ Cells are the fit count at each task's fixed bar (S5/MQAR/pendulum $n=36$, psMNI
 | log | 0/36 | 0/36 | 0/12 | 36/36 |
 | signed | 0/36 | 0/36 | 0/12 | 36/36 |
 | rotation | 0/36 | 0/36 | 0/12 | 36/36 |
-| rotation-hetero | 0/36 | 0/36 | 0/12 | 36/36 |
+| signed-rotation | 0/36 | 0/36 | 0/12 | 36/36 |
 | givens | 0/36 | 0/36 | 0/12 | 36/36 |
 | delta | 0/36 | 36/36 | 10/12 | 36/36 |
 | signed-givens | 1/36 | 0/36 | 0/12 | 36/36 |
@@ -45,7 +45,7 @@ Fit bar `val128` $\ge 0.99$, 36 seeds/arm. Generalization columns are word-probl
 | log | 36/36 | 0/36 | 0.016 / n/a | 0.012 / n/a | 0.010 / n/a | 98,936 |
 | signed | 36/36 | 0/36 | 0.025 / n/a | 0.019 / n/a | 0.015 / n/a | 107,256 |
 | rotation | 36/36 | 0/36 | 0.020 / n/a | 0.015 / n/a | 0.012 / n/a | 107,384 |
-| rotation-hetero | 36/36 | 0/36 | 0.023 / n/a | 0.017 / n/a | 0.013 / n/a | 107,320 |
+| signed-rotation | 36/36 | 0/36 | 0.016 / n/a | 0.013 / n/a | 0.011 / n/a | 107,320 |
 | givens | 36/36 | 0/36 | 0.015 / n/a | 0.012 / n/a | 0.010 / n/a | 111,544 |
 | delta | 36/36 | 0/36 | 0.016 / n/a | 0.012 / n/a | 0.011 / n/a | 133,256 |
 | signed-givens | 36/36 | 1/36 | 0.058 / 1.000 | 0.049 / 0.976 | 0.038 / 0.817 | 109,400 |
@@ -65,7 +65,7 @@ Fit bar `val_qacc` $\ge 0.99$, 36 seeds/arm. Generalization columns are query ac
 | log | 36/36 | 0/36 | 0.112 / n/a | 0.081 / n/a | 91,712 |
 | signed | 36/36 | 0/36 | 0.044 / n/a | 0.036 / n/a | 100,032 |
 | rotation | 36/36 | 0/36 | 0.083 / n/a | 0.064 / n/a | 100,160 |
-| rotation-hetero | 36/36 | 0/36 | 0.047 / n/a | 0.038 / n/a | 100,096 |
+| signed-rotation | 36/36 | 0/36 | 0.064 / n/a | 0.051 / n/a | 100,096 |
 | givens | 36/36 | 0/36 | 0.030 / n/a | 0.030 / n/a | 104,320 |
 | delta | 36/36 | 36/36 | 0.931 / 0.931 | 0.493 / 0.493 | 126,032 |
 | signed-givens | 36/36 | 0/36 | 0.036 / n/a | 0.034 / n/a | 102,176 |
@@ -85,16 +85,27 @@ Fit bar `val_acc` $\ge 0.90$, 12 seeds/arm. Generalization column is test accura
 | log | 12/12 | 0/12 | 0.784 / n/a | 84,234 |
 | signed | 12/12 | 0/12 | 0.857 / n/a | 92,554 |
 | rotation | 12/12 | 0/12 | 0.571 / n/a | 92,682 |
-| rotation-hetero | 12/12 | 0/12 | 0.868 / n/a | 92,618 |
+| signed-rotation | 12/12 | 0/12 | 0.736 / n/a | 92,618 |
 | givens | 12/12 | 0/12 | 0.290 / n/a | 96,842 |
 | delta | 12/12 | 10/12 | 0.905 / 0.908 | 118,554 |
 | signed-givens | 12/12 | 0/12 | 0.651 / n/a | 94,698 |
 | signed-delta | 12/12 | 12/12 | 0.924 / 0.924 | 105,554 |
 | gru | 12/12 | 3/12 | 0.885 / 0.897 | 38,474 |
 
-psMNIST is an accumulation-ordering task and the delta family leads on fit rate: `signed-delta` $12/12$ (best, and the only threshold-stable fitting arm), `delta` $10/12$, `gru` $3/12$. On raw test accuracy the ordering is `signed-delta` $0.924$ > `delta` $0.905$ > `gru` $0.885$ > `rotation-hetero` $0.868$ > `signed` $0.857$ > `log` $0.784$ > `signed-givens` $0.651$ > `rotation` $0.571$ > `givens` $0.290$. Threshold-robustness across $\{0.88, 0.90, 0.92\}$: `signed-delta` $12/12/12$ (stable), `delta` $12/10/2$, `gru` $11/3/0$, `rotation-hetero` $3/0/0$; all others $0/0/0$. So the delta, gru, and rotation-hetero orderings are threshold-sensitive while `signed-delta`'s is stable. Two-sided Fisher exact vs `log` ($0/12$): `signed-delta` ($12/12$) $p = 7.396\times10^{-7}$, `delta` ($10/12$) $p = 6.73\times10^{-5}$, `gru` ($3/12$) $p = 0.2174$ (not separated from `log` at $n=12$); all other arms $p = 1$.
+psMNIST is an accumulation-ordering task and the delta family leads on fit rate: `signed-delta` $12/12$ (best, and the only threshold-stable fitting arm), `delta` $10/12$, `gru` $3/12$. On raw test accuracy the ordering is `signed-delta` $0.924$ > `delta` $0.905$ > `gru` $0.885$ > `signed` $0.857$ > `log` $0.784$ > `signed-rotation` $0.736$ > `signed-givens` $0.651$ > `rotation` $0.571$ > `givens` $0.290$ (the corrected `signed-rotation`, at $0.736$, sits below `signed` and `log`; see the [block-order ablation](#psmnist-block-order-ablation) below). Threshold-robustness across $\{0.88, 0.90, 0.92\}$: `signed-delta` $12/12/12$ (stable), `delta` $12/10/2$, `gru` $11/3/0$; `signed-rotation` and all remaining arms are $0/0/0$ (none clear even the $0.88$ bar). So the delta and gru orderings are threshold-sensitive while `signed-delta`'s is stable. Two-sided Fisher exact vs `log` ($0/12$): `signed-delta` ($12/12$) $p = 7.396\times10^{-7}$, `delta` ($10/12$) $p = 6.73\times10^{-5}$, `gru` ($3/12$) $p = 0.2174$ (not separated from `log` at $n=12$); all other arms $p = 1$.
 
 Two structure reads follow. The stacked pure-rotation configuration is the weakest region ($0.290$ givens, $0.571$ rotation), and adding a sign channel to givens *hurts* accumulation rather than helping: `signed-givens` ($0.651$) sits well below plain `signed` ($0.857$), the mirror of the S5 result where the sign channel is what makes givens work. The `gru` control lands at $0.885$ raw (fit-only $0.897$ on its 3 fitting seeds), just under the $0.90$ bar; the [gru-large reference](#gru-large-grounding-reference) below grounds whether that is the code path or the budget.
+
+### psMNIST block-order ablation
+
+The `signed-rotation` composer arm was originally run rotation-first (`["rotation", "signed"]`), a different block architecture than its extract-then-compose siblings `signed-givens` and `signed-delta`. It now runs in the corrected signed-first order (`["signed", "rotation"]`), so all three composer arms share one architecture. The swap is parameter-identical, so the only difference is the block order, and on psMNIST that order matters:
+
+| block order | round | fits (`val_acc` $\ge 0.90$) | acc@test (raw) | params |
+|---|---|---|---|---|
+| rotation-first `["rotation","signed"]` (superseded) | `bench-psmnist-02` | 0/12 | 0.868 | 92,618 |
+| signed-first `["signed","rotation"]` (current) | `bench-psmnist-rotfix-01` | 0/12 | 0.736 | 92,618 |
+
+The corrected extract-then-compose order costs $0.868 \to 0.736$ raw test accuracy ($-0.132$), with neither order clearing the fit bar. psMNIST is accumulation-ordering, not group composition: the block that touches the raw pixel stream first shapes the accumulation, and the richer non-diagonal rotation block on the input (rotation-first) accumulates better than routing the stream through the diagonal sign block first (signed-first). The original $0.868$ was partly an artifact of the accumulation-favorable rotation-first order; the apples-to-apples number, with the arm in the same architecture as its siblings, is $0.736$. Block order is task-dependent: extract-then-compose is the evidenced-correct order for group composition (see the [two-layer stacks tutorial](../tutorials/two-layer-stacks.md)) but a handicap for accumulation. The swap leaves the other three tasks (S5, MQAR, pendulum) unchanged; the [master matrix](#master-fit-matrix) above and every per-task table report the corrected signed-first numbers.
 
 ### Pendulum irregular-timestep regression
 
@@ -105,7 +116,7 @@ Fit bar `val_mse` $\le 0.0014$, 36 seeds/arm (regression task; no length-general
 | log | 36/36 | 36/36 | 83,970 |
 | signed | 36/36 | 36/36 | 92,290 |
 | rotation | 36/36 | 36/36 | 92,354 |
-| rotation-hetero | 36/36 | 36/36 | 92,226 |
+| signed-rotation | 36/36 | 36/36 | 92,226 |
 | givens | 36/36 | 36/36 | 96,466 |
 | delta | 36/36 | 36/36 | 118,162 |
 | signed-givens | 36/36 | 36/36 | 94,306 |
@@ -116,15 +127,15 @@ Pendulum is a **positive control**, not a decay-benchmark result. All nine arms 
 
 ## S5 design-correction probe
 
-The matched S5 comparison handicapped two arms by config: `rotation-hetero` snapped to element orders $(2,3,4,6)$, missing S5's order-5, and `signed-delta` ran at $nh=2$ (a low deltaproduct count). This probe re-runs three config-corrected arms on S5 only, to separate genuine mechanism limits from experiment-design artifacts. It is a **descriptive design-correction population, not part of the matched nine-arm accounting**, and it carries **no Fisher-exact contrast** (no competing-arm-vs-`log` judgment). Same L4 stratum. Transcribed from `experiments/bench/bench_s5_probe.md`:
+The matched S5 comparison handicapped two arms by config: `signed-rotation` snapped to element orders $(2,3,4,6)$, missing S5's order-5, and `signed-delta` ran at $nh=2$ (a low deltaproduct count). This probe re-runs three config-corrected arms on S5 only, to separate genuine mechanism limits from experiment-design artifacts. It is a **descriptive design-correction population, not part of the matched nine-arm accounting**, and it carries **no Fisher-exact contrast** (no competing-arm-vs-`log` judgment). Same L4 stratum. Transcribed from `experiments/bench/bench_s5_probe.md`:
 
 | arm | seeds | fits | acc@T256 (raw/fit-only) | acc@T512 (raw/fit-only) | acc@T1024 (raw/fit-only) | params |
 |---|---|---|---|---|---|---|
-| rotation-hetero-k5 | 36/36 | 0/36 | 0.023 / n/a | 0.016 / n/a | 0.013 / n/a | 107,320 |
+| signed-rotation-k5 | 36/36 | 0/36 | 0.015 / n/a | 0.012 / n/a | 0.011 / n/a | 107,320 |
 | signed-delta-nh3 | 36/36 | 0/36 | 0.030 / n/a | 0.020 / n/a | 0.014 / n/a | 128,836 |
 | signed-delta-nh4 | 36/36 | 7/36 | 0.247 / 0.992 | 0.211 / 0.892 | 0.144 / 0.618 | 137,416 |
 
-Adding S5's order-5 to the rotation snap grid (`rotation-hetero-k5`, `snap=(2,3,4,5,6)`) does not rescue rotation: still $0/36$, so that family's matched $0/36$ is a genuine mechanism limit, not the missing snap order. Raising the delta product count does: `signed-delta` at $nh=3$ is still $0/36$, but $nh=4$ reaches $7/36$ (threshold-stable at $7/36$ for the $0.99$ and $0.995$ bars, $8/36$ at $0.98$), with clean fit-only generalization on the fitting seeds ($0.992$ at $T256$, $0.892$ at $T512$, $0.618$ at $T1024$). A $k$-cycle needs $k-1$ reflections, and S5's 5-cycle needs four, so $nh=4$ is the Householder threshold, and the matched matrix's $nh=2$ `signed-delta` $0/36$ was under-powered by design. Net across matched and probe evidence, S5 has two solving arms: the continuous `signed-givens` ($1/36$ matched) and the Householder `signed-delta-nh4` ($7/36$ probe).
+Adding S5's order-5 to the rotation snap grid (`signed-rotation-k5`, `snap=(2,3,4,5,6)`) does not rescue rotation: still $0/36$. This probe now also runs the corrected signed-first block order (the same `["signed", "rotation"]` stack as the matched `signed-rotation` arm), so that $0/36$ is confirmed to be a genuine mechanism limit: not the missing snap order, and not the earlier rotation-first block-order confound either. Raising the delta product count does: `signed-delta` at $nh=3$ is still $0/36$, but $nh=4$ reaches $7/36$ (threshold-stable at $7/36$ for the $0.99$ and $0.995$ bars, $8/36$ at $0.98$), with clean fit-only generalization on the fitting seeds ($0.992$ at $T256$, $0.892$ at $T512$, $0.618$ at $T1024$). A $k$-cycle needs $k-1$ reflections, and S5's 5-cycle needs four, so $nh=4$ is the Householder threshold, and the matched matrix's $nh=2$ `signed-delta` $0/36$ was under-powered by design. Net across matched and probe evidence, S5 has two solving arms: the continuous `signed-givens` ($1/36$ matched) and the Householder `signed-delta-nh4` ($7/36$ probe).
 
 ## gru-large grounding reference
 
@@ -149,6 +160,6 @@ This two-dial reading does **not** contradict the earlier `S3-hier` result where
 
 ## Full evidence
 
-- Raw per-seed rows: `experiments/lab_results.jsonl` (round tags `bench-s5-02`, `bench-mqar-02`, `bench-psmnist-02`, `bench-pendulum-02`, `bench-s5-probe-01`, `bench-psmnist-ref-01`).
+- Raw per-seed rows: `experiments/lab_results.jsonl` (round tags `bench-s5-02`, `bench-mqar-02`, `bench-psmnist-02`, `bench-pendulum-02`, `bench-s5-probe-01`, `bench-psmnist-ref-01`, plus the `signed-rotation` composer-order correction rounds `bench-{s5,mqar,psmnist,pendulum}-rotfix-01` and `bench-s5-probe-rotfix-01`). The superseded rotation-first `rotation-hetero(-k5)` rows under the `-02` / `-probe-01` tags are retained as history but no longer surfaced in the tables above; the matrix reports source `signed-rotation` from its correction round and disclose the mixed provenance.
 - Machine tables: `experiments/bench/bench_{s5,mqar,psmnist,pendulum}.md`, `bench_s5_probe.md`, `bench_psmnist_ref.md` (regenerated whole by `scripts/report_benchmarks.py`, never hand-edited).
 - Round-by-round ledger: [`experiments/EXPERIMENTS.md`](https://github.com/chris-santiago/minGRU/blob/main/experiments/EXPERIMENTS.md).

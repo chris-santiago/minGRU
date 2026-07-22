@@ -11,8 +11,8 @@
     0.995
   ],
   "arms": {
-    "rotation-hetero-k5": {
-      "arm": "rotation-hetero-k5",
+    "signed-rotation-k5": {
+      "arm": "signed-rotation-k5",
       "seeds_present": 36,
       "seeds_planned": 36,
       "present_seeds": [
@@ -61,9 +61,9 @@
         "0.995": 0
       },
       "mean_acc": {
-        "T1024": 0.012697222222222223,
-        "T256": 0.023166666666666665,
-        "T512": 0.016427777777777777
+        "T1024": 0.010591666666666666,
+        "T256": 0.015408333333333333,
+        "T512": 0.012288888888888889
       },
       "fit_only_acc": {
         "T1024": null,
@@ -203,9 +203,12 @@
       "compile": null
     }
   ],
+  "arm_round_overrides": {
+    "signed-rotation-k5": "bench-s5-probe-rotfix-01"
+  },
   "env": {
     "torch": "2.13.0",
-    "git_commit": "e91944201560019e4bb24485f004bde56665af73",
-    "generated": "2026-07-20T20:52:33.345029+00:00"
+    "git_commit": "67653323f22a5db6a2e32113ec6e18e1eb975cf5",
+    "generated": "2026-07-22T14:27:14.560001+00:00"
   }
 }

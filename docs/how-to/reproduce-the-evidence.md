@@ -72,7 +72,7 @@ uv run python experiments/benchmark_lab.py --round bench-s5-02 --task s5 --model
 ```
 
 - `--task`: `s5`, `mqar`, `psmnist`, or `pendulum`.
-- `--model`: any `ARM_REGISTRY` arm, e.g. `log`, `signed`, `rotation`, `rotation-hetero`, `givens`, `delta`, `signed-givens`, `signed-delta`, or the classical `gru` control.
+- `--model`: any `ARM_REGISTRY` arm, e.g. `log`, `signed`, `rotation`, `signed-rotation`, `givens`, `delta`, `signed-givens`, `signed-delta`, or the classical `gru` control.
 - `--device`: `cpu` (default) or `cuda`. `--round`/`--task`/`--model` are required unless `--selftest` is passed.
 
 The committed evidence trains every arm on `cuda` under the L4 stratum via a Lightning AI batch job (foreground-only, no keepalive): `uv run python scripts/gpu_check.py --job benchmarks`, which runs `scripts/gpu_benchmark_campaign.py` inside the job. That job needs Lightning credentials and a GPU-billed machine, so it is not a local, drop-in command the way Step 1's replay is; if you have Lightning access, `--tasks`/`--arms`/`--seeds` subset which cells the job trains. Reproducing the full nine-arm x four-task matrix at the recorded seed counts is a GPU-stratum undertaking, not a CPU one.

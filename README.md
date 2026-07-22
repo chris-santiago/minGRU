@@ -54,7 +54,7 @@ The mixer family is validated on four accepted public benchmarks — S5 symmetri
 | log | 0/36 | 0/36 | 0/12 | 36/36 |
 | signed | 0/36 | 0/36 | 0/12 | 36/36 |
 | rotation | 0/36 | 0/36 | 0/12 | 36/36 |
-| rotation-hetero | 0/36 | 0/36 | 0/12 | 36/36 |
+| signed-rotation | 0/36 | 0/36 | 0/12 | 36/36 |
 | givens | 0/36 | 0/36 | 0/12 | 36/36 |
 | delta | 0/36 | 36/36 | 10/12 | 36/36 |
 | signed-givens | 1/36 | 0/36 | 0/12 | 36/36 |

@@ -1598,3 +1598,35 @@ Threshold-robustness ($\{0.88, 0.90, 0.92\}$): $12/12$, $12/12$, $11/12$. 12/12 
 Reading: the hidden-256 GRU reaches $0.922$ raw test accuracy and fits $12/12$ at the $0.90$ bar ($11/12$ even at $0.92$), squarely inside the literature vanilla-GRU band. This confirms the GRU code path is correct — the matched control's $0.885$ is a capacity/budget effect, not a bug — and grounds the family numbers: the matched signed-delta ($0.924$, $12/12$) and delta ($0.905$, $10/12$) arms match or exceed a literature-scale GRU at under a fifth of its parameter count ($105{,}554$ / $118{,}554$ vs $596{,}234$). Reported as a reference row only, never a matched competitor.
 
 Artifacts: per-seed rows in `experiments/lab_results.jsonl` (round tag `bench-psmnist-ref-01`, `experiments.benchmark_lab.REF_ARMS`); report `experiments/bench/bench_psmnist_ref.{json,md}` (`scripts/report_benchmarks.py`, no Fisher). gru-large job `mingru-gpu-benchmarks-9796a8e` (commit `9796a8e`); report generated at `e919442`, committed at `7eeb7ff`. Intent ledger `.claude/output/intent/2026-07-19-benchmark-round-intent.md` (amendment 2026-07-20, gru-large grounding reference).
+
+## Round: signed-rotation composer order correction (`bench-*-rotfix-01`)
+
+**Purpose (correction round, 2026-07-22).** The accepted-benchmark round's rotation composer arm was registered `["rotation", "signed"]` (rotation-first), while its two sibling composer arms compose extract-then-compose, signed-first: `signed-givens` (`["signed", "givens"]`) and `signed-delta` (`["signed", "delta"]`). Testing the rotation composer in a different block architecture than its siblings confounded the composer comparison. This round re-runs the arm in the corrected signed-first order `["signed", "rotation"]` (renamed `rotation-hetero` to `signed-rotation`, and its S5 K=5 probe `rotation-hetero-k5` to `signed-rotation-k5`), so all three composer arms share one architecture and mirror `probes.py`'s `minGRU-hetero-sr` row. The swap is parameter-identical (both orders build the same shapes), so any difference is the block order alone. The original `bench-*-02` / `bench-s5-probe-01` `rotation-hetero(-k5)` rows are retained above as superseded history; the corrected arm writes under fresh `bench-*-rotfix-01` round tags, resolved per arm by `experiments.benchmark_tasks.BENCH_ARM_ROUND_OVERRIDES`.
+
+**Stratum.** L4 (torch 2.8.0+cu128, triton 3.4.0, `MINGRU_SCAN=triton`; artifact line `device=cuda, torch=2.8.0+cu128, scan=triton, compile=None`), the same stratum as the matched round. Jobs `mingru-gpu-benchmarks-6765332` (matrix arm, four tasks) and `mingru-gpu-benchmarks-6765332-e2ook` (S5 probe), commit `6765332`.
+
+**Corrected `signed-rotation` results** (transcribed from the regenerated `experiments/bench/bench_{s5,mqar,psmnist,pendulum}.md`, sourced from `bench-*-rotfix-01`; the composite matrix reports disclose the mixed provenance via an `arm_round_overrides` record and a rendered provenance line):
+
+| task | seeds | fits | key generalization (raw) | params |
+|---|---|---|---|---|
+| S5 | 36/36 | 0/36 | acc@T256/T512/T1024 = 0.016 / 0.013 / 0.011 | 107,320 |
+| MQAR | 36/36 | 0/36 | acc@T256_p16/p32 = 0.064 / 0.051 | 100,096 |
+| psMNIST | 12/12 | 0/12 | acc@test = 0.736 | 92,618 |
+| pendulum | 36/36 | 36/36 | val_mse fit metric (no post-selection sweep) | 92,226 |
+
+Probe `signed-rotation-k5` (S5 only, `bench-s5-probe-rotfix-01`): 36/36 present, 0/36 fit, acc@T256/T512/T1024 = 0.015 / 0.012 / 0.011, 107,320 params.
+
+**What the correction changed.** Three of four tasks are unchanged within noise: S5 and MQAR stay $0/36$ (near-chance generalization under both orders), pendulum stays $36/36$, and the S5 K=5 probe stays $0/36$. Only psMNIST moves, and it moves substantially.
+
+**psMNIST block-order ablation** (same arm, same task, same protocol; only the composer block order differs):
+
+| block order | round | present | fits (val_acc $\ge 0.90$) | acc@test (raw) | params |
+|---|---|---|---|---|---|
+| rotation-first `["rotation","signed"]` | `bench-psmnist-02` (superseded) | 12/12 | 0/12 | 0.868 | 92,618 |
+| signed-first `["signed","rotation"]` | `bench-psmnist-rotfix-01` | 12/12 | 0/12 | 0.736 | 92,618 |
+
+Reading: the corrected extract-then-compose order costs the rotation composer $0.868 \to 0.736$ raw test accuracy ($-0.132$) on psMNIST, with neither order clearing the $0.90$ fit bar. psMNIST is an accumulation-ordering task, not group composition: the block that touches the raw pixel stream first shapes the accumulation, and the richer non-diagonal rotation block on the input (rotation-first) accumulated better than routing the stream through the diagonal sign block first (signed-first). The original $0.868$ was therefore partly an artifact of the accumulation-favorable rotation-first order; the apples-to-apples number, with the arm in the same architecture as its givens/delta siblings, is $0.736$. In the corrected psMNIST raw-accuracy ordering `signed-rotation` falls from 4th to 6th: signed-delta $0.924$ > delta $0.905$ > gru $0.885$ > signed $0.857$ > log $0.784$ > signed-rotation $0.736$ > signed-givens $0.651$ > rotation $0.571$ > givens $0.290$. Net: block order is task-dependent, helping group composition (the evidenced extract-then-compose rule) and hurting accumulation.
+
+**S5 conclusion, re-evaluated.** The matched round read S5's rotation-family $0/36$ as "a genuine mechanism limit, not the missing snap order" (the K=5 probe did not rescue it). The corrected order confirms and extends this: `signed-rotation` and `signed-rotation-k5` are still $0/36$ near-chance on S5, so the $0/36$ is not the missing snap order and not the rotation-first block-order confound either. S5's two solving arms remain the continuous `signed-givens` ($1/36$ matched) and the Householder `signed-delta-nh4` ($7/36$ probe).
+
+Artifacts: per-seed rows in `experiments/lab_results.jsonl` (round tags `bench-{s5,mqar,psmnist,pendulum}-rotfix-01`, `bench-s5-probe-rotfix-01`; the superseded `rotation-hetero(-k5)` rows under `bench-*-02` / `bench-s5-probe-01` are retained, never rewritten). Regenerated reports `experiments/bench/bench_{s5,mqar,psmnist,pendulum,s5_probe}.{json,md}` (`scripts/report_benchmarks.py`; the composite matrix reports source `signed-rotation` from its correction round and carry an `arm_round_overrides` provenance disclosure). Per-arm round-tag override mechanism: `experiments.benchmark_tasks.BENCH_ARM_ROUND_OVERRIDES` (design spec `.claude/output/specs/2026-07-21-round-tag-override-design.md`); commit lineage `c1bc57c` (rename + composer-order swap) through `6765332` (override mechanism + integrity tests).
