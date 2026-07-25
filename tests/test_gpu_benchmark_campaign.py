@@ -91,7 +91,11 @@ def test_round_tags_match_current_bench_round_tags():
     # -01 tags are now the recorded pilot/calibration population. This
     # module's `_ROUND_TAGS` binds directly to `experiments.benchmark_tasks
     # .BENCH_ROUND_TAGS`, the single source of truth, so this test also
-    # pins that the two never drift apart.
+    # pins that the two never drift apart. `churn` (Task 4, this round's own
+    # design spec) never had a heterogeneous-budget `-01` pilot population
+    # under this tag -- its pilot rows land under the distinct
+    # `bench-churn-01` tag from the start -- but it still gets a `-02`
+    # matrix tag here, same shape as every other task.
     from experiments.benchmark_tasks import BENCH_ROUND_TAGS
 
     assert _ROUND_TAGS == BENCH_ROUND_TAGS
@@ -100,6 +104,7 @@ def test_round_tags_match_current_bench_round_tags():
         "mqar": "bench-mqar-02",
         "psmnist": "bench-psmnist-02",
         "pendulum": "bench-pendulum-02",
+        "churn": "bench-churn-02",
     }
 
 
@@ -302,6 +307,108 @@ def test_run_arm_kwargs_shrinks_eval_every_alongside_steps_override():
     kwargs = _run_arm_kwargs("bench-s5-02", TASKS["s5"], "log", seed=0, steps=20, device="cpu")
     assert kwargs["steps"] == 20
     assert kwargs["eval_every"] == 20
+
+
+# --- _churn_row_provenance / run_campaign: churn dataset provenance -------
+
+_churn_row_provenance = gpu_benchmark_campaign._churn_row_provenance
+
+
+def test_churn_row_provenance_matches_the_loader_and_dataset_constants():
+    """Design spec section 6 row contract: `config` additionally records
+    `dataset_id`, `revision`, `split_seed`, the four vocab caps, and `T`.
+    Every value must equal the exact constant `CHURN_TASK`'s own loader
+    factory (`make_churn_loader`) is built from -- not an independently
+    hardcoded literal that could drift."""
+    from experiments.benchmark_tasks import (
+        CHURN_SPLIT_SEED,
+        ROSBANK_CURRENCY_CAP,
+        ROSBANK_DATASET_ID,
+        ROSBANK_MCC_CAP,
+        ROSBANK_REVISION,
+        ROSBANK_T,
+    )
+
+    provenance = _churn_row_provenance()
+
+    assert provenance == {
+        "dataset_id": ROSBANK_DATASET_ID,
+        "revision": ROSBANK_REVISION,
+        "split_seed": CHURN_SPLIT_SEED,
+        "mcc_cap": ROSBANK_MCC_CAP,
+        "trx_category_cap": None,
+        "channel_type_cap": None,
+        "currency_cap": ROSBANK_CURRENCY_CAP,
+        "T": ROSBANK_T,
+    }
+
+
+def _fake_churn_row(*, round_tag, task, arm, seed, steps, eval_every, device, dry_run):
+    return {
+        "round": round_tag,
+        "task": "churn",
+        "variant": arm,
+        "layers": 2,
+        "seed": seed,
+        "steps": 1,
+        "acc": {"test": 0.5},
+        "secs": 0.1,
+        "ckpt": {"epoch": 1, "val_auc": 0.5, "selection_val_auc": 0.5},
+        "config": {"budget": {"lr": 0.001, "batch_size": 8, "epochs": 1}},
+    }
+
+
+def test_run_campaign_merges_churn_provenance_into_row_config(monkeypatch, capsys):
+    """`run_campaign` must merge `_churn_row_provenance()` into a churn
+    row's `config` AFTER `benchmark_lab.run_arm` returns (module docstring:
+    "run_arm itself leaves churn's own config_extra empty ... provenance
+    lands at this campaign layer") -- verified on the actual printed
+    `MINGRU_LAB_ROW` line, not just the helper function in isolation, and
+    the merge must not drop `run_arm`'s own `budget` sub-dict."""
+    import experiments.benchmark_lab as benchmark_lab
+
+    monkeypatch.setattr(benchmark_lab, "run_arm", _fake_churn_row)
+
+    gpu_benchmark_campaign.run_campaign(["churn"], ["log"], [0], None, "cpu")
+
+    out = capsys.readouterr().out
+    row_lines = [
+        line for line in out.splitlines() if line.startswith(gpu_benchmark_campaign._ROW_PREFIX)
+    ]
+    assert len(row_lines) == 1
+    row = json.loads(row_lines[0][len(gpu_benchmark_campaign._ROW_PREFIX) :])
+    assert row["config"]["budget"] == {"lr": 0.001, "batch_size": 8, "epochs": 1}
+    for key, value in _churn_row_provenance().items():
+        assert row["config"][key] == value
+
+
+def test_run_campaign_does_not_add_churn_provenance_to_other_tasks(monkeypatch, capsys):
+    import experiments.benchmark_lab as benchmark_lab
+
+    def _fake_s5_row(*, round_tag, task, arm, seed, steps, eval_every, device, dry_run):
+        return {
+            "round": round_tag,
+            "task": "s5",
+            "variant": arm,
+            "layers": 2,
+            "seed": seed,
+            "steps": 1,
+            "acc": {"T256": 0.5},
+            "secs": 0.1,
+            "ckpt": {"step": 1, "val128": 0.5, "selection_val128": 0.5},
+            "config": {"budget": {"lr": 0.003, "batch_size": 8, "steps": 1, "eval_every": 1}},
+        }
+
+    monkeypatch.setattr(benchmark_lab, "run_arm", _fake_s5_row)
+    gpu_benchmark_campaign.run_campaign(["s5"], ["log"], [0], None, "cpu")
+
+    out = capsys.readouterr().out
+    row_lines = [
+        line for line in out.splitlines() if line.startswith(gpu_benchmark_campaign._ROW_PREFIX)
+    ]
+    row = json.loads(row_lines[0][len(gpu_benchmark_campaign._ROW_PREFIX) :])
+    for key in _churn_row_provenance():
+        assert key not in row["config"]
 
 
 # --- main(): --arms defaults to MATRIX_ARMS only (no per-task subset) -----

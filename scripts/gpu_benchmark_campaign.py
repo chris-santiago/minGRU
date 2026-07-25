@@ -10,12 +10,12 @@ full design.
 
 Task x arm matrix (spec section 1/6)
 -------------------------------------
-Four tasks (``s5``, ``mqar``, ``psmnist``, ``pendulum``), each run by
-default against ``experiments/benchmark_lab.py``'s ``MATRIX_ARMS`` (spec
-section 6 "Arms" fixed ``log``/``signed``/``rotation``/``givens``/
+Five tasks (``s5``, ``mqar``, ``psmnist``, ``pendulum``, ``churn``), each
+run by default against ``experiments/benchmark_lab.py``'s ``MATRIX_ARMS``
+(spec section 6 "Arms" fixed ``log``/``signed``/``rotation``/``givens``/
 ``delta``; ``signed-rotation`` was added by amendment, six total; a second
 amendment then added ``signed-givens``/``signed-delta``, eight total --
-every matrix arm runs on all four tasks, no per-task arm subset). Unlike
+every matrix arm runs on every task, no per-task arm subset). Unlike
 the GPU 36-seed round's ``gpu_hetero_campaign.py``,
 no arm here forces a distinct backend (no per-arm ``MINGRU_SCAN``/
 ``torch.compile`` split) -- every arm of a task runs under the same
@@ -48,9 +48,23 @@ writes under its own distinct ledger round tag
 (``experiments.benchmark_tasks.BENCH_REF_ROUND_TAGS``), resolved by
 ``_round_tag_for_arm`` alongside probe-arm routing.
 
+A fifth task, ``churn`` (rosbank-churn benchmark round, spec
+``.claude/output/specs/2026-07-25-churn-benchmark-design.md``), joins
+``TASKS`` -- selectable and default-included exactly like the original
+four tasks (this module's ``--tasks`` default/choices already read
+``experiments.benchmark_tasks.TASKS`` dynamically, so no arg-parser edit
+was needed), and run against the same nine ``MATRIX_ARMS``. Its rows'
+``config`` additionally carries dataset provenance (``dataset_id``,
+``revision``, ``split_seed``, the four categorical fields' vocab caps,
+and ``T``) merged in by ``_churn_row_provenance`` after ``run_arm``
+returns -- ``run_arm`` itself leaves churn's own ``config_extra`` empty
+(spec section 6 row contract; provenance lands at this campaign layer,
+not the task-agnostic driver, per the round's implementation plan).
+
 Round tags: ``bench-s5-02``, ``bench-mqar-02``, ``bench-psmnist-02``,
-``bench-pendulum-02`` -- one per task, independent of which MATRIX arms
-that task's cell selects, read from ``experiments.benchmark_tasks
+``bench-pendulum-02``, ``bench-churn-02`` -- one per task, independent of
+which MATRIX arms that task's cell selects, read from
+``experiments.benchmark_tasks
 .BENCH_ROUND_TAGS`` (the single source of truth this module and
 ``scripts/report_benchmarks.py`` both bind to). Bumped from the spec's
 original ``-01`` tags at the pre-matrix technical review (2026-07-19): the
@@ -74,7 +88,7 @@ Pre-flight (fail-loud, before seed 0, ``--device cuda`` only)
    stratum, matching ``gpu_hetero_campaign.py``'s pin) -- clear
    ``SystemExit`` if not.
 3. ``experiments/benchmark_lab.py --selftest`` run as a subprocess (tiny
-   model, few steps, all four tasks, dry-run only -- a wiring smoke test).
+   model, few steps, all five tasks, dry-run only -- a wiring smoke test).
    A non-zero exit raises ``SystemExit`` with the subprocess's stderr
    attached; this blocks a broken lab from burning a seed matrix (spec
    section 10). Run once, unconditionally, regardless of the invocation's
@@ -150,6 +164,12 @@ from experiments.benchmark_tasks import (  # noqa: E402
     BENCH_PROBE_ROUND_TAGS,
     BENCH_REF_ROUND_TAGS,
     BENCH_ROUND_TAGS,
+    CHURN_SPLIT_SEED,
+    ROSBANK_CURRENCY_CAP,
+    ROSBANK_DATASET_ID,
+    ROSBANK_MCC_CAP,
+    ROSBANK_REVISION,
+    ROSBANK_T,
 )
 
 _BENCHMARK_LAB_PATH = _REPO_ROOT / "experiments" / "benchmark_lab.py"
@@ -298,6 +318,34 @@ def _run_arm_kwargs(
         device=device,
         dry_run=True,
     )
+
+
+def _churn_row_provenance() -> dict[str, Any]:
+    """Dataset-provenance fields merged into every churn row's ``config``
+    (design spec section 6 row contract: "config additionally records
+    dataset_id, revision, split_seed, the four vocab caps, and T").
+
+    ``benchmark_lab.run_arm`` leaves churn's own ``config_extra`` empty
+    (module docstring's "fifth task" paragraph) -- this campaign layer adds
+    the provenance instead, built entirely from the same
+    ``experiments.benchmark_tasks`` module constants ``CHURN_TASK``'s own
+    loader factory (``make_churn_loader``) is built from, rather than
+    duplicating a literal here or constructing a second ``RosbankLoader``
+    just to read its attributes back. ``trx_category``/``channel_type``
+    have no numeric cap (``_build_vocab``'s own ``cap: int | None``
+    contract -- every distinct train-split value gets its own one-hot
+    slot), so their cap fields are ``None`` rather than an invented number.
+    """
+    return {
+        "dataset_id": ROSBANK_DATASET_ID,
+        "revision": ROSBANK_REVISION,
+        "split_seed": CHURN_SPLIT_SEED,
+        "mcc_cap": ROSBANK_MCC_CAP,
+        "trx_category_cap": None,
+        "channel_type_cap": None,
+        "currency_cap": ROSBANK_CURRENCY_CAP,
+        "T": ROSBANK_T,
+    }
 
 
 def _assert_cuda_and_torch_version() -> None:
@@ -460,6 +508,8 @@ def run_campaign(
                 # log -- see the module docstring's "Row transport" section.
                 with redirect_stdout(io.StringIO()):
                     row = benchmark_lab.run_arm(**kwargs)
+                if task_name == "churn":
+                    row["config"] = {**row["config"], **_churn_row_provenance()}
                 wall = time.perf_counter() - t0
                 print(_ROW_PREFIX + json.dumps(row), flush=True)
                 print(
@@ -481,7 +531,7 @@ def main(argv: list[str] | None = None) -> int:
         nargs="+",
         choices=sorted(benchmark_lab.TASKS),
         default=list(benchmark_lab.TASKS),
-        help="task subset (default: all four, spec order s5/mqar/psmnist/pendulum)",
+        help="task subset (default: all five, spec order s5/mqar/psmnist/pendulum/churn)",
     )
     parser.add_argument(
         "--arms",

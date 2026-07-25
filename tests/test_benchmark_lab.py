@@ -1233,12 +1233,12 @@ def test_bench_arm_round_overrides_keys_are_registered_arms_and_tasks():
 
 # ------------------------------------------------------ TaskSpec singletons
 def test_canonical_tasks_registry_shape():
-    assert set(TASKS) == {"s5", "mqar", "psmnist", "pendulum"}
+    assert set(TASKS) == {"s5", "mqar", "psmnist", "pendulum", "churn"}
     for name, task in TASKS.items():
         assert isinstance(task, TaskSpec)
         assert task.name == name
         assert isinstance(task.budget, Budget)
-        if task.loss_mode == "last_step":
+        if task.loss_mode in ("last_step", "last_step_timed"):
             assert task.budget.epochs is not None and task.budget.steps is None
         else:
             assert task.budget.steps is not None and task.budget.epochs is None

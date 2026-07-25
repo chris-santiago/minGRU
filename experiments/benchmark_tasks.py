@@ -1300,6 +1300,25 @@ class RosbankLoader:
         yield from _rosbank_ordered_batches(self._test, self.vocabs, self.batch_size)
 
 
+CHURN_SPLIT_SEED = 20260725  # one fixed production user-split seed (spec §4/§6), same single-constant-threaded-through-the-factory convention as PSMNIST_PERMUTATION_SEED below; recorded in every churn row's `config` by the campaign script (Task 4 of this round).
+
+
+def make_churn_loader(batch_size: int) -> RosbankLoader:
+    """`RosbankLoader` factory keyed only by `batch_size` (mirrors
+    `make_psmnist_loader`'s "wiring site" rationale: the driver constructs
+    the loader AFTER resolving CLI budget overrides, then asserts the two
+    batch sizes match). `CHURN_TASK.data` holds this factory, not a
+    `Loader` instance -- the same documented `last_step`/`last_step_timed`
+    exception `Loader`'s own docstring already calls out. Every other
+    constructor argument (`split_seed`, `T`, `mcc_cap`, `currency_cap`,
+    the user-split sizes, `root`, `download`) stays at `RosbankLoader`'s
+    own production defaults (spec §4/§6): `CHURN_SPLIT_SEED` is this
+    round's one fixed split seed, identical across every arm and seed,
+    exactly like `PSMNIST_PERMUTATION_SEED`.
+    """
+    return RosbankLoader(split_seed=CHURN_SPLIT_SEED, batch_size=batch_size)
+
+
 # ------------------------------------------------------- canonical TaskSpecs
 # Concrete TaskSpec singletons for the four benchmark-round tasks (spec §4
 # Global Constraints; landed here per the orchestrator's Task 4 brief, since
@@ -1419,11 +1438,38 @@ PENDULUM_TASK = TaskSpec(
     seeds=36,
 )
 
+# PILOT-PLACEHOLDER (churn round, spec `.claude/output/specs/2026-07-25-
+# churn-benchmark-design.md` §6: "Fit threshold, epochs, and lr are
+# pilot-frozen before the matrix") -- same treatment as PENDULUM_TAU above:
+# unlike S5/MQAR/psMNIST, this round's spec names no concrete Global-
+# Constraint AUROC threshold up front, so this is a reasonable starting
+# point, not yet calibrated. Chance is 0.5; the ptls literature sanity
+# anchor (spec §10, a much larger-scale supervised RNN) is ~0.818 --
+# CHURN_FIT_AUROC sits well above chance while leaving headroom for this
+# round's smaller feature-based models. Task 7's pilot round calibrates and
+# freezes the real value (and the robustness triple below) in the round
+# entries before any matrix seed runs.
+CHURN_FIT_AUROC = 0.65
+
+CHURN_TASK = TaskSpec(
+    name="churn",
+    loss_mode="last_step_timed",
+    data=make_churn_loader,
+    fit_metric="val_auc",
+    fit_threshold=CHURN_FIT_AUROC,
+    fit_direction="ge",
+    robustness=(CHURN_FIT_AUROC - 0.05, CHURN_FIT_AUROC, CHURN_FIT_AUROC + 0.05),
+    eval_protocol=(),  # no length/pair-count generalization axis (fixed T=256, spec §4/§6)
+    budget=Budget(lr=1e-3, batch_size=128, epochs=20),  # PILOT-PLACEHOLDER
+    seeds=36,
+)
+
 TASKS: dict[str, TaskSpec] = {
     "s5": S5_TASK,
     "mqar": MQAR_TASK,
     "psmnist": PSMNIST_TASK,
     "pendulum": PENDULUM_TASK,
+    "churn": CHURN_TASK,
 }
 
 # ------------------------------------------------------- ledger round tags
@@ -1450,6 +1496,13 @@ BENCH_ROUND_TAGS: dict[str, str] = {
     "mqar": "bench-mqar-02",
     "psmnist": "bench-psmnist-02",
     "pendulum": "bench-pendulum-02",
+    # churn (Task 4, this round's own design spec §6 "Round tags"): unlike
+    # the four bumped -01->-02 tags above, bench-churn-02 was never a
+    # heterogeneous-budget pilot population under this same tag -- churn's
+    # pilot rows land under the distinct bench-churn-01 tag from the start
+    # (see the churn design spec §6 and Task 7's pilot round), so there is
+    # no dedup-collision risk to bump away from here.
+    "churn": "bench-churn-02",
 }
 
 # Probe round tags (Amendments, `.claude/output/intent/2026-07-19-benchmark-

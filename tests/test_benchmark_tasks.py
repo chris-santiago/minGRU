@@ -22,6 +22,9 @@ Sections
    `PsMNISTLoader` end-to-end pass via monkeypatched torchvision
 8. auroc -- perfect/reversed/all-tied score orderings, a hand-computed
    tie case, shape mismatch and single-class-input errors
+9A/9B. Rosbank pure helpers and `RosbankLoader` end-to-end (Task 2)
+9C. `CHURN_TASK` registration -- `TASKS`/`BENCH_ROUND_TAGS` membership,
+   TaskSpec field contract, `make_churn_loader` factory wiring (Task 4)
 """
 
 from __future__ import annotations
@@ -37,6 +40,9 @@ import experiments.benchmark_tasks as benchmark_tasks_module
 import pytest
 import torch
 from experiments.benchmark_tasks import (
+    BENCH_ROUND_TAGS,
+    CHURN_SPLIT_SEED,
+    CHURN_TASK,
     MQAR_KEY_VOCAB,
     MQAR_TRAIN_PAIRS,
     MQAR_VALUE_VOCAB,
@@ -44,13 +50,17 @@ from experiments.benchmark_tasks import (
     PENDULUM_LENGTH,
     PENDULUM_SUBSTEPS,
     PSMNIST_T,
+    ROSBANK_CURRENCY_CAP,
     ROSBANK_EXPECTED_COLUMNS,
+    ROSBANK_MCC_CAP,
     ROSBANK_NAN_CHANNEL_TYPE,
+    ROSBANK_T,
     ROSBANK_TEST_USERS,
     ROSBANK_TRAIN_USERS,
     ROSBANK_VAL_USERS,
     S5_COMPOSE,
     S5_ELEMENTS,
+    TASKS,
     Budget,
     EvalConfig,
     PsMNISTLoader,
@@ -78,6 +88,7 @@ from experiments.benchmark_tasks import (
     _validate_rosbank_schema,
     _window_gap_days,
     auroc,
+    make_churn_loader,
     make_group_word,
     make_mqar,
     make_pendulum,
@@ -1486,3 +1497,71 @@ def test_rosbank_loader_real_download_cache_if_present():
         # pad positions are excluded since they are deliberately 0 by
         # construction regardless of any real predecessor gap.
         assert (split.dt[split.valid] >= 0).all()
+
+
+# ===========================================================================
+# 9C. CHURN_TASK registration (Task 4: task registration + campaign wiring)
+# ===========================================================================
+
+
+def test_churn_task_is_registered_in_tasks_and_bench_round_tags():
+    assert TASKS["churn"] is CHURN_TASK
+    assert BENCH_ROUND_TAGS["churn"] == "bench-churn-02"
+
+
+def test_churn_task_field_contract_matches_spec_section_6():
+    """Spec `.claude/output/specs/2026-07-25-churn-benchmark-design.md`
+    §6 TaskSpec contract: `loss_mode="last_step_timed"`,
+    `fit_metric="val_auc"`, `fit_direction="ge"`, epoch-based budget,
+    36 seeds, no post-selection generalization sweep (fixed T=256)."""
+    assert CHURN_TASK.name == "churn"
+    assert CHURN_TASK.loss_mode == "last_step_timed"
+    assert CHURN_TASK.data is make_churn_loader
+    assert CHURN_TASK.fit_metric == "val_auc"
+    assert CHURN_TASK.fit_direction == "ge"
+    assert CHURN_TASK.eval_protocol == ()
+    assert CHURN_TASK.seeds == 36
+    assert CHURN_TASK.budget.lr == 1e-3
+    assert CHURN_TASK.budget.batch_size == 128
+    assert CHURN_TASK.budget.epochs == 20
+    assert CHURN_TASK.budget.steps is None
+
+
+def test_churn_fit_threshold_is_a_pilot_placeholder_bracketed_by_chance_and_the_sanity_anchor():
+    """`CHURN_FIT_AUROC` (fit_threshold) is not yet pilot-calibrated (brief:
+    "threshold frozen post-pilot") -- it must still be a defensible AUROC
+    value strictly between chance (0.5) and the ptls literature sanity
+    anchor (~0.818, spec §10), with the robustness triple bracketing it in
+    ascending order and centered on the same value."""
+    assert 0.5 < CHURN_TASK.fit_threshold < 0.818
+    lo, mid, hi = CHURN_TASK.robustness
+    assert lo < mid < hi
+    assert mid == CHURN_TASK.fit_threshold
+
+
+def test_make_churn_loader_constructs_rosbank_loader_with_split_seed_and_batch_size(monkeypatch):
+    """`make_churn_loader` mirrors `make_psmnist_loader`'s factory
+    convention: every constructor argument beyond `split_seed`/
+    `batch_size` stays at `RosbankLoader`'s own production defaults."""
+    captured: dict = {}
+
+    class _FakeRosbankLoader:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(benchmark_tasks_module, "RosbankLoader", _FakeRosbankLoader)
+
+    loader = benchmark_tasks_module.make_churn_loader(64)
+
+    assert isinstance(loader, _FakeRosbankLoader)
+    assert captured == {"split_seed": CHURN_SPLIT_SEED, "batch_size": 64}
+
+
+def test_churn_row_provenance_constants_are_the_ones_the_loader_factory_uses():
+    """Sanity cross-check for `scripts/gpu_benchmark_campaign.py`'s
+    `_churn_row_provenance` (Task 4): the constants it records must be the
+    exact ones `make_churn_loader`/`RosbankLoader`'s own production
+    defaults are built from, not independently hardcoded literals."""
+    assert ROSBANK_MCC_CAP == 100
+    assert ROSBANK_CURRENCY_CAP == 5
+    assert ROSBANK_T == 256

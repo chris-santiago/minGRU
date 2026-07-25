@@ -10,8 +10,9 @@ task's generalization protocol, and emits one ledger row -- mirroring
 `experiments/hetero_lab.py`'s `run_arm` shape (seeding convention,
 checkpoint-selection loop, row assembly, `--dry-run` convention) but
 dispatching on `TaskSpec.loss_mode` instead of hardcoding one task's batch
-contract, since this round's four tasks span four different label shapes
-(dense / masked_query / last_step / regression -- spec §6).
+contract, since this round's five tasks span five different label shapes
+(dense / masked_query / last_step / regression / last_step_timed -- spec
+§6).
 
 Models are built through the packaged mixer registry path
 (`min_gru.MinGRUStack`, mirroring `probes.py`'s `build()`/`MIXER_REGISTRY`
@@ -123,10 +124,10 @@ Usage:
       --round bench-s5-02 --task s5 --model log --seed 0
   uv run python experiments/benchmark_lab.py --selftest
 
-`--selftest` runs a tiny (few-step, small-batch) sweep of all four tasks
+`--selftest` runs a tiny (few-step, small-batch) sweep of all five tasks
 under the `log` arm, dry-run only -- a wiring smoke test, not evidence.
-psMNIST substitutes a synthetic stand-in `Loader` (no torchvision, no MNIST
-download) per the task brief.
+psMNIST and churn each substitute a synthetic stand-in `Loader` (no
+torchvision/MNIST download, no pandas/network download, respectively).
 
 Pendulum's decay-channel wiring reuses `probes.py`'s existing
 timestamped-input mechanism (`TimestampedMinGRUTagger`'s fairness rule),
@@ -224,7 +225,7 @@ RESULTS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lab_results.
 # kwargs) for five of the eight arms; `signed-rotation`/`signed-givens`/
 # `signed-delta` are the three `list[str]` arms (per-block mixer types,
 # kwargs keyed by type name or `None` -- see `MinGRUStack`'s own docstring
-# for this schema). Every arm here runs on all four tasks -- there is no
+# for this schema). Every arm here runs on every task -- there is no
 # per-task arm subset; `scripts/report_benchmarks.py` and
 # `scripts/gpu_benchmark_campaign.py` both iterate this same dict.
 #
@@ -1368,20 +1369,73 @@ class _SyntheticPsMNISTLoader:
         yield from self._batches(*self._test)
 
 
+class _SyntheticChurnLoader:
+    """Synthetic stand-in for `RosbankLoader`, used only by `--selftest`/
+    tests -- same rationale as `_SyntheticPsMNISTLoader` above (no
+    download, no pandas dependency). Implements the same `Loader`-shaped
+    3-tuple `(x, dt, y)` `last_step_timed` batch contract (spec
+    `.claude/output/specs/2026-07-25-churn-benchmark-design.md` §6) with
+    small random data at a tiny `T`/`d_in`; both classes are present in
+    every split (`auroc` hard-errors on a single-class eval set)."""
+
+    def __init__(
+        self,
+        batch_size: int,
+        n_train: int = 16,
+        n_val: int = 8,
+        n_test: int = 8,
+        T: int = 8,
+        d_in: int = 126,
+        seed: int = 0,
+    ) -> None:
+        self.batch_size = batch_size
+        g = torch.Generator().manual_seed(seed)
+
+        def _make(n: int):
+            x = torch.rand(n, T, d_in, generator=g)
+            dt = torch.rand(n, T, generator=g)
+            dt[:, 0] = 0.0
+            n_pos = n // 2
+            y = torch.cat([torch.zeros(n - n_pos, dtype=torch.long), torch.ones(n_pos, dtype=torch.long)])
+            y = y[torch.randperm(n, generator=g)]
+            return x, dt, y
+
+        self._train = _make(n_train)
+        self._val = _make(n_val)
+        self._test = _make(n_test)
+
+    def _batches(self, x: torch.Tensor, dt: torch.Tensor, y: torch.Tensor):
+        for start in range(0, x.shape[0], self.batch_size):
+            end = start + self.batch_size
+            yield x[start:end], dt[start:end], y[start:end]
+
+    def train_epoch(self, gen: torch.Generator):
+        yield from self._batches(*self._train)
+
+    def val(self):
+        yield from self._batches(*self._val)
+
+    def test(self):
+        yield from self._batches(*self._test)
+
+
 def _tiny_task_overrides() -> dict[str, TaskSpec]:
     """Tiny per-task `TaskSpec` variants for `--selftest`: the same
     loss_mode/data wiring as the canonical `TASKS` registry (so the real
     model/loss/eval dispatch code path is exercised end-to-end), but a
-    handful of steps/epochs and a small batch so the four-task sweep runs
-    in well under a second. psMNIST substitutes `_SyntheticPsMNISTLoader`;
-    MQAR's generator is called with a smaller `num_pairs` so its
-    presentation+query span still fits inside the shrunk sequence length.
+    handful of steps/epochs and a small batch so the five-task sweep runs
+    in well under a second. psMNIST substitutes `_SyntheticPsMNISTLoader`
+    and churn substitutes `_SyntheticChurnLoader` (both no-download, no
+    optional-dependency stand-ins); MQAR's generator is called with a
+    smaller `num_pairs` so its presentation+query span still fits inside
+    the shrunk sequence length.
     """
     tiny_eval_protocol: dict[str, tuple[EvalConfig, ...]] = {
         "s5": (EvalConfig(T=32),),
         "mqar": (EvalConfig(T=32, num_pairs=2),),
         "psmnist": (),
         "pendulum": (),
+        "churn": (),
     }
     tiny: dict[str, TaskSpec] = {}
     for name, task in TASKS.items():
@@ -1403,14 +1457,19 @@ def _tiny_task_overrides() -> dict[str, TaskSpec]:
             def data(batch_size):
                 return _SyntheticPsMNISTLoader(batch_size)
 
+        elif name == "churn":
+
+            def data(batch_size):
+                return _SyntheticChurnLoader(batch_size)
+
         tiny[name] = replace(task, budget=tiny_budget, data=data, eval_protocol=tiny_eval_protocol[name])
     return tiny
 
 
 def _selftest() -> None:
-    """Tiny model, few steps, all four tasks, all four loss modes --
+    """Tiny model, few steps, all five tasks, all five loss modes --
     a wiring smoke test (brief), not evidence. Dry-run only."""
-    print("benchmark_lab selftest: tiny arm x task sweep (all four loss modes)")
+    print("benchmark_lab selftest: tiny arm x task sweep (all five loss modes)")
     required = ("round", "task", "variant", "layers", "seed", "steps", "acc", "secs", "ckpt", "config")
     for name, task in _tiny_task_overrides().items():
         row = run_arm(round_tag="selftest", task=task, arm="log", seed=0, device="cpu", dry_run=True)
@@ -1418,15 +1477,15 @@ def _selftest() -> None:
         assert not missing, f"{name}: row missing required key(s) {missing}"
         assert task.fit_metric in row["ckpt"], f"{name}: ckpt missing fit metric {task.fit_metric!r}"
         print(f"  {name:>9} ok: ckpt={row['ckpt']}, acc={row['acc']}")
-    print("benchmark_lab selftest: all four tasks ok")
+    print("benchmark_lab selftest: all five tasks ok")
 
 
 # ------------------------------------------------------------------------ CLI
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--selftest", action="store_true", help="tiny model, few steps, all four tasks; exits after")
+    p.add_argument("--selftest", action="store_true", help="tiny model, few steps, all five tasks; exits after")
     p.add_argument("--round", help="ledger round tag, e.g. bench-s5-02")
-    p.add_argument("--task", choices=sorted(TASKS), help="s5 | mqar | psmnist | pendulum")
+    p.add_argument("--task", choices=sorted(TASKS), help="s5 | mqar | psmnist | pendulum | churn")
     p.add_argument(
         "--model",
         choices=sorted(ARM_REGISTRY),

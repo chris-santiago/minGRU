@@ -150,6 +150,7 @@ def test_round_tags_bind_to_the_shared_bench_round_tags_source():
         "mqar": "bench-mqar-02",
         "psmnist": "bench-psmnist-02",
         "pendulum": "bench-pendulum-02",
+        "churn": "bench-churn-02",
     }
 
 
