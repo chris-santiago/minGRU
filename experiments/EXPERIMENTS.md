@@ -1658,3 +1658,22 @@ Artifacts: per-seed rows in `experiments/lab_results.jsonl` (round tags `bench-{
 **Reading.** Seven of nine arms fit reliably ($\ge 34/36$) and sit within 0.02 AUROC of each other (0.808–0.822), all inside the ptls sanity-anchor neighborhood (their 1024-hidden supervised RNN: ~0.818) at d_model=64 — the task is learnable by the whole family and does not separate the accumulation-capable arms. The two decisive failures are the Givens family: `givens` (decay-active) collapses to 1/36 (p ≈ 2e-12) and `signed-givens` to 21/36 (p ≈ 1e-5) — consistent with psMNIST's accumulation ordering, where the givens family also trails badly (0.290/0.651 raw). The matched-width `gru` control is the strongest arm here (36/36 at the strict 0.82 bar; 0.834 test AUROC with the fewest parameters), so on this real-world task the parallel-scan mixers pay a small but consistent accuracy tax vs the classical gate. Framing rule reminder: this is acc@T-style *fit-quality* evidence only; no length-generalization axis exists for this task (fixed T=256).
 
 Artifacts: per-seed rows in `experiments/lab_results.jsonl` (round `bench-churn-02`); regenerated `experiments/bench/bench_churn.{json,md}` + merged-across-shards `bench_churn_env.json` (`scripts/report_benchmarks.py` / `scripts/gpu_check.py --job benchmarks --shards 6`); commit lineage `d27b351` (metric) → `879ba35` (loader) → `d0bd97a` (driver) → `4c014a2` (registration) → `7c394b2` (report) → `4cc2135` (sharded launcher) → `7836bdd` (pilot freeze).
+
+## Round: churn capacity probe + grounding reference (`bench-churn-probe-01` / `bench-churn-ref-01`)
+
+**Purpose (user request, 2026-07-25).** Does capacity close churn's mixer-vs-GRU gap? Two off-matrix arms on the identical task/protocol: `signed-delta-nh4` (the S5 probe round's 4-reflection Householder config) under `bench-churn-probe-01`, and `gru-large` (hidden-256 literature-scale `nn.GRU`, `REF_ARM_BUDGETS` 40-epoch override = 2× the matched arms' epochs, psMNIST-ref rule) under `bench-churn-ref-01`. Both kept out of `bench-churn-02` accounting; no Fisher (probe descriptive; ref non-matched budget).
+
+**Stratum.** L4 (torch 2.8.0+cu128, triton 3.4.0, `MINGRU_SCAN=triton`; artifact line `device=cuda, torch=2.8.0+cu128, scan=triton, compile=None`), single job `mingru-gpu-benchmarks-4b5cdaa`, commit `4b5cdaa`, 36 seeds per arm.
+
+**Results** (transcribed from regenerated `experiments/bench/bench_churn_probe.md` / `bench_churn_ref.md`; fit = `ckpt.val_auc` $\ge 0.80$; matched-round comparators from `bench_churn.md`):
+
+| arm | round | fits | strict $\ge 0.82$ | AUROC@test (raw) |
+|---|---|---|---|---|
+| signed-delta-nh4 | probe-01 | 36/36 | 20/36 | 0.823 |
+| signed-delta (nh=2) | `-02` matched | 35/36 | 13/36 | 0.821 |
+| gru (d64) | `-02` matched | 36/36 | 36/36 | 0.834 |
+| gru-large (h256, 40 ep) | ref-01 | 36/36 | 36/36 | 0.827 |
+
+**Reading.** Capacity does not close the gap. nh4 buys `signed-delta` full fit reliability ($35/36 \to 36/36$) and $+0.002$ raw AUROC — within noise of the matched config and still $-0.011$ below the matched `gru`. The literature-scale `gru-large` is *worse* than the matched d64 `gru` ($0.827$ vs $0.834$): with 4,000 training users, hidden-256 overfits where hidden-64 does not, so the matched control remains the strongest model on this task at any tested scale. Churn's ordering is therefore not a capacity artifact: the small classical gate simply fits this real-world sequence task best among everything tested.
+
+Artifacts: per-seed rows in `experiments/lab_results.jsonl` (rounds `bench-churn-probe-01`, `bench-churn-ref-01`); regenerated `experiments/bench/bench_churn_probe.{json,md}`, `bench_churn_ref.{json,md}`, updated `bench_churn_env.json`; tag routing + `REF_ARM_BUDGETS` entry commits `5380141`–`4b5cdaa`.

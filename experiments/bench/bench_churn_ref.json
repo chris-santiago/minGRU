@@ -1,0 +1,86 @@
+{
+  "task": "churn",
+  "round": "bench-churn-ref-01",
+  "reference": true,
+  "fit_metric": "val_auc",
+  "fit_threshold": 0.8,
+  "fit_direction": "ge",
+  "robustness_thresholds": [
+    0.78,
+    0.8,
+    0.8200000000000001
+  ],
+  "arms": {
+    "gru-large": {
+      "arm": "gru-large",
+      "seeds_present": 36,
+      "seeds_planned": 36,
+      "present_seeds": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35
+      ],
+      "missing_seeds": [],
+      "fits": 36,
+      "robustness": {
+        "0.78": 36,
+        "0.8": 36,
+        "0.8200000000000001": 36
+      },
+      "mean_acc": {
+        "test": 0.8267222222222222
+      },
+      "fit_only_acc": {
+        "test": 0.8267222222222222
+      },
+      "params": 690946
+    }
+  },
+  "stratum_labels": [
+    {
+      "device": "cuda",
+      "torch": "2.8.0+cu128",
+      "scan": "triton",
+      "compile": null
+    }
+  ],
+  "arm_round_overrides": {},
+  "env": {
+    "torch": "2.13.0",
+    "git_commit": "4b5cdaa2b6fde7fd09937a3fa70f5b0c15ec6697",
+    "generated": "2026-07-25T19:36:25.423008+00:00"
+  }
+}
