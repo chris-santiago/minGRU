@@ -418,6 +418,9 @@ REF_ARMS: dict[str, tuple[str | list[str], dict | None]] = {
 # `gru-large`'s psMNIST run actually used, not just what differs.
 REF_ARM_BUDGETS: dict[tuple[str, str], dict[str, float | int]] = {
     ("psmnist", "gru-large"): {"epochs": 60, "lr": 1e-3},
+    # churn ref (user request 2026-07-25): 2x the matched arms' 20 epochs,
+    # same lr -- the psmnist ref's own 2x-epochs-at-literature-scale rule.
+    ("churn", "gru-large"): {"epochs": 40, "lr": 1e-3},
 }
 
 # The build_model/CLI lookup: matrix arms (the clean nine-arm seed-matrix

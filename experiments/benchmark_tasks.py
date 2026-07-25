@@ -1528,6 +1528,10 @@ BENCH_ROUND_TAGS: dict[str, str] = {
 # `-02` matrix tags so the finish handler accepts probe rows too.
 BENCH_PROBE_ROUND_TAGS: dict[str, str] = {
     "s5": "bench-s5-probe-01",
+    # churn capacity probe (user request 2026-07-25): signed-delta-nh4 on the
+    # rosbank task, off-matrix vs bench-churn-02 (same L4 stratum, same frozen
+    # budget; only the arm config differs from the matched signed-delta).
+    "churn": "bench-churn-probe-01",
 }
 
 # Reference round tags (Amendments, `.claude/output/intent/2026-07-19-
@@ -1548,6 +1552,10 @@ BENCH_PROBE_ROUND_TAGS: dict[str, str] = {
 # and probe tags so the finish handler accepts reference rows too.
 BENCH_REF_ROUND_TAGS: dict[str, str] = {
     "psmnist": "bench-psmnist-ref-01",
+    # churn gru-large grounding reference (user request 2026-07-25):
+    # NON-matched literature-scale control (hidden-256, REF_ARM_BUDGETS
+    # 40-epoch override), kept out of bench-churn-02 accounting, no Fisher.
+    "churn": "bench-churn-ref-01",
 }
 
 # Per-arm round-tag correction overrides (design spec, `.claude/output/specs/
