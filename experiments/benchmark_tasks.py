@@ -49,8 +49,8 @@ import torch
 
 # ------------------------------------------------------------- TaskSpec
 
-LossMode = Literal["dense", "masked_query", "last_step", "regression"]
-FitMetric = Literal["val128", "val_qacc", "val_acc", "val_mse"]
+LossMode = Literal["dense", "masked_query", "last_step", "regression", "last_step_timed"]
+FitMetric = Literal["val128", "val_qacc", "val_acc", "val_mse", "val_auc"]
 FitDirection = Literal["ge", "le"]
 
 
@@ -166,6 +166,91 @@ class TaskSpec:
     eval_protocol: tuple[EvalConfig, ...]
     budget: Budget
     seeds: int
+
+
+# ------------------------------------------------------------- metrics
+# `val_auc` fit metric (churn round, spec §6 metric contract): a pure-torch
+# rank-based AUROC, no sklearn dependency (spec §8 key-decisions). Kept
+# task-agnostic (not folded into any one `TaskSpec`) since a later task in
+# this round is the first and only consumer, wiring it into the lab
+# driver's checkpoint-selection/eval path for `loss_mode="last_step_timed"`.
+
+
+def auroc(scores: torch.Tensor, labels: torch.Tensor) -> float:
+    """Area under the ROC curve via the Mann-Whitney U rank statistic,
+    average ranks for ties (spec §6: "AUROC by Mann-Whitney rank statistic
+    with average ranks for ties; direction ge").
+
+    Equivalent to the pairwise definition (fraction of positive/negative
+    pairs the positive outranks, ties counting as half a win) but computed
+    in O(n log n) via one sort instead of the O(n_pos * n_neg) pairwise
+    comparison: `U = sum(rank(positives)) - n_pos*(n_pos+1)/2`, `AUC = U /
+    (n_pos * n_neg)`. Tied scores (including an entire constant-score input)
+    receive the mean of the ranks their tied group spans, via
+    `torch.unique_consecutive` over the sorted scores -- the same
+    tie-averaging `scipy.stats.rankdata(method="average")` performs, kept
+    here as batched tensor ops rather than a Python loop over positions.
+
+    Parameters
+    ----------
+    scores : torch.Tensor
+        Real-valued scores, one per example, any shape (flattened via
+        `reshape(-1)`) (spec §6: "positive-class logit minus negative-class
+        logit at the final position").
+    labels : torch.Tensor
+        Same element count as `scores`, values in `{0, 1}`.
+
+    Returns
+    -------
+    float
+        AUROC in `[0, 1]`; 1.0 is perfect ranking, 0.5 is chance
+        (including the fully-tied degenerate case), 0.0 is perfectly
+        inverted.
+
+    Raises
+    ------
+    ValueError
+        If `scores` and `labels` have a different number of elements, or if
+        `labels` contains only one class (spec §6: "Degenerate single-class
+        eval sets are a hard error" -- AUROC is undefined with no
+        positive/negative pair to rank).
+    """
+    scores = scores.reshape(-1)
+    labels = labels.reshape(-1)
+    if scores.shape != labels.shape:
+        raise ValueError(
+            f"scores and labels must have the same number of elements, got "
+            f"{scores.shape[0]} and {labels.shape[0]}"
+        )
+
+    n_pos = int((labels == 1).sum())
+    n_neg = int((labels == 0).sum())
+    if n_pos == 0 or n_neg == 0:
+        raise ValueError(
+            f"auroc is undefined for single-class input: got {n_pos} positive and "
+            f"{n_neg} negative labels, need at least one of each"
+        )
+
+    sorted_scores, order = torch.sort(scores)
+    n = sorted_scores.shape[0]
+
+    # Average-rank ties: `unique_consecutive` groups runs of equal sorted
+    # values; every position in a group is assigned the mean of the
+    # (1-based) ranks that group spans -- e.g. two tied entries at sorted
+    # positions 0,1 (ranks 1,2) both get rank 1.5. Untied, this reduces to
+    # the plain 1..n rank sequence.
+    _, counts = torch.unique_consecutive(sorted_scores, return_counts=True)
+    group_ends = torch.cumsum(counts, dim=0)
+    group_starts = group_ends - counts
+    group_avg_rank = (group_starts + group_ends + 1).to(torch.float64) / 2.0
+    avg_ranks = torch.repeat_interleave(group_avg_rank, counts)
+
+    ranks_by_original_position = torch.empty(n, dtype=torch.float64, device=scores.device)
+    ranks_by_original_position[order] = avg_ranks
+
+    sum_ranks_pos = ranks_by_original_position[labels == 1].sum()
+    u_stat = sum_ranks_pos - n_pos * (n_pos + 1) / 2.0
+    return (u_stat / (n_pos * n_neg)).item()
 
 
 # ----------------------------------------------------------------- S5

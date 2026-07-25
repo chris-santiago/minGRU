@@ -20,6 +20,8 @@ Sections
 7. psMNIST -- permutation stability, split/batch logic on synthetic
    tensors (no torchvision, no MNIST download), and a full
    `PsMNISTLoader` end-to-end pass via monkeypatched torchvision
+8. auroc -- perfect/reversed/all-tied score orderings, a hand-computed
+   tie case, shape mismatch and single-class-input errors
 """
 
 from __future__ import annotations
@@ -49,6 +51,7 @@ from experiments.benchmark_tasks import (
     _prepare_split,
     _shuffled_batches,
     _split_train_val,
+    auroc,
     make_group_word,
     make_mqar,
     make_pendulum,
@@ -774,3 +777,73 @@ def test_psmnist_loader_end_to_end_with_monkeypatched_torchvision(monkeypatch):
     assert row_matches.sum().item() == 1, "expected train row must survive shuffling exactly once"
     matched_index = row_matches.nonzero(as_tuple=True)[0].item()
     assert train_y[matched_index].item() == target_y.item()
+
+
+# ===========================================================================
+# 8. auroc -- Mann-Whitney rank statistic, average-rank ties (spec §6 metric
+#    contract: "score = positive-class logit minus negative-class logit at
+#    the final position; AUROC by Mann-Whitney rank statistic with average
+#    ranks for ties; direction ge. Degenerate single-class eval sets are a
+#    hard error.")
+# ===========================================================================
+
+
+def test_auroc_perfectly_ranked_scores_is_one():
+    """Every positive score strictly exceeds every negative score -> 1.0."""
+    scores = torch.tensor([0.1, 0.2, 0.9, 1.5])
+    labels = torch.tensor([0, 0, 1, 1])
+    assert auroc(scores, labels) == pytest.approx(1.0)
+
+
+def test_auroc_reversed_scores_is_zero():
+    """Every positive score strictly below every negative score -> 0.0."""
+    scores = torch.tensor([0.9, 1.5, 0.1, 0.2])
+    labels = torch.tensor([0, 0, 1, 1])
+    assert auroc(scores, labels) == pytest.approx(0.0)
+
+
+def test_auroc_all_tied_scores_is_half():
+    """A completely uninformative (constant) score gives the chance-level
+    0.5, not an arbitrary tie-breaking artifact."""
+    scores = torch.tensor([0.5, 0.5, 0.5, 0.5])
+    labels = torch.tensor([0, 1, 0, 1])
+    assert auroc(scores, labels) == pytest.approx(0.5)
+
+
+def test_auroc_hand_computed_tie_case():
+    """scores=[1,1,2,3], labels=[0,1,0,1] (one positive tied with one
+    negative, one positive strictly ahead of both negatives).
+
+    By exhaustive pairwise comparison (Mann-Whitney U over the 2x2
+    positive/negative pairs, ties scoring 0.5): pos=1 vs neg=1 -> tie
+    (0.5); pos=1 vs neg=2 -> discordant (0.0); pos=3 vs neg=1 ->
+    concordant (1.0); pos=3 vs neg=2 -> concordant (1.0). Mean = (0.5 + 0.0
+    + 1.0 + 1.0) / 4 = 0.625, matching the average-rank formula: tied rank
+    1.5 for both score-1 entries, rank 3 for score-2, rank 4 for score-3;
+    sum of positive ranks = 1.5 + 4 = 5.5; U = 5.5 - 2*3/2 = 2.5; AUC =
+    2.5 / (2*2) = 0.625.
+    """
+    scores = torch.tensor([1.0, 1.0, 2.0, 3.0])
+    labels = torch.tensor([0, 1, 0, 1])
+    assert auroc(scores, labels) == pytest.approx(0.625)
+
+
+def test_auroc_single_class_raises():
+    """A degenerate eval set (only one label value present) has no defined
+    AUROC -- spec §6 calls this a hard error, not a silent fallback."""
+    scores = torch.tensor([0.1, 0.5, 0.9])
+    labels = torch.tensor([1, 1, 1])
+    with pytest.raises(ValueError):
+        auroc(scores, labels)
+
+    with pytest.raises(ValueError):
+        auroc(scores, torch.zeros_like(labels))
+
+
+def test_auroc_shape_mismatch_raises():
+    """`scores`/`labels` element counts must match; a length mismatch is a
+    caller bug, not a value to silently truncate/broadcast."""
+    scores = torch.tensor([0.1, 0.5, 0.9])
+    labels = torch.tensor([1, 0])
+    with pytest.raises(ValueError):
+        auroc(scores, labels)
