@@ -55,6 +55,8 @@ nav = [
     ] },
 
     { "Slides" = "slides/index.md" },
+
+    { "Benchmark validation" = "slides/benchmark-validation.html" },
 ]
 
 
