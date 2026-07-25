@@ -1630,3 +1630,31 @@ Reading: the corrected extract-then-compose order costs the rotation composer $0
 **S5 conclusion, re-evaluated.** The matched round read S5's rotation-family $0/36$ as "a genuine mechanism limit, not the missing snap order" (the K=5 probe did not rescue it). The corrected order confirms and extends this: `signed-rotation` and `signed-rotation-k5` are still $0/36$ near-chance on S5, so the $0/36$ is not the missing snap order and not the rotation-first block-order confound either. S5's two solving arms remain the continuous `signed-givens` ($1/36$ matched) and the Householder `signed-delta-nh4` ($7/36$ probe).
 
 Artifacts: per-seed rows in `experiments/lab_results.jsonl` (round tags `bench-{s5,mqar,psmnist,pendulum}-rotfix-01`, `bench-s5-probe-rotfix-01`; the superseded `rotation-hetero(-k5)` rows under `bench-*-02` / `bench-s5-probe-01` are retained, never rewritten). Regenerated reports `experiments/bench/bench_{s5,mqar,psmnist,pendulum,s5_probe}.{json,md}` (`scripts/report_benchmarks.py`; the composite matrix reports source `signed-rotation` from its correction round and carry an `arm_round_overrides` provenance disclosure). Per-arm round-tag override mechanism: `experiments.benchmark_tasks.BENCH_ARM_ROUND_OVERRIDES` (design spec `.claude/output/specs/2026-07-21-round-tag-override-design.md`); commit lineage `c1bc57c` (rename + composer-order swap) through `6765332` (override mechanism + integrity tests).
+
+## Round: rosbank-churn event-sequence benchmark (`bench-churn-02`)
+
+**Purpose (2026-07-25).** First real-world event-sequence task in the suite: per-user binary churn from Rosbank card transactions (HF `pytorch-lifestream/rosbank-churn`, revision `aad1b512d`, 5,000 labeled users, seeded 4000/500/500 user split, last-256 events, one-hot categorical fields ∥ log1p(amount), `d_in=126`). New `last_step_timed` loss mode + `val_auc` fit metric; real irregular transaction gaps feed the mechanical decay channel for `DECAY_CAPABLE_ARMS` {log, signed, rotation, givens} while every arm receives `log1p(dt)` as an input feature (pendulum fairness rule). Spec `.claude/output/specs/2026-07-25-churn-benchmark-design.md`; intent ledger `.claude/output/intent/2026-07-25-churn-benchmark-intent.md`.
+
+**Stratum.** L4 (torch 2.8.0+cu128, triton 3.4.0, `MINGRU_SCAN=triton`; artifact line `device=cuda, torch=2.8.0+cu128, scan=triton, compile=None`). Pilot job `mingru-gpu-benchmarks-4cc2135` (commit `4cc2135`); matrix = 6 concurrent seed-sharded jobs `mingru-gpu-benchmarks-7836bdd-shard{0..5}of6` (commit `7836bdd`, shard $k$ ran seeds $6k..6k{+}5$, all nine arms).
+
+**Pilot-tag disclosure (mandatory).** The 9 pilot rows (log/gru/signed × seeds 0–2) carry the matrix tag `bench-churn-02`, not a `-01` pilot tag: `BENCH_ROUND_TAGS` was registered at `-02` and the campaign has no pilot-tag routing, unlike the prior round whose pilot predated its tag bump. Impact: none on the population — the pilot confirmed the placeholder budget unchanged (lr 1e-3, batch 128, epochs 20; selections at epochs 2–14 of 20), so all 324 rows carry one identical `config.budget` and one stratum (verified across the round). The AUROC fit threshold (0.80; robustness 0.78/0.80/0.82) was frozen from those 9 rows (val_auc 0.816–0.837) at commit `7836bdd` before the remaining 315 seeds ran; the threshold is report-time-only and alters no row. `bench-churn-01` was never emitted.
+
+**Collection disclosure.** The local 6-shard waiter crashed on a post-submit `job.status` lookup race (SDK raises "does not exist in Teamspace" before the job is listable); all six jobs completed server-side. Rows were collected by replaying the unchanged `_finish_benchmarks(..., merge_sidecar=True)` per shard (dedup key `(round, task, variant, seed)`): 45+9-dup on shard 0, 54×5 on shards 1–5 → 324/324, 9 arms × 36 seeds complete. Follow-up debt: add a visibility-retry to the shard wait loop (`scripts/gpu_check.py:_run_sharded_benchmarks`).
+
+**Results** (transcribed from regenerated `experiments/bench/bench_churn.md`; fit = `ckpt.val_auc` $\ge 0.80$):
+
+| arm | fits | AUROC@test (raw / fit-only) | strict bar $\ge 0.82$ | Fisher vs `log` | params |
+|---|---|---|---|---|---|
+| log | 36/36 | 0.822 / 0.822 | 25/36 | — | 91,906 |
+| signed | 36/36 | 0.819 / 0.819 | 23/36 | p = 1 | 100,226 |
+| rotation | 36/36 | 0.808 / 0.808 | 6/36 | p = 1 | 100,290 |
+| signed-rotation | 34/36 | 0.813 / 0.815 | 10/36 | p = 0.493 | 100,162 |
+| givens | 1/36 | 0.767 / 0.763 | 0/36 | p = 1.975e-12 | 104,402 |
+| delta | 35/36 | 0.818 / 0.818 | 6/36 | p = 1 | 126,098 |
+| signed-givens | 21/36 | 0.795 / 0.805 | 4/36 | p = 9.638e-06 | 102,242 |
+| signed-delta | 35/36 | 0.821 / 0.821 | 13/36 | p = 1 | 113,098 |
+| gru | 36/36 | 0.834 / 0.834 | 36/36 | p = 1 | 62,146 |
+
+**Reading.** Seven of nine arms fit reliably ($\ge 34/36$) and sit within 0.02 AUROC of each other (0.808–0.822), all inside the ptls sanity-anchor neighborhood (their 1024-hidden supervised RNN: ~0.818) at d_model=64 — the task is learnable by the whole family and does not separate the accumulation-capable arms. The two decisive failures are the Givens family: `givens` (decay-active) collapses to 1/36 (p ≈ 2e-12) and `signed-givens` to 21/36 (p ≈ 1e-5) — consistent with psMNIST's accumulation ordering, where the givens family also trails badly (0.290/0.651 raw). The matched-width `gru` control is the strongest arm here (36/36 at the strict 0.82 bar; 0.834 test AUROC with the fewest parameters), so on this real-world task the parallel-scan mixers pay a small but consistent accuracy tax vs the classical gate. Framing rule reminder: this is acc@T-style *fit-quality* evidence only; no length-generalization axis exists for this task (fixed T=256).
+
+Artifacts: per-seed rows in `experiments/lab_results.jsonl` (round `bench-churn-02`); regenerated `experiments/bench/bench_churn.{json,md}` + merged-across-shards `bench_churn_env.json` (`scripts/report_benchmarks.py` / `scripts/gpu_check.py --job benchmarks --shards 6`); commit lineage `d27b351` (metric) → `879ba35` (loader) → `d0bd97a` (driver) → `4c014a2` (registration) → `7c394b2` (report) → `4cc2135` (sharded launcher) → `7836bdd` (pilot freeze).
