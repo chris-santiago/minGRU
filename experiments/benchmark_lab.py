@@ -142,6 +142,22 @@ docstring in `src/mingru/min_gru.py`) -- the delta arm on the pendulum
 task therefore only sees `dt` through the feature channel, never
 mechanically; this asymmetry is inherent to the packaged mixer's contract,
 not something this driver invents or can route around.
+
+A fifth loss mode, `last_step_timed` (rosbank-churn round, spec
+`.claude/output/specs/2026-07-25-churn-benchmark-design.md` §6), reuses this
+exact fairness-rule/decay wiring rather than inventing a second copy:
+`build_model` routes it through the same `input_size = in_dim + 1` +
+`DECAY_CAPABLE_ARMS`-gated `mixer_kwargs.update(decay=...)` branch as
+`regression`, and `_forward_last_step_timed` mirrors `_forward_regression`'s
+`log1p(dt)` concat / `delta_t=dt if arm in DECAY_CAPABLE_ARMS else None`
+routing exactly -- the only difference is cross-entropy at the FINAL
+position only (`last_step`'s slicing), not MSE over every position, and the
+eval-time metric is AUROC over accumulated (score, label) pairs, not a
+per-batch-averaged accuracy/MSE (`_eval_last_step_timed_loader`, spec §6
+metric contract). Training is epoch-based (psMNIST's `Loader` pattern) with
+a 3-tuple `(x, dt, y)` batch contract instead of psMNIST's 2-tuple `(x,
+y)`; `_train_epoch_based` dispatches on `task.loss_mode` to pick the right
+forward/eval pair without duplicating its checkpoint-selection loop.
 """
 
 from __future__ import annotations
@@ -166,6 +182,7 @@ from experiments.benchmark_tasks import (
     TASKS,
     EvalConfig,
     TaskSpec,
+    auroc,
 )
 from min_gru import MinGRUStack
 
@@ -592,6 +609,8 @@ def _model_shape(task_name: str) -> tuple[int, int]:
         return 1, 10
     if task_name == "pendulum":
         return 2, 2
+    if task_name == "churn":
+        return 126, 2  # spec §6 feature layout: d_in=126, binary churn label
     raise ValueError(f"no model shape registered for task {task_name!r}")
 
 
@@ -631,8 +650,11 @@ def build_model(task: TaskSpec, arm: str) -> nn.Module:
             return GRUTokenSequenceModel(in_dim, out_dim, d_model=d_model)
         if task.loss_mode == "last_step":
             return GRUFeatureSequenceModel(in_dim, out_dim, d_model=d_model)
-        if task.loss_mode == "regression":
-            # +1: log1p(dt) fairness-rule feature (see module docstring)
+        if task.loss_mode in ("regression", "last_step_timed"):
+            # +1: log1p(dt) fairness-rule feature (see module docstring). Both
+            # loss_modes share this exact treatment -- last_step_timed (churn)
+            # is not a second copy, see module docstring's "fifth loss mode"
+            # paragraph.
             return GRUFeatureSequenceModel(in_dim + 1, out_dim, d_model=d_model)
         raise ValueError(f"unknown loss_mode {task.loss_mode!r}")
     mixer, arm_kwargs = ARM_REGISTRY[arm]
@@ -641,8 +663,13 @@ def build_model(task: TaskSpec, arm: str) -> nn.Module:
         return TokenSequenceModel(in_dim, out_dim, mixer, mixer_kwargs)
     if task.loss_mode == "last_step":
         return FeatureSequenceModel(in_dim, out_dim, mixer, mixer_kwargs)
-    if task.loss_mode == "regression":
-        input_size = in_dim + 1  # +1: log1p(dt) fairness-rule feature (see module docstring)
+    if task.loss_mode in ("regression", "last_step_timed"):
+        # +1: log1p(dt) fairness-rule feature (see module docstring). Both
+        # loss_modes share this exact treatment, including the
+        # DECAY_CAPABLE_ARMS-gated mechanical decay kwargs -- last_step_timed
+        # (churn) is not a second copy, see module docstring's "fifth loss
+        # mode" paragraph.
+        input_size = in_dim + 1
         if arm in DECAY_CAPABLE_ARMS:
             mixer_kwargs.update(decay="learnable", log1p_delta=True, decay_rate=0.05)
         return FeatureSequenceModel(input_size, out_dim, mixer, mixer_kwargs)
@@ -699,11 +726,38 @@ def _forward_regression(
     return sq_err.mean(), sq_err.sum().item(), sq_err.numel()
 
 
+def _forward_last_step_timed(
+    model, x: torch.Tensor, dt: torch.Tensor, y: torch.Tensor, arm: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """`last_step_timed` (churn): cross-entropy at the FINAL position's
+    logits only (`_forward_last_step`'s slicing), with `dt`'s fairness-rule/
+    decay routing copied exactly from `_forward_regression` (module
+    docstring's "fifth loss mode" paragraph): `dt` always reaches the model
+    as a `log1p(dt)` concatenated feature; it additionally reaches the
+    stack's mechanical decay channel for arms in `DECAY_CAPABLE_ARMS`,
+    `None` otherwise.
+
+    Returns `(loss, score, y)` rather than `(loss, correct, total)` --
+    churn's fit/eval metric is AUROC over the WHOLE eval set (spec §6
+    metric contract: "score = positive-class logit minus negative-class
+    logit at the final position"), not a per-batch accuracy count, so the
+    caller accumulates `score`/`y` across every batch in an eval pass and
+    calls `auroc()` exactly once (`_eval_last_step_timed_loader`)."""
+    feat = torch.log1p(dt).unsqueeze(-1)
+    model_in = torch.cat([x, feat], dim=-1)
+    decay_dt = dt if arm in DECAY_CAPABLE_ARMS else None
+    logits = model(model_in, delta_t=decay_dt)[:, -1, :]
+    loss = F.cross_entropy(logits, y)
+    score = logits[:, 1] - logits[:, 0]
+    return loss, score, y
+
+
 def _forward_step_based(task: TaskSpec, arm: str, model, batch: tuple[torch.Tensor, ...]):
     """Dispatch one generator-drawn batch to its loss_mode's forward
     function. Not used by psMNIST (`last_step`, loader-based -- see
-    `_train_epoch_based`), whose data acquisition already differs
-    entirely from the generator tasks."""
+    `_train_epoch_based`) or churn (`last_step_timed`, also loader-based),
+    whose data acquisition already differs entirely from the generator
+    tasks."""
     if task.loss_mode == "dense":
         x, y = batch
         return _forward_dense(model, x, y)
@@ -789,6 +843,30 @@ def _eval_last_step_loader(forward_model, batches, device: torch.device | None =
         den += t
     forward_model.train()
     return num / den
+
+
+@torch.no_grad()
+def _eval_last_step_timed_loader(
+    arm: str, forward_model, batches, device: torch.device | None = None
+) -> float:
+    """AUROC over a `Loader`'s `val()`/`test()` 3-tuple `(x, dt, y)`
+    batches (churn, `last_step_timed`) -- deliberately a SEPARATE function
+    from `_eval_last_step_loader` rather than a branch inside it: the two
+    loss modes accumulate fundamentally different statistics
+    (weighted-average correct-count/total-count vs. accumulate-then-
+    single-`auroc()`-call over (score, label) pairs, spec §6 metric
+    contract), and psMNIST's existing `_eval_last_step_loader` path/tests
+    must stay byte-identical."""
+    forward_model.eval()
+    scores, labels = [], []
+    for x, dt, y in batches:
+        if device is not None:
+            x, dt, y = x.to(device), dt.to(device), y.to(device)
+        _, score, label = _forward_last_step_timed(forward_model, x, dt, y, arm)
+        scores.append(score.detach())
+        labels.append(label.detach())
+    forward_model.train()
+    return auroc(torch.cat(scores), torch.cat(labels))
 
 
 def _run_eval_protocol(
@@ -879,6 +957,8 @@ def _train_step_based(
 
 
 def _train_epoch_based(
+    task: TaskSpec,
+    arm: str,
     state_model: nn.Module,
     forward_model,
     opt: torch.optim.Optimizer,
@@ -887,21 +967,38 @@ def _train_epoch_based(
     epochs: int,
     device: torch.device,
 ) -> tuple[int, float, dict | None]:
-    """Epoch-based training loop (psMNIST): checkpoint once per epoch on
-    val accuracy (spec §4/Budget docstring: epoch-based tasks have no
-    `eval_every`, they checkpoint once per epoch instead)."""
+    """Epoch-based training loop (psMNIST `last_step`, churn
+    `last_step_timed`): checkpoint once per epoch on the val metric (spec
+    §4/Budget docstring: epoch-based tasks have no `eval_every`, they
+    checkpoint once per epoch instead). Both loss modes select on
+    higher-is-better (`val_acc`/`val_auc`, both `fit_direction="ge"` --
+    `last_step_timed` must never route through an `le` path, CLAUDE.md
+    known-debt item); the loop body dispatches on `task.loss_mode` for the
+    forward pass and the eval call, but the checkpoint-selection shell
+    (train epoch, eval once, keep-if-better, clone state) is shared, not
+    duplicated per loss mode."""
     best_metric, best_state, best_epoch = -1.0, None, 0
+    timed = task.loss_mode == "last_step_timed"
     for epoch in range(1, epochs + 1):
         state_model.train()
-        for x, y in loader.train_epoch(gen):
-            x, y = x.to(device), y.to(device)
-            loss, _, _ = _forward_last_step(forward_model, x, y)
+        for batch in loader.train_epoch(gen):
+            batch = _to_device(batch, device)
+            if timed:
+                x, dt, y = batch
+                loss, _, _ = _forward_last_step_timed(forward_model, x, dt, y, arm)
+            else:
+                x, y = batch
+                loss, _, _ = _forward_last_step(forward_model, x, y)
             opt.zero_grad()
             loss.backward()
             opt.step()
-        val_acc = _eval_last_step_loader(forward_model, loader.val(), device=device)
-        if val_acc > best_metric:
-            best_metric, best_epoch = val_acc, epoch
+        val_metric = (
+            _eval_last_step_timed_loader(arm, forward_model, loader.val(), device=device)
+            if timed
+            else _eval_last_step_loader(forward_model, loader.val(), device=device)
+        )
+        if val_metric > best_metric:
+            best_metric, best_epoch = val_metric, epoch
             best_state = {k: v.detach().clone() for k, v in state_model.state_dict().items()}
     return best_epoch, best_metric, best_state
 
@@ -1037,8 +1134,10 @@ def run_arm(
     """
     if arm not in ARM_REGISTRY:
         raise ValueError(f"unknown arm {arm!r}; expected one of {sorted(ARM_REGISTRY)}")
-    if task.loss_mode == "last_step":
-        assert task.budget.epochs is not None, f"{task.name}: last_step task must set Budget.epochs"
+    if task.loss_mode in ("last_step", "last_step_timed"):
+        assert task.budget.epochs is not None, (
+            f"{task.name}: epoch-based task (loss_mode={task.loss_mode!r}) must set Budget.epochs"
+        )
     else:
         assert task.budget.steps is not None, f"{task.name}: step-based task must set Budget.steps"
 
@@ -1076,7 +1175,7 @@ def run_arm(
     opt = torch.optim.Adam(model.parameters(), lr=effective_lr)
     t0 = time.time()
 
-    if task.loss_mode == "last_step":
+    if task.loss_mode in ("last_step", "last_step_timed"):
         loader = task.data(effective_batch_size)
         assert loader.batch_size == effective_batch_size, (
             f"loader batch_size ({loader.batch_size}) does not match the "
@@ -1084,7 +1183,7 @@ def run_arm(
             "wiring bug (quality-review carry-over, Task 2 report)"
         )
         best_epoch, best_metric, best_state = _train_epoch_based(
-            model, forward_model, opt, loader, gen, effective_epochs, device_obj
+            task, arm, model, forward_model, opt, loader, gen, effective_epochs, device_obj
         )
         _require_checkpoint(best_state, task.name, f"epochs={effective_epochs}")
         model.load_state_dict(best_state)
@@ -1093,17 +1192,29 @@ def run_arm(
         # once more on the val split for `ckpt[task.fit_metric]` -- `val()`
         # iterates in a fixed, non-shuffled order (no seed to vary), so this
         # re-eval is deterministic and equals `selection_value` exactly for
-        # psMNIST; still recorded via the same code path as the step-based
-        # branch below so `ckpt[task.fit_metric]` always means "the selected
-        # checkpoint's held-out metric", not a max-over-selection-evals
-        # statistic, uniformly across all four tasks.
-        fit_metric_value = round(
-            _eval_last_step_loader(forward_model, loader.val(), device=device_obj), 4
-        )
-        acc = {"test": round(_eval_last_step_loader(forward_model, loader.test(), device=device_obj), 4)}
+        # every epoch-based task (psMNIST, churn); still recorded via the
+        # same code path as the step-based branch below so
+        # `ckpt[task.fit_metric]` always means "the selected checkpoint's
+        # held-out metric", not a max-over-selection-evals statistic,
+        # uniformly across every task.
+        if task.loss_mode == "last_step_timed":
+            fit_metric_value = round(
+                _eval_last_step_timed_loader(arm, forward_model, loader.val(), device=device_obj), 4
+            )
+            test_auc = _eval_last_step_timed_loader(
+                arm, forward_model, loader.test(), device=device_obj
+            )
+            acc = {"test": round(test_auc, 4)}
+            config_extra: dict = {}
+        else:
+            fit_metric_value = round(
+                _eval_last_step_loader(forward_model, loader.val(), device=device_obj), 4
+            )
+            test_acc = _eval_last_step_loader(forward_model, loader.test(), device=device_obj)
+            acc = {"test": round(test_acc, 4)}
+            config_extra = {"permutation_seed": loader.permutation_seed}
         selected_step, ckpt_key = best_epoch, "epoch"
         config_budget = {"lr": effective_lr, "batch_size": effective_batch_size, "epochs": effective_epochs}
-        config_extra: dict = {"permutation_seed": loader.permutation_seed}
     else:
         ckpt_T = _ckpt_eval_T(task.name, effective_train_T)
         best_step, best_metric, best_state = _train_step_based(

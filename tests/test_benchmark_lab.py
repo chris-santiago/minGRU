@@ -72,6 +72,22 @@ Sections
     60-epoch override as the resolved default (an explicit `epochs=`
     argument still wins), leaving `gru`'s and every matched arm's
     budget resolution untouched.
+12. `last_step_timed` (rosbank-churn round, spec
+    `.claude/output/specs/2026-07-25-churn-benchmark-design.md` §6) -- a
+    fifth loss mode reusing `regression`'s `log1p(dt)`
+    concat/`DECAY_CAPABLE_ARMS`-gated decay-kwarg wiring exactly, with
+    cross-entropy at the FINAL position only (`last_step`'s slicing) and
+    AUROC (not accuracy/MSE) as the eval-time metric. Exercised against a
+    fake `Loader` (`_FakeChurnLoader`, mirroring `_SyntheticPsMNISTLoader`)
+    emitting the 3-tuple `(x, dt, y)` batch contract, since the real
+    `RosbankLoader` (Task 2 of this round) is out of this file's footprint.
+    Covers: `_forward_last_step_timed`'s CE/dt-routing correctness, decay
+    kwargs on exactly the four `DECAY_CAPABLE_ARMS`, `delta_t` never
+    reaching `gru`/`gru-large`/`delta`, the `+1` `log1p(dt)` input-width
+    feature reaching every `MATRIX_ARMS` arm, `_model_shape("churn")`,
+    `_eval_last_step_timed_loader`'s single-`auroc()`-call-per-pass
+    accumulation, and `_train_epoch_based`'s higher-is-better checkpoint
+    selection on the timed path.
 """
 
 from __future__ import annotations
@@ -98,12 +114,15 @@ from experiments.benchmark_lab import (
     _eval_last_step_loader,
     _forward_dense,
     _forward_last_step,
+    _forward_last_step_timed,
     _forward_masked_query,
     _forward_regression,
     _model_layers,
+    _model_shape,
     _row_exists,
     _SyntheticPsMNISTLoader,
     _tiny_task_overrides,
+    _train_epoch_based,
     build_model,
     run_arm,
 )
@@ -1229,3 +1248,324 @@ def test_canonical_eval_protocol_configs_are_eval_config_instances():
     for task in TASKS.values():
         for ec in task.eval_protocol:
             assert isinstance(ec, EvalConfig)
+
+
+# ------------------------------------------ 12. last_step_timed (churn round)
+CHURN_D_IN = 126  # spec §6 feature layout: d_in=126 (one-hot fields + log1p(amount))
+
+
+class _FakeChurnLoader:
+    """Stub `Loader` for `last_step_timed` tests: Task 2 of this round (in
+    progress in parallel, not this file's footprint) owns the real
+    `RosbankLoader`; this fake emits the same 3-tuple `(x, dt, y)` batch
+    contract (spec §6: `x` float32 `(B, T, 126)`, `dt` float32 `(B, T)`
+    days >= 0 with `dt[:, 0] == 0`, `y` int64 `(B,)` in `{0, 1}`) at a
+    fixed small `T`/batch count, mirroring `_SyntheticPsMNISTLoader`'s
+    role for `last_step`. Every split is constructed with both classes
+    present (`auroc` hard-errors on a single-class eval set)."""
+
+    def __init__(
+        self,
+        batch_size: int,
+        n_train: int = 8,
+        n_val: int = 6,
+        n_test: int = 6,
+        T: int = 5,
+        d_in: int = CHURN_D_IN,
+        seed: int = 0,
+    ) -> None:
+        self.batch_size = batch_size
+        self.permutation_seed = None  # no pixel permutation -- not psMNIST
+        g = torch.Generator().manual_seed(seed)
+
+        def _make(n: int):
+            x = torch.rand(n, T, d_in, generator=g)
+            dt = torch.rand(n, T, generator=g)
+            dt[:, 0] = 0.0
+            n_pos = n // 2
+            y_neg = torch.zeros(n - n_pos, dtype=torch.long)
+            y_pos = torch.ones(n_pos, dtype=torch.long)
+            y = torch.cat([y_neg, y_pos])[torch.randperm(n, generator=g)]
+            return x, dt, y
+
+        self._train = _make(n_train)
+        self._val = _make(n_val)
+        self._test = _make(n_test)
+
+    def _batches(self, x: torch.Tensor, dt: torch.Tensor, y: torch.Tensor):
+        for start in range(0, x.shape[0], self.batch_size):
+            end = start + self.batch_size
+            yield x[start:end], dt[start:end], y[start:end]
+
+    def train_epoch(self, gen: torch.Generator):
+        yield from self._batches(*self._train)
+
+    def val(self):
+        yield from self._batches(*self._val)
+
+    def test(self):
+        yield from self._batches(*self._test)
+
+
+def _churn_task(epochs: int = 1, batch_size: int = 3) -> TaskSpec:
+    """A `last_step_timed` `TaskSpec` wired to `_FakeChurnLoader`, standing
+    in for the real `churn` `TaskSpec` Task 4 of this round registers into
+    `TASKS` -- exercises the driver's dispatch with zero dependency on
+    Task 2's real loader or Task 4's registration."""
+    return TaskSpec(
+        name="churn",
+        loss_mode="last_step_timed",
+        data=lambda bs: _FakeChurnLoader(bs),
+        fit_metric="val_auc",
+        fit_threshold=0.6,
+        fit_direction="ge",
+        robustness=(0.55, 0.6, 0.65),
+        eval_protocol=(),
+        budget=Budget(lr=1e-3, batch_size=batch_size, epochs=epochs),
+        seeds=36,
+    )
+
+
+def test_model_shape_churn_is_126_by_2():
+    assert _model_shape("churn") == (126, 2)
+
+
+def test_forward_last_step_timed_matches_manual_ce_and_final_position_slicing():
+    """`_forward_last_step_timed`'s loss/score must equal a manually
+    computed `F.cross_entropy`/logit-difference at the model's OWN final
+    position, over the same `log1p(dt)`-concatenated input -- mirroring
+    `test_regression_eval_matches_manual_mse`'s manual-recompute pattern
+    for the timed loss mode."""
+    torch.manual_seed(SEED)
+    B, T = 3, 5
+    task = _churn_task()
+    model = build_model(task, "log")
+    model.eval()
+    x = torch.randn(B, T, CHURN_D_IN)
+    dt = torch.rand(B, T).clamp(min=0.01)
+    dt[:, 0] = 0.0
+    y = torch.randint(0, 2, (B,))
+
+    with torch.no_grad():
+        loss, score, y_out = _forward_last_step_timed(model, x, dt, y, "log")
+
+        feat = torch.log1p(dt).unsqueeze(-1)
+        model_in = torch.cat([x, feat], dim=-1)
+        logits = model(model_in, delta_t=dt)[:, -1, :]
+        manual_loss = F.cross_entropy(logits, y)
+        manual_score = logits[:, 1] - logits[:, 0]
+
+    assert torch.allclose(loss, manual_loss, atol=1e-6)
+    assert torch.allclose(score, manual_score, atol=1e-6)
+    assert torch.equal(y_out, y)
+
+
+@pytest.mark.parametrize("arm", sorted(set(ARM_REGISTRY) - {"gru", "gru-large"}))
+def test_build_model_churn_decay_wiring_matches_decay_capable_arms(arm):
+    """Decay kwargs (`decay="learnable"`) land on the mixer for exactly
+    the four `DECAY_CAPABLE_ARMS`, mirroring the pendulum wiring test --
+    same gate, same kwargs, applied through the shared `regression`/
+    `last_step_timed` build_model branch."""
+    task = _churn_task()
+    model = build_model(task, arm)
+    mixer = model.stack.blocks[0].mingru
+    if arm in DECAY_CAPABLE_ARMS:
+        assert mixer.decay == "learnable"
+    else:
+        assert mixer.decay is None
+
+
+def test_churn_delta_arm_gets_no_mechanical_decay():
+    task = _churn_task()
+    model = build_model(task, "delta")
+    assert model.stack.blocks[0].mingru.decay is None
+    x = torch.randn(2, 5, CHURN_D_IN)
+    dt = torch.rand(2, 5).clamp(min=0.01)
+    dt[:, 0] = 0.0
+    y = torch.randint(0, 2, (2,))
+    loss, score, _ = _forward_last_step_timed(model, x, dt, y, "delta")
+    assert torch.isfinite(loss)
+
+
+@pytest.mark.parametrize("arm", ["gru", "gru-large"])
+def test_churn_gru_arms_get_dt_as_feature_never_mechanical_delta_t(arm):
+    """`gru`/`gru-large` have no decay mechanism -- `dt` reaches them ONLY
+    via the `log1p(dt)` input-width feature (127 = 126 + 1), never as
+    `delta_t`. `GRUFeatureSequenceModel.forward`'s own assertion (a
+    non-`None` `delta_t` raises) is the safety net this test relies on: if
+    `_forward_last_step_timed` ever routed `delta_t` to these arms, this
+    call would raise instead of returning a finite loss."""
+    task = _churn_task()
+    model = build_model(task, arm)
+    assert isinstance(model, GRUFeatureSequenceModel)
+    assert model.rnn.input_size == CHURN_D_IN + 1
+    x = torch.randn(2, 5, CHURN_D_IN)
+    dt = torch.rand(2, 5).clamp(min=0.01)
+    dt[:, 0] = 0.0
+    y = torch.randint(0, 2, (2,))
+    loss, score, _ = _forward_last_step_timed(model, x, dt, y, arm)
+    assert torch.isfinite(loss)
+
+
+@pytest.mark.parametrize("arm", sorted(MATRIX_ARMS))
+def test_build_model_churn_feature_sequence_shapes_every_matrix_arm(arm):
+    """Every one of the nine `MATRIX_ARMS` arms receives the `log1p(dt)`
+    input-width feature (input width 127) and produces the churn
+    (T, 2)-shaped per-position logits `_forward_last_step_timed` then
+    slices to the final position. Decay-capable arms require a `delta_t`
+    argument (their mixer's `decay="learnable"` pairing contract) -- the
+    other five arms are called with no `delta_t` at all, exercising both
+    of `FeatureSequenceModel.forward`'s call shapes."""
+    task = _churn_task()
+    model = build_model(task, arm)
+    assert isinstance(model, (FeatureSequenceModel, GRUFeatureSequenceModel))
+    x = torch.rand(2, 5, CHURN_D_IN + 1)
+    dt = torch.rand(2, 5).clamp(min=0.01)
+    dt[:, 0] = 0.0
+    out = model(x, delta_t=dt) if arm in DECAY_CAPABLE_ARMS else model(x)
+    assert out.shape == (2, 5, 2)
+
+
+def test_gru_forward_backward_smoke_last_step_timed_churn():
+    """Gradient-flow smoke for `last_step_timed`, mirroring section 10's
+    one-smoke-test-per-loss-mode convention for the `gru` arm
+    (`test_gru_forward_backward_smoke_{dense_s5,masked_query_mqar,
+    last_step_psmnist,regression_pendulum}`, `_assert_gradients_flow`
+    helper above) -- this is the fifth loss mode's entry in that same
+    per-loss-mode cluster, closing the gap where section 12 otherwise
+    lacked one."""
+    torch.manual_seed(0)
+    task = _churn_task()
+    model = build_model(task, "gru")
+    x = torch.randn(3, 5, CHURN_D_IN)
+    dt = torch.rand(3, 5).clamp(min=0.01)
+    dt[:, 0] = 0.0
+    y = torch.randint(0, 2, (3,))
+    loss, _, _ = _forward_last_step_timed(model, x, dt, y, "gru")
+    loss.backward()
+    _assert_gradients_flow(model)
+
+
+def test_eval_last_step_timed_loader_calls_auroc_once_over_accumulated_batches(monkeypatch):
+    """`_eval_last_step_timed_loader` must accumulate `(score, label)`
+    across EVERY batch the loader yields and call `auroc()` exactly ONCE
+    per eval pass (spec §6 metric contract) -- not once per batch. Spies
+    on `experiments.benchmark_lab.auroc` (the module's imported binding
+    the eval function actually calls) to verify the call count and the
+    total element count passed in equals the whole val split, then
+    delegates to the real `auroc` so the returned score is still real."""
+    import experiments.benchmark_lab as lab
+
+    calls = []
+    real_auroc = lab.auroc
+
+    def _spy(scores, labels):
+        calls.append((scores.numel(), labels.numel()))
+        return real_auroc(scores, labels)
+
+    monkeypatch.setattr(lab, "auroc", _spy)
+    task = _churn_task(batch_size=3)
+    model = build_model(task, "log")
+    loader = task.data(3)
+    n_val = loader._val[2].numel()
+
+    result = lab._eval_last_step_timed_loader("log", model, loader.val())
+
+    assert len(calls) == 1
+    assert calls[0] == (n_val, n_val)
+    assert 0.0 <= result <= 1.0
+
+
+def test_train_epoch_based_churn_selects_best_val_auc_higher_is_better(monkeypatch):
+    """`_train_epoch_based`'s checkpoint selection on the timed path must
+    be higher-is-better (`val_auc`, `fit_direction="ge"` -- CLAUDE.md's
+    known `le`-epoch-based-path bug must never trigger here): with a
+    scripted val_auc sequence [0.5, 0.9, 0.7] across 3 epochs, the
+    checkpoint must land on epoch 2 (the max), not the last epoch run."""
+    import experiments.benchmark_lab as lab
+
+    task = _churn_task(epochs=3, batch_size=3)
+    torch.manual_seed(SEED)
+    model = build_model(task, "log")
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    loader = task.data(3)
+    gen = torch.Generator().manual_seed(1)
+
+    scripted = iter([0.5, 0.9, 0.7])
+    monkeypatch.setattr(
+        lab, "_eval_last_step_timed_loader", lambda arm, fm, batches, device=None: next(scripted)
+    )
+    best_epoch, best_metric, best_state = _train_epoch_based(
+        task, "log", model, model, opt, loader, gen, 3, torch.device("cpu")
+    )
+    assert best_epoch == 2
+    assert best_metric == 0.9
+    assert best_state is not None
+
+
+def test_train_epoch_based_psmnist_path_unchanged_by_timed_dispatch():
+    """Sanity: adding the `last_step_timed` dispatch branch to
+    `_train_epoch_based` must not disturb the pre-existing `last_step`
+    (psMNIST) path -- same call shape (now with `task`/`arm` leading
+    positional args), same accuracy-based checkpoint selection, still
+    picks a valid epoch with a real checkpoint."""
+    tiny_tasks = _tiny_task_overrides()
+    task = tiny_tasks["psmnist"]
+    torch.manual_seed(SEED)
+    model = build_model(task, "log")
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    loader = task.data(task.budget.batch_size)
+    gen = torch.Generator().manual_seed(1)
+
+    best_epoch, best_metric, best_state = _train_epoch_based(
+        task, "log", model, model, opt, loader, gen, task.budget.epochs, torch.device("cpu")
+    )
+    assert best_epoch >= 1
+    assert 0.0 <= best_metric <= 1.0
+    assert best_state is not None
+
+
+def test_run_arm_churn_row_schema_and_val_auc_checkpoint():
+    """End-to-end `run_arm` on a `last_step_timed` `TaskSpec`: the row must
+    carry every required key, `ckpt["val_auc"]`/`ckpt["selection_val_auc"]`
+    (the task's own `fit_metric`, spec §6 row contract: `ckpt` carries
+    `val_auc` and selection fields), and `acc["test"]` as an AUROC value in
+    `[0, 1]` -- `run_arm` reached this all through the SAME dispatch path
+    `TASKS["churn"]` will use once Task 4 registers it, per the brief's
+    "zero further driver edits" requirement."""
+    task = _churn_task(epochs=2, batch_size=3)
+    row = run_arm(round_tag="test-churn", task=task, arm="log", seed=0, device="cpu", dry_run=True)
+    missing = [k for k in REQUIRED_ROW_KEYS if k not in row]
+    assert not missing, f"row missing required key(s) {missing}"
+    assert row["task"] == "churn"
+    assert row["variant"] == "log"
+    assert row["ckpt"]["epoch"] >= 1
+    assert "val_auc" in row["ckpt"]
+    assert 0.0 <= row["ckpt"]["val_auc"] <= 1.0
+    assert "selection_val_auc" in row["ckpt"]
+    assert 0.0 <= row["ckpt"]["selection_val_auc"] <= 1.0
+    assert 0.0 <= row["acc"]["test"] <= 1.0
+    assert "tau" not in row["config"]
+    assert "permutation_seed" not in row["config"]
+
+
+@pytest.mark.parametrize("arm", sorted(DECAY_CAPABLE_ARMS))
+def test_run_arm_churn_decay_arm_end_to_end(arm):
+    """Every `DECAY_CAPABLE_ARMS` member must run end-to-end on the timed
+    loss mode without error, producing a valid AUROC row -- exercises the
+    decay-enabled forward/backward path through the full `run_arm` loop,
+    not just `build_model`'s static wiring."""
+    task = _churn_task(epochs=1, batch_size=3)
+    row = run_arm(round_tag="test-churn-decay", task=task, arm=arm, seed=0, dry_run=True)
+    assert 0.0 <= row["ckpt"]["val_auc"] <= 1.0
+
+
+def test_run_arm_churn_loader_batch_size_mismatch_assertion_applies():
+    """The existing loader/Budget batch-size wiring assertion (originally
+    a psMNIST-only guard) must apply uniformly to the timed path too --
+    both loss modes share the same `task.data(effective_batch_size)` call
+    site in `run_arm`."""
+    task = _churn_task(epochs=1, batch_size=4)
+    bad_task = replace(task, data=lambda bs: _FakeChurnLoader(3))  # ignores bs, always 3
+    with pytest.raises(AssertionError):
+        run_arm(round_tag="test-churn-mismatch", task=bad_task, arm="log", seed=0, dry_run=True)
