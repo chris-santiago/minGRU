@@ -1527,14 +1527,16 @@ def test_churn_task_field_contract_matches_spec_section_6():
     assert CHURN_TASK.budget.steps is None
 
 
-def test_churn_fit_threshold_is_a_pilot_placeholder_bracketed_by_chance_and_the_sanity_anchor():
-    """`CHURN_FIT_AUROC` (fit_threshold) is not yet pilot-calibrated (brief:
-    "threshold frozen post-pilot") -- it must still be a defensible AUROC
-    value strictly between chance (0.5) and the ptls literature sanity
-    anchor (~0.818, spec §10), with the robustness triple bracketing it in
-    ascending order and centered on the same value."""
-    assert 0.5 < CHURN_TASK.fit_threshold < 0.818
+def test_churn_fit_threshold_is_the_pilot_frozen_value():
+    """`CHURN_FIT_AUROC` (fit_threshold) is PILOT-FROZEN at 0.80
+    (2026-07-25 pilot: log/gru/signed x 3 seeds fit at val_auc
+    0.816-0.837; see the constant's own calibration comment and the
+    round's EXPERIMENTS.md entry). The exact value is now evidence-bearing
+    -- report fit-rates are computed against it -- so this pins it, along
+    with the psMNIST-style +/-0.02 robustness band centered on it."""
+    assert CHURN_TASK.fit_threshold == 0.80
     lo, mid, hi = CHURN_TASK.robustness
+    assert (lo, mid, hi) == pytest.approx((0.78, 0.80, 0.82))
     assert lo < mid < hi
     assert mid == CHURN_TASK.fit_threshold
 

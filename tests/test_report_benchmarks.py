@@ -937,7 +937,7 @@ def test_probe_report_discloses_nothing_absent_case(monkeypatch):
 # "val_auc"`, not on the task name.
 def test_churn_fits_table_is_auroc_framed_not_accuracy():
     rows = [
-        _churn_row(0, "log", val_auc=0.70, test_auc=0.68),  # fits (threshold 0.65)
+        _churn_row(0, "log", val_auc=0.83, test_auc=0.68),  # fits (frozen threshold 0.80)
         _churn_row(1, "log", val_auc=0.40, test_auc=0.42),  # does not fit
     ]
 

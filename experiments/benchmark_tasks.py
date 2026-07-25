@@ -1438,18 +1438,19 @@ PENDULUM_TASK = TaskSpec(
     seeds=36,
 )
 
-# PILOT-PLACEHOLDER (churn round, spec `.claude/output/specs/2026-07-25-
-# churn-benchmark-design.md` §6: "Fit threshold, epochs, and lr are
-# pilot-frozen before the matrix") -- same treatment as PENDULUM_TAU above:
-# unlike S5/MQAR/psMNIST, this round's spec names no concrete Global-
-# Constraint AUROC threshold up front, so this is a reasonable starting
-# point, not yet calibrated. Chance is 0.5; the ptls literature sanity
-# anchor (spec §10, a much larger-scale supervised RNN) is ~0.818 --
-# CHURN_FIT_AUROC sits well above chance while leaving headroom for this
-# round's smaller feature-based models. Task 7's pilot round calibrates and
-# freezes the real value (and the robustness triple below) in the round
-# entries before any matrix seed runs.
-CHURN_FIT_AUROC = 0.65
+# PILOT-FROZEN 2026-07-25 (churn round, spec `.claude/output/specs/2026-07-
+# 25-churn-benchmark-design.md` §6: "Fit threshold, epochs, and lr are
+# pilot-frozen before the matrix"). Calibration evidence: the 9-seed pilot
+# (log/gru/signed x seeds 0-2, L4 stratum, this exact budget) fit at
+# val_auc 0.816-0.837 -- see the round's EXPERIMENTS.md entry. 0.80 sits
+# with clear margin below that healthy-fit cluster, far above chance
+# (0.5), and below both literature sanity anchors (ptls supervised RNN
+# ~0.818 at 16x this width; handcrafted-feature GBM ~0.827): a mixer that
+# cannot reach 0.80 val AUROC here genuinely failed to fit. The
+# robustness triple is the psMNIST-style +/-0.02 band -- +/-0.05 would put
+# the strict bar at 0.85, above every pilot fit, an uninformative
+# zero-pass bar.
+CHURN_FIT_AUROC = 0.80
 
 CHURN_TASK = TaskSpec(
     name="churn",
@@ -1458,9 +1459,12 @@ CHURN_TASK = TaskSpec(
     fit_metric="val_auc",
     fit_threshold=CHURN_FIT_AUROC,
     fit_direction="ge",
-    robustness=(CHURN_FIT_AUROC - 0.05, CHURN_FIT_AUROC, CHURN_FIT_AUROC + 0.05),
+    robustness=(CHURN_FIT_AUROC - 0.02, CHURN_FIT_AUROC, CHURN_FIT_AUROC + 0.02),
     eval_protocol=(),  # no length/pair-count generalization axis (fixed T=256, spec §4/§6)
-    budget=Budget(lr=1e-3, batch_size=128, epochs=20),  # PILOT-PLACEHOLDER
+    # PILOT-FROZEN 2026-07-25: the 9-seed pilot ran this exact budget and
+    # selected checkpoints at epochs 2-14 of 20 (no truncation) -- confirmed,
+    # not revised. See CHURN_FIT_AUROC's comment for the calibration record.
+    budget=Budget(lr=1e-3, batch_size=128, epochs=20),
     seeds=36,
 )
 
