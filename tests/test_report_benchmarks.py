@@ -138,6 +138,29 @@ def _psmnist_row(seed: int, arm: str, val_acc: float, test_acc: float) -> dict:
     }
 
 
+def _churn_row(seed: int, arm: str, val_auc: float, test_auc: float) -> dict:
+    return {
+        "round": ROUND_TAGS["churn"],
+        "task": "churn",
+        "variant": arm,
+        "layers": 2,
+        "seed": seed,
+        "epochs": 20,
+        "acc": {"test": test_auc},
+        "secs": 30.0,
+        "ckpt": {"epoch": 20, "val_auc": val_auc},
+        "config": {
+            "device": "cuda",
+            "torch": "2.8.0+cu128",
+            "scan": "triton",
+            "compile": None,
+            "dataset_id": "pytorch-lifestream/rosbank-churn",
+            "revision": "main",
+            "split_seed": 20260725,
+        },
+    }
+
+
 # ----------------------------------------------------------- 0. round tags
 def test_round_tags_bind_to_the_shared_bench_round_tags_source():
     # This module owns `ROUND_TAGS` as its own name, but binds it directly
@@ -269,6 +292,18 @@ def test_pendulum_has_no_generalization_keys():
 
     assert report["arms"]["log"]["mean_acc"] == {}
     assert report["arms"]["log"]["fit_only_acc"] == {}
+
+
+def test_churn_fit_metric_is_val_auc_with_ge_direction_and_test_key():
+    task = TASKS["churn"]
+    rows = [_churn_row(0, "log", val_auc=0.95, test_auc=0.94)]
+
+    report = build_task_report("churn", rows)
+
+    assert report["fit_metric"] == "val_auc"
+    assert report["fit_direction"] == "ge"
+    assert report["fit_threshold"] == task.fit_threshold
+    assert report["arms"]["log"]["mean_acc"] == {"test": 0.94}
 
 
 def test_generalization_mean_tolerates_rows_missing_a_key():
@@ -891,3 +926,99 @@ def test_probe_report_discloses_nothing_absent_case(monkeypatch):
     assert report["arm_round_overrides"] == {}
     md = render_probe_markdown(report)
     assert "Provenance" not in md
+
+
+# --------------------------- 13. churn: val_auc + AUROC-framed table -----
+# (churn design spec `.claude/output/specs/2026-07-25-churn-benchmark-
+# design.md` §6 metric contract: `acc = {"test": <AUROC>}`): churn's
+# generalization table must be labeled AUROC, never accuracy, while every
+# other task's table keeps the pre-existing "accuracy"/"acc@" framing --
+# `_generalization_metric_label` switches on `report["fit_metric"] ==
+# "val_auc"`, not on the task name.
+def test_churn_fits_table_is_auroc_framed_not_accuracy():
+    rows = [
+        _churn_row(0, "log", val_auc=0.70, test_auc=0.68),  # fits (threshold 0.65)
+        _churn_row(1, "log", val_auc=0.40, test_auc=0.42),  # does not fit
+    ]
+
+    report = build_task_report("churn", rows)
+    md = render_markdown(report)
+
+    assert "## Fits and generalization AUROC (raw / fit-only)" in md
+    assert "AUROC@test (raw/fit-only)" in md
+    assert "acc@test" not in md
+    assert "generalization accuracy" not in md
+    log_rep = report["arms"]["log"]
+    assert log_rep["mean_acc"]["test"] == (0.68 + 0.42) / 2  # raw: over all rows
+    assert log_rep["fit_only_acc"]["test"] == 0.68  # fit-only: over the one fitting row
+
+
+def test_non_churn_tasks_keep_the_existing_accuracy_framing():
+    """Regression: relabeling churn's table must not change the framing
+    word for any other task's table (`_generalization_metric_label` keys
+    off `fit_metric`, not the task name, so this is the discriminating
+    case that proves churn's `val_auc` alone triggers the AUROC label)."""
+    rows = [_psmnist_row(0, "log", val_acc=0.95, test_acc=0.94)]
+
+    report = build_task_report("psmnist", rows)
+    md = render_markdown(report)
+
+    assert "## Fits and generalization accuracy (raw / fit-only)" in md
+    assert "acc@test (raw/fit-only)" in md
+    assert "AUROC" not in md
+
+
+def test_churn_fit_rate_judged_against_the_pilot_placeholder_threshold():
+    """Fit-rate accounting flows through the same generic `_fit_rows`/
+    `_robustness_counts` path as every other task, reading churn's
+    pilot-placeholder `fit_threshold`/`robustness` straight from
+    `TASKS["churn"]` -- no churn-specific branch needed."""
+    task = TASKS["churn"]
+    rows = [
+        _churn_row(0, "log", val_auc=task.fit_threshold + 0.05, test_auc=0.7),  # fits
+        _churn_row(1, "log", val_auc=task.fit_threshold - 0.05, test_auc=0.5),  # does not fit
+        _churn_row(2, "log", val_auc=task.fit_threshold, test_auc=0.6),  # boundary fits
+    ]
+
+    report = build_task_report("churn", rows)
+
+    assert report["fit_threshold"] == task.fit_threshold
+    assert report["arms"]["log"]["fits"] == 2
+    assert report["robustness_thresholds"] == list(task.robustness)
+
+
+def test_churn_fisher_vs_log_reference_arm():
+    task = TASKS["churn"]
+    fits = task.fit_threshold + 0.1
+    misses = task.fit_threshold - 0.1
+    rows = [_churn_row(i, "log", val_auc=fits, test_auc=0.7) for i in range(3)]
+    rows += [_churn_row(i, "log", val_auc=misses, test_auc=0.5) for i in range(3, 6)]
+    rows += [_churn_row(i, "signed", val_auc=misses, test_auc=0.5) for i in range(6, 9)]
+
+    report = build_task_report("churn", rows)
+    info = report["fisher_vs_reference"]["signed"]
+
+    assert info["fits"] == "0/3"
+    assert info["reference_fits"] == "3/6"
+    assert 0.0 <= info["p"] <= 1.0
+    assert FISHER_REFERENCE_ARM not in report["fisher_vs_reference"]
+
+
+def test_churn_stratum_check_is_the_generic_untouched_path():
+    rows = [_churn_row(0, "log", val_auc=0.7, test_auc=0.7)]
+    report = build_task_report("churn", rows)
+    assert report["stratum_labels"] == [
+        {"device": "cuda", "torch": "2.8.0+cu128", "scan": "triton", "compile": None}
+    ]
+
+
+def test_churn_round_flows_through_write_reports(tmp_path):
+    rows = [_churn_row(0, "log", val_auc=0.7, test_auc=0.7)]
+
+    reports = write_reports(rows, tmp_path)
+
+    assert "churn" in reports
+    on_disk = json.loads((tmp_path / "bench_churn.json").read_text())
+    assert on_disk == reports["churn"]
+    md = (tmp_path / "bench_churn.md").read_text()
+    assert "AUROC" in md

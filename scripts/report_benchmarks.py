@@ -66,7 +66,8 @@ with no special-casing needed here):
 - fit count + threshold-robustness triple, judged on the task's own
   ``fit_metric``/``fit_threshold``/``fit_direction``/``robustness``
   (read from ``experiments.benchmark_tasks.TASKS``, never hardcoded here
-  -- S5/MQAR/psMNIST are "ge" accuracy-style, pendulum is "le" MSE-style).
+  -- S5/MQAR/psMNIST are "ge" accuracy-style, pendulum is "le" MSE-style,
+  churn is "ge" AUROC-style).
 - generalization accuracy, both raw (mean over ALL rows) and fit-only
   (mean over fitting rows only) -- docs framing rule (CLAUDE.md /
   spec §7): never state generalization accuracy without both.
@@ -75,17 +76,24 @@ with no special-casing needed here):
   own hardcoded ``ACC_LENGTHS``/``FIT_ONLY_LENGTHS`` (64/256/512/1024,
   512/1024), which is the S3 matched-state round's key shape, not this
   round's -- S5's eval keys are ``"T256"``/``"T512"``/``"T1024"``,
-  MQAR's are ``"T256_p16"``/``"T256_p32"``, psMNIST's is a single
-  ``"test"``, and pendulum's is empty (spec §4: no post-selection
-  generalization sweep beyond the fit metric itself). Forcing four
-  different key shapes through one hardcoded-key aggregator would be
-  more parameter creep than the aggregator's own docstring already
-  invites (see its "out of this task's parameterization scope" note in
-  ``tests/test_evidence_stats_params.py``) -- so this module computes
-  the generalization table directly from each task's own rows (whatever
-  keys their ``acc`` dicts actually carry, sorted for determinism) and
-  only imports ``fisher_exact_two_sided`` from ``_evidence_stats``,
-  which needed no such task-specific shape.
+  MQAR's are ``"T256_p16"``/``"T256_p32"``, psMNIST's and churn's are
+  each a single ``"test"``, and pendulum's is empty (spec §4: no
+  post-selection generalization sweep beyond the fit metric itself).
+  Forcing four different key shapes through one hardcoded-key aggregator
+  would be more parameter creep than the aggregator's own docstring
+  already invites (see its "out of this task's parameterization scope"
+  note in ``tests/test_evidence_stats_params.py``) -- so this module
+  computes the generalization table directly from each task's own rows
+  (whatever keys their ``acc`` dicts actually carry, sorted for
+  determinism) and only imports ``fisher_exact_two_sided`` from
+  ``_evidence_stats``, which needed no such task-specific shape. Churn's
+  ``acc`` dict holds AUROC, not accuracy (churn design spec §6 metric
+  contract: ``acc = {"test": <AUROC>}``) -- the "Fits and generalization"
+  table's section title and column prefix are relabeled "AUROC" instead
+  of "accuracy"/"acc" whenever ``report["fit_metric"] == "val_auc"``
+  (`_generalization_metric_label`), so the rendered Markdown never calls
+  an AUROC value an accuracy. Every other current ``FitMetric`` keeps the
+  existing "accuracy" framing unchanged.
 - two-sided Fisher exact vs the ``log`` arm (spec §4/§8 "log as the
   Fisher reference arm"; ``_evidence_stats.fisher_exact_two_sided``, no
   scipy).
@@ -582,15 +590,33 @@ def _render_provenance_lines(report: dict[str, Any]) -> list[str]:
     ]
 
 
-def _render_fits_table_lines(arms: dict[str, dict[str, Any]]) -> list[str]:
-    """ "Fits and generalization accuracy" table, shared by the matched and
-    the reference report renderers (both carry the same per-arm
-    ``ArmReport``-shaped dict, `_build_arm_report`'s output)."""
+def _generalization_metric_label(fit_metric: str) -> str:
+    """Section title / column-prefix word for the generalization table
+    below, keyed off the task's own ``fit_metric`` (spec §6 metric
+    contract) rather than a hardcoded task name -- ``val_auc`` (churn) is
+    the one FitMetric whose ``acc`` dict holds AUROC values, not accuracy
+    (CLAUDE.md docs framing rule: never mislabel a metric in disclosed
+    output). Every other current FitMetric (``val128``/``val_qacc``/
+    ``val_acc``/``val_mse``) keeps the existing "accuracy" framing --
+    S5/MQAR/psMNIST's ``acc`` dicts are genuinely accuracy-shaped, and
+    pendulum's is empty so the framing word never surfaces there."""
+    return "AUROC" if fit_metric == "val_auc" else "accuracy"
+
+
+def _render_fits_table_lines(arms: dict[str, dict[str, Any]], metric_label: str) -> list[str]:
+    """ "Fits and generalization <accuracy|AUROC>" table, shared by the
+    matched and the reference report renderers (both carry the same
+    per-arm ``ArmReport``-shaped dict, `_build_arm_report`'s output).
+    ``metric_label`` (`_generalization_metric_label`'s output) picks the
+    section title and column-prefix word; the accuracy-framed column
+    prefix stays the existing abbreviated "acc" rather than the spelled-out
+    "accuracy", AUROC-framed tables use "AUROC" in both places."""
     lines: list[str] = []
     acc_keys = sorted({k for rep in arms.values() for k in rep["mean_acc"]})
-    lines += ["## Fits and generalization accuracy (raw / fit-only)", ""]
+    column_prefix = "acc" if metric_label == "accuracy" else metric_label
+    lines += [f"## Fits and generalization {metric_label} (raw / fit-only)", ""]
     if acc_keys:
-        acc_header = " | ".join(f"acc@{k} (raw/fit-only)" for k in acc_keys)
+        acc_header = " | ".join(f"{column_prefix}@{k} (raw/fit-only)" for k in acc_keys)
         lines.append(f"| arm | seeds (present/planned) | fits | {acc_header} | params |")
         lines.append("| --- | --- | --- |" + " --- |" * len(acc_keys) + " --- |")
     else:
@@ -675,7 +701,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines += _render_provenance_lines(report)
     lines.append("")
 
-    lines += _render_fits_table_lines(arms)
+    lines += _render_fits_table_lines(arms, _generalization_metric_label(report["fit_metric"]))
     lines += _render_robustness_lines(arms, report["robustness_thresholds"])
 
     lines += ["", f"## Two-sided Fisher exact vs `{report['fisher_reference_arm']}`", ""]
@@ -901,7 +927,7 @@ def _render_population_markdown(report: dict[str, Any], pop: _AuxPopulation) -> 
     ]
     lines += _render_provenance_lines(report)
     lines.append("")
-    lines += _render_fits_table_lines(arms)
+    lines += _render_fits_table_lines(arms, _generalization_metric_label(report["fit_metric"]))
     lines += _render_robustness_lines(arms, report["robustness_thresholds"])
     lines += _render_completeness_lines(arms)
     lines.append("")
