@@ -26,10 +26,14 @@ Sections
 
 from __future__ import annotations
 
+import datetime
 import math
 import sys
 import types
+import urllib.error
+from pathlib import Path
 
+import experiments.benchmark_tasks as benchmark_tasks_module
 import pytest
 import torch
 from experiments.benchmark_tasks import (
@@ -40,17 +44,39 @@ from experiments.benchmark_tasks import (
     PENDULUM_LENGTH,
     PENDULUM_SUBSTEPS,
     PSMNIST_T,
+    ROSBANK_EXPECTED_COLUMNS,
+    ROSBANK_NAN_CHANNEL_TYPE,
+    ROSBANK_TEST_USERS,
+    ROSBANK_TRAIN_USERS,
+    ROSBANK_VAL_USERS,
     S5_COMPOSE,
     S5_ELEMENTS,
     Budget,
     EvalConfig,
     PsMNISTLoader,
+    RosbankLoader,
     TaskSpec,
+    _build_vocab,
+    _download_rosbank_csv,
+    _encode_user_sequence,
+    _ensure_rosbank_csv,
+    _FieldVocab,
     _integrate_pendulum,
     _ordered_batches,
     _prepare_split,
+    _rosbank_onehot_batch,
+    _rosbank_ordered_batches,
+    _rosbank_shuffled_batches,
+    _RosbankSplitData,
+    _RosbankVocabs,
     _shuffled_batches,
     _split_train_val,
+    _split_user_ids,
+    _truncate_and_leftpad,
+    _user_gap_days,
+    _valid_mask,
+    _validate_rosbank_schema,
+    _window_gap_days,
     auroc,
     make_group_word,
     make_mqar,
@@ -847,3 +873,616 @@ def test_auroc_shape_mismatch_raises():
     labels = torch.tensor([1, 0])
     with pytest.raises(ValueError):
         auroc(scores, labels)
+
+
+# ===========================================================================
+# 9. Rosbank churn -- spec `.claude/output/specs/2026-07-25-churn-benchmark-
+#    design.md` §4/§6/§9. Section A is pure functions (no pandas needed);
+#    section B is `RosbankLoader` end-to-end against a synthetic mini-CSV
+#    fixture (skip-if-no-pandas, no network).
+# ===========================================================================
+
+# --------------------------------------------------- 9A. pure helpers
+
+
+def test_build_vocab_uncapped_orders_by_value_and_assigns_oov():
+    vocab = _build_vocab(["b", "a", "c", "a"], cap=None)
+    assert vocab.index == {"a": 0, "b": 1, "c": 2}
+    assert vocab.size == 4
+    assert vocab.oov_index == 3
+    assert vocab.encode("a") == 0
+    assert vocab.encode("c") == 2
+    assert vocab.encode("unseen") == 3
+
+
+def test_build_vocab_capped_ranks_by_frequency_then_value_tiebreak():
+    """1 and 4 tie at frequency 3; 2 has frequency 2; 3 has frequency 1.
+    cap=2 keeps only the top two by frequency, tie broken by ascending
+    value -- 1 then 4 -- everything else (2, 3) falls to OOV."""
+    vocab = _build_vocab([1, 1, 1, 2, 2, 3, 4, 4, 4], cap=2)
+    assert vocab.index == {1: 0, 4: 1}
+    assert vocab.size == 3
+    assert vocab.encode(1) == 0
+    assert vocab.encode(4) == 1
+    assert vocab.encode(2) == vocab.oov_index
+    assert vocab.encode(3) == vocab.oov_index
+
+
+def test_rosbank_vocabs_d_in_sums_every_field_plus_amount():
+    vocabs = _RosbankVocabs(
+        mcc=_FieldVocab({100: 0, 200: 1}),  # size 3
+        trx_category=_FieldVocab({"A": 0}),  # size 2
+        channel_type=_FieldVocab({"POS": 0, ROSBANK_NAN_CHANNEL_TYPE: 1}),  # size 3
+        currency=_FieldVocab({810: 0}),  # size 2
+    )
+    assert vocabs.d_in == 3 + 2 + 3 + 2 + 1  # == 11
+
+
+def test_split_user_ids_is_deterministic_and_partitions_every_user_once():
+    ids = list(range(1, 9))
+    train1, val1, test1 = _split_user_ids(ids, split_seed=7, n_train=4, n_val=2, n_test=2)
+    train2, val2, test2 = _split_user_ids(ids, split_seed=7, n_train=4, n_val=2, n_test=2)
+    assert (train1, val1, test1) == (train2, val2, test2)
+    assert len(train1) == 4
+    assert len(val1) == 2
+    assert len(test1) == 2
+    assert sorted(train1 + val1 + test1) == ids
+
+
+def test_split_user_ids_differs_across_seeds():
+    ids = list(range(1, 9))
+    train1, _, _ = _split_user_ids(ids, split_seed=7, n_train=4, n_val=2, n_test=2)
+    train2, _, _ = _split_user_ids(ids, split_seed=8, n_train=4, n_val=2, n_test=2)
+    assert train1 != train2
+
+
+def test_split_user_ids_rejects_size_mismatch():
+    with pytest.raises(ValueError, match="do not match"):
+        _split_user_ids(list(range(1, 9)), split_seed=7, n_train=4, n_val=2, n_test=3)
+
+
+def test_user_gap_days_first_position_is_zero_and_rest_are_real_gaps():
+    timestamps = [
+        datetime.datetime(2017, 1, 1),
+        datetime.datetime(2017, 1, 3),
+        datetime.datetime(2017, 1, 3, 12),
+    ]
+    assert _user_gap_days(timestamps) == [0.0, 2.0, 0.5]
+
+
+def test_user_gap_days_empty_input():
+    assert _user_gap_days([]) == []
+
+
+@pytest.mark.parametrize(
+    "n_events,T,expected",
+    [
+        (2, 4, [False, False, True, True]),
+        (4, 4, [True, True, True, True]),
+        (6, 4, [True, True, True, True]),  # over-length: no padding at all
+        (0, 3, [False, False, False]),
+    ],
+)
+def test_valid_mask(n_events, T, expected):
+    assert _valid_mask(n_events, T) == expected
+
+
+def test_truncate_and_leftpad_keeps_last_T_and_pads_front():
+    assert _truncate_and_leftpad([1, 2, 3, 4, 5, 6], 4, 0) == [3, 4, 5, 6]
+    assert _truncate_and_leftpad([1, 2], 4, 0) == [0, 0, 1, 2]
+    assert _truncate_and_leftpad([1, 2, 3, 4], 4, 0) == [1, 2, 3, 4]
+
+
+def test_window_gap_days_forces_first_kept_position_to_zero():
+    """Full history has 6 gaps; keeping the last 4 would naively carry a
+    real (nonzero) gap into position 0 of the window -- must be forced back
+    to 0 (no predecessor WITHIN the window), unlike every other kept
+    position."""
+    full = [0.0, 1.0, 1.0, 1.0, 243.0, 1.0]
+    assert _window_gap_days(full, 4) == [0.0, 1.0, 243.0, 1.0]
+
+
+def test_window_gap_days_pads_with_zero():
+    assert _window_gap_days([0.0, 1.0], 4) == [0.0, 0.0, 0.0, 1.0]
+
+
+def test_encode_user_sequence_maps_oov_and_truncates_and_pads():
+    vocabs = _RosbankVocabs(
+        mcc=_FieldVocab({100: 0}),
+        trx_category=_FieldVocab({"A": 0}),
+        channel_type=_FieldVocab({"POS": 0}),
+        currency=_FieldVocab({810: 0}),
+    )
+    mcc, trxcat, channel, currency, amount_log1p, dt, valid = _encode_user_sequence(
+        mcc=[100, 999],  # 999 unseen -> OOV
+        trx_category=["A", "A"],
+        channel_type=["POS", "POS"],
+        currency=[810, 810],
+        amount=[0.0, math.e - 1],  # log1p(e - 1) == 1.0
+        timestamps=[datetime.datetime(2017, 1, 1), datetime.datetime(2017, 1, 2)],
+        vocabs=vocabs,
+        T=3,
+    )
+    assert valid == [False, True, True]
+    assert mcc == [0, vocabs.mcc.encode(100), vocabs.mcc.encode(999)]
+    assert mcc[-1] == vocabs.mcc.oov_index
+    assert dt == [0.0, 0.0, 1.0]
+    assert amount_log1p[1] == pytest.approx(0.0)
+    assert amount_log1p[2] == pytest.approx(1.0)
+
+
+def test_rosbank_onehot_batch_zeros_pad_positions_and_concatenates_fields_in_spec_order():
+    """Feature layout (spec §6): MCC || trx_category || channel_type ||
+    currency || log1p(amount)."""
+    vocabs = _RosbankVocabs(
+        mcc=_FieldVocab({100: 0, 200: 1}),
+        trx_category=_FieldVocab({"A": 0}),
+        channel_type=_FieldVocab({"POS": 0, ROSBANK_NAN_CHANNEL_TYPE: 1}),
+        currency=_FieldVocab({810: 0}),
+    )
+    split = _RosbankSplitData(
+        mcc=torch.tensor([[0, 0, 1, 1]]),
+        trx_category=torch.tensor([[0, 0, 0, 0]]),
+        channel_type=torch.tensor([[0, 0, 1, 0]]),
+        currency=torch.tensor([[0, 0, 0, 0]]),
+        amount_log1p=torch.tensor([[0.0, 0.0, 1.0, 2.0]]),
+        dt=torch.tensor([[0.0, 0.0, 0.0, 3.0]]),
+        valid=torch.tensor([[False, False, True, True]]),
+        y=torch.tensor([1]),
+    )
+    x, dt, y = _rosbank_onehot_batch(split, torch.tensor([0]), vocabs)
+    assert x.shape == (1, 4, vocabs.d_in)
+    assert x[0, 0].sum().item() == 0.0  # pad position -> all-zero feature vector
+    assert x[0, 1].sum().item() == 0.0  # pad position -> all-zero feature vector
+    assert x[0, 2].sum().item() > 0.0  # real position
+    assert x[0, 3].sum().item() > 0.0  # real position
+    # MCC one-hot is the first `vocabs.mcc.size` columns: index 1 (value
+    # 200) at the last position.
+    mcc_width = vocabs.mcc.size
+    assert x[0, 3, :mcc_width].argmax().item() == 1
+    assert torch.equal(dt, split.dt)
+    assert torch.equal(y, split.y)
+
+
+def test_rosbank_ordered_batches_covers_dataset_in_fixed_order():
+    n, T, batch_size = 5, 4, 2
+    vocabs = _RosbankVocabs(
+        mcc=_FieldVocab({i: i for i in range(n * T)}),
+        trx_category=_FieldVocab({0: 0}),
+        channel_type=_FieldVocab({0: 0}),
+        currency=_FieldVocab({0: 0}),
+    )
+    split = _RosbankSplitData(
+        mcc=torch.arange(n * T).reshape(n, T),
+        trx_category=torch.zeros(n, T, dtype=torch.int64),
+        channel_type=torch.zeros(n, T, dtype=torch.int64),
+        currency=torch.zeros(n, T, dtype=torch.int64),
+        amount_log1p=torch.zeros(n, T),
+        dt=torch.zeros(n, T),
+        valid=torch.ones(n, T, dtype=torch.bool),
+        y=torch.arange(n),
+    )
+    batches = list(_rosbank_ordered_batches(split, vocabs, batch_size))
+    assert [b[2].shape[0] for b in batches] == [2, 2, 1]  # last batch smaller
+    recovered_y = torch.cat([b[2] for b in batches])
+    assert torch.equal(recovered_y, split.y), "ordered batches must not shuffle"
+
+
+def test_rosbank_shuffled_batches_covers_dataset_but_reorders_and_is_seeded_reproducible():
+    n, T, batch_size = 5, 4, 2
+    vocabs = _RosbankVocabs(
+        mcc=_FieldVocab({0: 0}),
+        trx_category=_FieldVocab({0: 0}),
+        channel_type=_FieldVocab({0: 0}),
+        currency=_FieldVocab({0: 0}),
+    )
+    split = _RosbankSplitData(
+        mcc=torch.zeros(n, T, dtype=torch.int64),
+        trx_category=torch.zeros(n, T, dtype=torch.int64),
+        channel_type=torch.zeros(n, T, dtype=torch.int64),
+        currency=torch.zeros(n, T, dtype=torch.int64),
+        amount_log1p=torch.zeros(n, T),
+        dt=torch.zeros(n, T),
+        valid=torch.ones(n, T, dtype=torch.bool),
+        y=torch.arange(n),
+    )
+    gen1 = torch.Generator().manual_seed(SEED)
+    y1 = torch.cat([b[2] for b in _rosbank_shuffled_batches(split, vocabs, batch_size, gen1)])
+    assert sorted(y1.tolist()) == list(range(n)), "shuffle must cover every row exactly once"
+    assert not torch.equal(y1, split.y), "shuffle must actually reorder"
+
+    gen2 = torch.Generator().manual_seed(SEED)
+    y2 = torch.cat([b[2] for b in _rosbank_shuffled_batches(split, vocabs, batch_size, gen2)])
+    assert torch.equal(y1, y2)
+
+
+def test_validate_rosbank_schema_passes_on_exact_column_set():
+    class _FakeSeries:
+        def __init__(self, n):
+            self._n = n
+
+        def nunique(self):
+            return self._n
+
+    class _FakeDF:
+        def __init__(self, columns, n_users):
+            self.columns = columns
+            self._n_users = n_users
+
+        def __getitem__(self, key):
+            assert key == "cl_id"
+            return _FakeSeries(self._n_users)
+
+    df = _FakeDF(set(ROSBANK_EXPECTED_COLUMNS), n_users=5000)
+    _validate_rosbank_schema(df)  # must not raise
+
+
+def test_validate_rosbank_schema_raises_on_missing_columns():
+    class _FakeDF:
+        columns = ROSBANK_EXPECTED_COLUMNS - {"currency"}
+
+    with pytest.raises(ValueError, match="schema drift"):
+        _validate_rosbank_schema(_FakeDF())
+
+
+def test_validate_rosbank_schema_raises_on_wrong_labeled_user_count():
+    class _FakeSeries:
+        def nunique(self):
+            return 4999
+
+    class _FakeDF:
+        columns = ROSBANK_EXPECTED_COLUMNS
+
+        def __getitem__(self, key):
+            return _FakeSeries()
+
+    with pytest.raises(ValueError, match="schema drift"):
+        _validate_rosbank_schema(_FakeDF(), expected_labeled_users=5000)
+
+
+def test_download_rosbank_csv_raises_loud_on_http_error(monkeypatch, tmp_path):
+    def fake_urlopen(url):
+        raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    with pytest.raises(RuntimeError, match="404"):
+        _download_rosbank_csv("https://example.invalid/train.csv.gz", tmp_path / "train.csv.gz")
+
+
+def test_ensure_rosbank_csv_reuses_cached_file_without_downloading(monkeypatch, tmp_path):
+    dest = tmp_path / "train.csv.gz"
+    dest.write_bytes(b"cached-content")
+
+    def boom(url, dest):
+        raise AssertionError("must not download when a cached file already exists")
+
+    monkeypatch.setattr(benchmark_tasks_module, "_download_rosbank_csv", boom)
+    resolved = _ensure_rosbank_csv(tmp_path, download=True)
+    assert resolved == dest
+    assert resolved.read_bytes() == b"cached-content"
+
+
+def test_ensure_rosbank_csv_raises_when_missing_and_download_false(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        _ensure_rosbank_csv(tmp_path / "missing", download=False)
+
+
+# --------------------------------------------------- 9B. RosbankLoader end-to-end
+# Synthetic mini-CSV fixture (spec §9/§10: "no network"), 8 labeled users
+# split 4/2/2. Roles are assigned to ACTUAL cl_id values only after calling
+# `_split_user_ids` with the same (seed, sizes) `RosbankLoader` will use
+# internally, so each role's expected split membership is known up front
+# rather than assumed -- `nan_id` is deliberately pinned to `train_ids[0]`
+# so the NaN-as-category sentinel is guaranteed a genuine (train-derived)
+# vocabulary slot, not an OOV fallback.
+
+ROSBANK_TEST_SPLIT_SEED = 7
+ROSBANK_TEST_ALL_IDS = list(range(1, 9))
+ROSBANK_TEST_CSV_HEADER = (
+    "PERIOD,cl_id,MCC,channel_type,currency,TRDATETIME,amount,trx_category,target_flag,target_sum\n"
+)
+
+
+def _rosbank_test_roles():
+    """Resolve which synthetic cl_id plays which test role, given the same
+    split this fixture's `RosbankLoader` will compute internally."""
+    train_ids, val_ids, test_ids = _split_user_ids(
+        ROSBANK_TEST_ALL_IDS, ROSBANK_TEST_SPLIT_SEED, n_train=4, n_val=2, n_test=2
+    )
+    nan_id = train_ids[0]
+    remaining = [i for i in ROSBANK_TEST_ALL_IDS if i != nan_id]
+    truncate_id, pad_id, exact_id, tie_id = remaining[:4]
+    filler_ids = remaining[4:]
+    return {
+        "train_ids": train_ids,
+        "val_ids": val_ids,
+        "test_ids": test_ids,
+        "nan_id": nan_id,
+        "truncate_id": truncate_id,
+        "pad_id": pad_id,
+        "exact_id": exact_id,
+        "tie_id": tie_id,
+        "filler_ids": filler_ids,
+    }
+
+
+def _write_rosbank_fixture_csv(path, roles) -> None:
+    rows: list[tuple] = []
+
+    def add(cl_id, events, target_flag):
+        for mcc, channel, currency, ts, amount, trxcat in events:
+            rows.append(
+                (
+                    "2017-01",
+                    cl_id,
+                    mcc,
+                    channel,
+                    currency,
+                    ts,
+                    amount,
+                    trxcat,
+                    target_flag,
+                    target_flag * 1000,
+                )
+            )
+
+    add(
+        roles["truncate_id"],
+        [
+            (100, "POS", 810, "01JAN17:00:00:00", 10.0, "C2C_OUT"),
+            (100, "POS", 810, "02JAN17:00:00:00", 20.0, "C2C_OUT"),
+            (100, "POS", 810, "03JAN17:00:00:00", 30.0, "C2C_OUT"),
+            (100, "POS", 810, "04JAN17:00:00:00", 40.0, "C2C_OUT"),
+            # non-trivial month, locale-independence check:
+            (100, "POS", 810, "05SEP17:00:00:00", 50.0, "C2C_OUT"),
+            (100, "POS", 810, "06SEP17:00:00:00", 60.0, "C2C_OUT"),
+        ],
+        target_flag=1,
+    )
+    add(
+        roles["pad_id"],
+        [
+            (200, "POS", 840, "10JAN17:00:00:00", 5.0, "POS"),
+            (200, "POS", 840, "11JAN17:00:00:00", 15.0, "POS"),
+        ],
+        target_flag=0,
+    )
+    add(
+        roles["exact_id"],
+        [
+            (300, "WD_ATM_ROS", 978, "01FEB17:00:00:00", 1.0, "POS"),
+            (300, "WD_ATM_ROS", 978, "02FEB17:00:00:00", 2.0, "POS"),
+            (300, "WD_ATM_ROS", 978, "03FEB17:00:00:00", 3.0, "POS"),
+            (300, "WD_ATM_ROS", 978, "04FEB17:00:00:00", 4.0, "POS"),
+        ],
+        target_flag=1,
+    )
+    add(
+        roles["tie_id"],
+        [
+            (150, "POS", 810, "20JAN17:00:00:00", 100.0, "POS"),
+            (150, "POS", 810, "21JAN17:00:00:00", 200.0, "POS"),  # tied timestamp, written first
+            (150, "POS", 810, "21JAN17:00:00:00", 300.0, "POS"),  # tied timestamp, written second
+        ],
+        target_flag=0,
+    )
+    add(
+        roles["nan_id"],
+        [
+            (400, "POS", 810, "01MAR17:00:00:00", 7.0, "POS"),
+            (400, "", 810, "02MAR17:00:00:00", 8.0, "POS"),  # blank -> NaN channel_type
+        ],
+        target_flag=0,
+    )
+    for i, fid in enumerate(roles["filler_ids"]):
+        add(
+            fid,
+            [
+                (500 + i, "POS", 810, f"0{i + 1}APR17:00:00:00", 1.0 + i, "POS"),
+                (500 + i, "POS", 810, f"1{i + 1}APR17:00:00:00", 2.0 + i, "POS"),
+            ],
+            target_flag=i % 2,
+        )
+
+    body = "\n".join(",".join(str(v) for v in row) for row in rows)
+    path.write_text(ROSBANK_TEST_CSV_HEADER + body + "\n")
+
+
+def _rosbank_test_loader(csv_path, **overrides) -> RosbankLoader:
+    kwargs = dict(
+        split_seed=ROSBANK_TEST_SPLIT_SEED,
+        batch_size=2,
+        csv_path=str(csv_path),
+        T=4,
+        mcc_cap=1000,
+        currency_cap=1000,
+        n_train_users=4,
+        n_val_users=2,
+        n_test_users=2,
+        expected_labeled_users=8,
+    )
+    kwargs.update(overrides)
+    return RosbankLoader(**kwargs)
+
+
+def _rosbank_split_data_for(loader, cl_id, roles):
+    if cl_id in roles["train_ids"]:
+        return loader._train, roles["train_ids"].index(cl_id)
+    if cl_id in roles["val_ids"]:
+        return loader._val, roles["val_ids"].index(cl_id)
+    return loader._test, roles["test_ids"].index(cl_id)
+
+
+@pytest.fixture
+def rosbank_fixture(tmp_path):
+    pytest.importorskip("pandas")
+    roles = _rosbank_test_roles()
+    csv_path = tmp_path / "rosbank_synthetic.csv"
+    _write_rosbank_fixture_csv(csv_path, roles)
+    return csv_path, roles
+
+
+def test_rosbank_loader_truncates_to_last_T_events_in_chronological_order(rosbank_fixture):
+    csv_path, roles = rosbank_fixture
+    loader = _rosbank_test_loader(csv_path)
+    split, i = _rosbank_split_data_for(loader, roles["truncate_id"], roles)
+
+    assert split.valid[i].tolist() == [True, True, True, True]
+    assert split.dt[i][0].item() == 0.0  # forced 0 despite a real (truncated-away) predecessor
+    assert split.dt[i][1].item() == pytest.approx(1.0)  # Jan4 - Jan3
+    sep5, jan4 = datetime.datetime(2017, 9, 5), datetime.datetime(2017, 1, 4)
+    expected_gap = (sep5 - jan4).total_seconds() / 86400.0
+    assert split.dt[i][2].item() == pytest.approx(expected_gap, abs=1e-3)  # Sep5 - Jan4
+    assert split.dt[i][3].item() == pytest.approx(1.0)  # Sep6 - Sep5
+    # Truncation kept the LAST 4 (by time) of 6 events -- amounts 30/40/50/60,
+    # not the first 4 (10/20/30/40).
+    expected_amounts = [math.log1p(v) for v in [30.0, 40.0, 50.0, 60.0]]
+    assert split.amount_log1p[i].tolist() == pytest.approx(expected_amounts)
+
+
+def test_rosbank_loader_left_pads_short_sequences_with_zero_features(rosbank_fixture):
+    csv_path, roles = rosbank_fixture
+    loader = _rosbank_test_loader(csv_path)
+    split, i = _rosbank_split_data_for(loader, roles["pad_id"], roles)
+
+    assert split.valid[i].tolist() == [False, False, True, True]
+    x, dt, _ = _rosbank_onehot_batch(split, torch.tensor([i]), loader.vocabs)
+    assert x[0, 0].sum().item() == 0.0
+    assert x[0, 1].sum().item() == 0.0
+    assert x[0, 2].sum().item() > 0.0  # true final-2 positions are real events
+    assert x[0, 3].sum().item() > 0.0
+    assert dt[0, 0].item() == 0.0
+    assert dt[0, 1].item() == 0.0
+    assert dt[0, 2].item() == 0.0  # first real position -- no predecessor within the window
+    assert dt[0, 3].item() == pytest.approx(1.0)  # Jan11 - Jan10
+
+
+def test_rosbank_loader_exact_length_sequence_has_no_padding(rosbank_fixture):
+    csv_path, roles = rosbank_fixture
+    loader = _rosbank_test_loader(csv_path)
+    split, i = _rosbank_split_data_for(loader, roles["exact_id"], roles)
+
+    assert split.valid[i].tolist() == [True, True, True, True]
+    assert split.dt[i][0].item() == 0.0
+    for k in range(1, 4):
+        assert split.dt[i][k].item() == pytest.approx(1.0)
+
+
+def test_rosbank_loader_tied_timestamps_preserve_original_row_order(rosbank_fixture):
+    """Two events share an identical `TRDATETIME`; the stable sort must
+    keep them in their original CSV row order (spec §9: "date-only
+    timestamp ties preserve original row order")."""
+    csv_path, roles = rosbank_fixture
+    loader = _rosbank_test_loader(csv_path)
+    split, i = _rosbank_split_data_for(loader, roles["tie_id"], roles)
+
+    assert split.valid[i].tolist() == [False, True, True, True]
+    expected_amounts = [math.log1p(v) for v in [100.0, 200.0, 300.0]]
+    assert split.amount_log1p[i][1:].tolist() == pytest.approx(expected_amounts)
+    # Tied pair -> zero-day gap, not negative/undefined.
+    assert split.dt[i][3].item() == pytest.approx(0.0)
+
+
+def test_rosbank_loader_nan_channel_type_maps_to_dedicated_vocab_slot(rosbank_fixture):
+    csv_path, roles = rosbank_fixture
+    loader = _rosbank_test_loader(csv_path)
+    split, i = _rosbank_split_data_for(loader, roles["nan_id"], roles)
+
+    assert split.valid[i].tolist() == [False, False, True, True]
+    nan_slot = loader.vocabs.channel_type.index[ROSBANK_NAN_CHANNEL_TYPE]
+    assert nan_slot != loader.vocabs.channel_type.oov_index
+    assert split.channel_type[i][3].item() == nan_slot
+
+
+def test_rosbank_loader_is_reproducible_given_the_same_split_seed(rosbank_fixture):
+    csv_path, _ = rosbank_fixture
+    loader1 = _rosbank_test_loader(csv_path)
+    loader2 = _rosbank_test_loader(csv_path)
+    assert torch.equal(loader1._train.mcc, loader2._train.mcc)
+    assert torch.equal(loader1._val.dt, loader2._val.dt)
+    assert torch.equal(loader1._test.y, loader2._test.y)
+
+
+def test_rosbank_loader_public_iterators_yield_last_step_timed_batch_contract(rosbank_fixture):
+    csv_path, _ = rosbank_fixture
+    loader = _rosbank_test_loader(csv_path)
+
+    val_batches = list(loader.val())
+    assert sum(b[0].shape[0] for b in val_batches) == 2
+    for x, dt, y in val_batches:
+        assert x.shape[1:] == (4, loader.d_in)
+        assert x.dtype == torch.float32
+        assert dt.shape == (x.shape[0], 4)
+        assert dt.dtype == torch.float32
+        assert y.dtype == torch.int64
+        assert set(y.tolist()) <= {0, 1}
+
+    test_batches = list(loader.test())
+    assert sum(b[0].shape[0] for b in test_batches) == 2
+
+    train_batches = list(loader.train_epoch(torch.Generator().manual_seed(0)))
+    assert sum(b[0].shape[0] for b in train_batches) == 4
+
+
+def test_rosbank_loader_raises_on_missing_column(tmp_path):
+    pytest.importorskip("pandas")
+    bad_csv = tmp_path / "bad_schema.csv"
+    bad_csv.write_text(
+        "PERIOD,cl_id,MCC,channel_type,TRDATETIME,amount,trx_category,target_flag,target_sum\n"
+        "2017-01,1,100,POS,01JAN17:00:00:00,1.0,POS,0,0\n"
+    )
+    with pytest.raises(ValueError, match="schema drift"):
+        RosbankLoader(split_seed=1, batch_size=2, csv_path=str(bad_csv), expected_labeled_users=1)
+
+
+def test_rosbank_loader_raises_on_wrong_labeled_user_count(tmp_path):
+    pytest.importorskip("pandas")
+    csv_path = tmp_path / "small_valid.csv"
+    csv_path.write_text(
+        ROSBANK_TEST_CSV_HEADER + "2017-01,1,100,POS,810,01JAN17:00:00:00,1.0,POS,0,0\n"
+    )
+    with pytest.raises(ValueError, match="schema drift"):
+        # default expected_labeled_users (5000) does not match this 1-user fixture
+        RosbankLoader(split_seed=1, batch_size=2, csv_path=str(csv_path))
+
+
+def test_rosbank_loader_real_download_cache_if_present():
+    """Real-download loader test (spec §10): "A real-download loader test
+    is skip-if-missing." This must never trigger a network fetch by
+    surprise in CI, so it is gated on the cached file already existing at
+    the production cache path -- skip with a clear reason when it does
+    not, rather than downloading ~4.7 MB unasked; `download=False` below
+    is a second, redundant guard against ever reaching for the network
+    even if this gate were bypassed."""
+    pytest.importorskip("pandas")
+    cache_path = Path("./data/rosbank/train.csv.gz")
+    if not cache_path.exists():
+        pytest.skip(
+            f"real Rosbank dataset not cached at {cache_path}; skip-if-missing "
+            f"(spec §10) -- this test never downloads it itself"
+        )
+
+    loader = RosbankLoader(split_seed=0, batch_size=128, download=False)
+
+    # d_in == 126 exactly, on the REAL dataset's vocab sizes (spec §6:
+    # MCC top-100 + OOV = 101, trx_category all-values + OOV = 11,
+    # channel_type all-values-incl-NaN + OOV = 7, currency top-5 + OOV = 6,
+    # + 1 log1p(amount) = 126) -- this is the arithmetic the spec review
+    # flagged as unverified against real data; the synthetic fixture used
+    # elsewhere in this section can't exercise it since its vocab sizes are
+    # deliberately tiny.
+    assert loader.d_in == 126
+
+    assert loader._train.y.shape[0] == ROSBANK_TRAIN_USERS
+    assert loader._val.y.shape[0] == ROSBANK_VAL_USERS
+    assert loader._test.y.shape[0] == ROSBANK_TEST_USERS
+
+    for split in (loader._train, loader._val, loader._test):
+        # log1p(amount) must stay finite everywhere (dataset min amount is
+        # 0.01 per the verified dataset facts, so log1p is always safely
+        # defined -- no zero/negative amount to produce -inf/NaN).
+        assert torch.isfinite(split.amount_log1p).all()
+        # dt must be non-negative at every REAL (non-pad) position --
+        # pad positions are excluded since they are deliberately 0 by
+        # construction regardless of any real predecessor gap.
+        assert (split.dt[split.valid] >= 0).all()

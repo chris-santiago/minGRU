@@ -36,16 +36,29 @@ task's `loss_mode` (spec §6):
   `(batch, T, d_out)`, `dt` float `(batch, T)` feeding the decay channel via
   the existing timestamped-input path (`probes.py`'s `TIMESTAMPED_TASKS`
   convention: `dt[:, 0] == 0`, nothing precedes the first position).
+- `last_step_timed` (churn, spec `.claude/output/specs/2026-07-25-churn-
+  benchmark-design.md` §6): `(x, dt, y)`, `x` float `(batch, 256, 126)`, `dt`
+  float `(batch, 256)` (day-gaps between consecutive real events; position 0
+  of the window and every pad position are 0, same no-predecessor
+  convention as `regression`), `y` int64 `(batch,)` in `{0, 1}`; loss/AUROC
+  apply only at the final position, which left-padding guarantees is always
+  a real event (see `RosbankLoader`).
 """
 
 from __future__ import annotations
 
 import itertools
-from collections.abc import Callable, Iterator
+import math
+import urllib.error
+import urllib.request
+from collections import Counter
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, Protocol
 
 import torch
+import torch.nn.functional as F
 
 # ------------------------------------------------------------- TaskSpec
 
@@ -78,6 +91,13 @@ class Loader(Protocol):
 
     Every method yields `last_step` batches (module docstring): `x` float
     `(batch, T, d_in)`, `y` int64 `(batch,)`.
+
+    `RosbankLoader` (churn, `last_step_timed`) shares this exact
+    `train_epoch`/`val`/`test` method shape and the same epoch-based-
+    dataset-owns-its-own-fixed-preprocessing rationale, but yields 3-tuple
+    `(x, dt, y)` batches instead -- documented on its own class docstring
+    rather than a second literal `Protocol` here, since that would just
+    duplicate this docstring's rationale for a different tuple arity.
     """
 
     def train_epoch(self, gen: torch.Generator) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
@@ -715,6 +735,569 @@ def make_psmnist_loader(batch_size: int) -> PsMNISTLoader:
     is what knows to call it this way.
     """
     return PsMNISTLoader(permutation_seed=PSMNIST_PERMUTATION_SEED, batch_size=batch_size)
+
+
+# ----------------------------------------------------------------- Rosbank
+# Rosbank churn (spec `.claude/output/specs/2026-07-25-churn-benchmark-
+# design.md` §4/§6): per-user binary churn prediction from a bank's
+# transaction event stream (`pytorch-lifestream/rosbank-churn` on the HF
+# Hub). `RosbankLoader` owns download, parsing, per-user chronological
+# sorting, the seeded 4000/500/500 user split, train-split-derived
+# categorical vocabularies (with OOV/NaN buckets), and last-256-event
+# truncation with left-padding -- everything up to but not including the
+# per-batch one-hot expansion (spec §5 architecture: "integer-encoded
+# sequences are precomputed once, one-hot expansion happens per batch").
+#
+# pandas is imported lazily inside `RosbankLoader.__init__` only (the same
+# torchvision convention `PsMNISTLoader` already uses above): every helper
+# function below either touches no pandas object at all (pure Python/torch),
+# or receives an already-constructed pandas `DataFrame`/`Series` and calls
+# only ITS methods (`.groupby`, `.sort_values`, `.isin`, `.fillna`, `.tolist`
+# -- none of which require the `pandas` module itself in scope), so this
+# module stays importable without pandas installed; only actually
+# CONSTRUCTING a `RosbankLoader` requires it.
+
+ROSBANK_DATASET_ID = "pytorch-lifestream/rosbank-churn"
+ROSBANK_REVISION = "aad1b512deaee7ffea4c289e496785bc9e17bd80"  # pinned HF revision (spec §4)
+ROSBANK_RESOLVE_URL = (
+    f"https://huggingface.co/datasets/{ROSBANK_DATASET_ID}/resolve/{ROSBANK_REVISION}/train.csv.gz"
+)
+ROSBANK_EXPECTED_COLUMNS = frozenset(
+    {
+        "PERIOD",
+        "cl_id",
+        "MCC",
+        "channel_type",
+        "currency",
+        "TRDATETIME",
+        "amount",
+        "trx_category",
+        "target_flag",
+        "target_sum",
+    }
+)
+ROSBANK_EXPECTED_LABELED_USERS = 5_000
+ROSBANK_TRAIN_USERS = 4_000
+ROSBANK_VAL_USERS = 500
+ROSBANK_TEST_USERS = 500
+ROSBANK_T = 256  # last-256-event truncation window (spec §4/§6)
+ROSBANK_MCC_CAP = 100  # top-100-by-train-frequency + OOV (spec §6 feature layout)
+ROSBANK_CURRENCY_CAP = 5  # top-5-by-train-frequency + OOV (spec §6 feature layout)
+ROSBANK_TRDATETIME_FORMAT = "%d%b%y:%H:%M:%S"  # e.g. "05SEP17:00:00:00" (spec §4)
+# NaN-as-category sentinel (spec §4/§6); never a real HF channel_type string.
+ROSBANK_NAN_CHANNEL_TYPE = "<rosbank-nan-channel-type>"
+
+
+def _download_rosbank_csv(url: str, dest: Path) -> None:
+    """Fetch `url` and write it to `dest` (spec §4: "download failure ...
+    fails loud; there is no silent fallback"). Downloads to a `.part`
+    sidecar first and atomically renames into place, so a failed/killed
+    download never leaves a corrupt file at `dest` for a later run to treat
+    as a valid cache hit.
+
+    Raises
+    ------
+    RuntimeError
+        On any HTTP or network failure (404, other HTTP error, DNS/connect
+        failure), chained from the underlying `urllib.error` exception.
+    """
+    try:
+        with urllib.request.urlopen(url) as response:  # noqa: S310 -- fixed https:// HF resolve URL, not user input
+            payload = response.read()
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(
+            f"Rosbank dataset download failed ({e.code} {e.reason}) from {url}"
+        ) from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Rosbank dataset download failed ({e.reason}) from {url}") from e
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    tmp.write_bytes(payload)
+    tmp.replace(dest)
+
+
+def _ensure_rosbank_csv(root: Path, download: bool) -> Path:
+    """Return the path to a cached `train.csv.gz` under `root`, downloading
+    it first (pinned revision, spec §4) if not already cached and `download`
+    is true; raises if missing and `download` is false."""
+    dest = root / "train.csv.gz"
+    if dest.exists():
+        return dest
+    if not download:
+        raise FileNotFoundError(
+            f"Rosbank dataset not found at {dest} and download=False; pass "
+            f"download=True or place train.csv.gz there manually"
+        )
+    root.mkdir(parents=True, exist_ok=True)
+    _download_rosbank_csv(ROSBANK_RESOLVE_URL, dest)
+    return dest
+
+
+def _validate_rosbank_schema(
+    df, expected_labeled_users: int = ROSBANK_EXPECTED_LABELED_USERS
+) -> None:
+    """Fail loud on schema drift (spec §4: "column set, labeled-user
+    count"). Called before any parsing, so a drifted source raises a clear
+    message instead of an obscure `KeyError`/mis-shaped result downstream.
+    """
+    actual_columns = set(df.columns)
+    if actual_columns != ROSBANK_EXPECTED_COLUMNS:
+        missing = sorted(ROSBANK_EXPECTED_COLUMNS - actual_columns)
+        extra = sorted(actual_columns - ROSBANK_EXPECTED_COLUMNS)
+        raise ValueError(
+            f"Rosbank schema drift: missing columns {missing}, unexpected columns {extra}"
+        )
+    n_users = df["cl_id"].nunique()
+    if n_users != expected_labeled_users:
+        raise ValueError(
+            f"Rosbank schema drift: expected {expected_labeled_users} labeled users, "
+            f"found {n_users}"
+        )
+
+
+@dataclass(frozen=True)
+class _FieldVocab:
+    """One categorical field's train-split-derived vocabulary (spec §4/§6):
+    `index` maps a raw value to its one-hot slot `0..len(index)-1`; any
+    value NOT in `index` (unseen in train, or capped out of the top-N)
+    encodes to the trailing OOV slot at index `len(index)`."""
+
+    index: dict
+
+    @property
+    def size(self) -> int:
+        """One-hot width: every mapped value plus one trailing OOV slot."""
+        return len(self.index) + 1
+
+    @property
+    def oov_index(self) -> int:
+        return len(self.index)
+
+    def encode(self, value) -> int:
+        return self.index.get(value, self.oov_index)
+
+
+def _build_vocab(values: Sequence, cap: int | None) -> _FieldVocab:
+    """Build a `_FieldVocab` from train-split `values` (spec §6: "Vocab caps
+    from train split only").
+
+    `cap=None` (trx_category, channel_type): every distinct value gets a
+    slot, ordered by the value itself (ascending) -- deterministic and
+    independent of frequency, since an uncapped field has no OOV-selection
+    decision to make; only the one-hot slot ORDER needs to be fixed, and
+    sorted-by-value is the simplest reproducible choice.
+
+    `cap=N` (MCC, currency): the top-`N` values by train-split frequency get
+    a slot (spec §6: "top-100-by-train-frequency" / "top-5"), ranked
+    highest-frequency-first; ties broken by ascending value for a fully
+    deterministic cutoff (the spec does not prescribe a tie-break, but the
+    cutoff must still be reproducible given `split_seed`). Everything else
+    falls to OOV.
+    """
+    counts = Counter(values)
+    if cap is None:
+        ordered = sorted(counts.keys())
+    else:
+        ordered = sorted(counts.keys(), key=lambda v: (-counts[v], v))[:cap]
+    return _FieldVocab(index={v: i for i, v in enumerate(ordered)})
+
+
+@dataclass(frozen=True)
+class _RosbankVocabs:
+    """The four categorical field vocabularies (spec §6 feature layout),
+    bundled so every call site threads one object instead of four."""
+
+    mcc: _FieldVocab
+    trx_category: _FieldVocab
+    channel_type: _FieldVocab
+    currency: _FieldVocab
+
+    @property
+    def d_in(self) -> int:
+        """Total one-hot-concat-plus-amount feature width (spec §6: 126 for
+        the real dataset's vocab sizes; the caps fix MCC/currency at
+        `cap + 1` exactly, while trx_category/channel_type vary with
+        whatever data built this bundle -- e.g. a small synthetic test
+        fixture)."""
+        return (
+            self.mcc.size
+            + self.trx_category.size
+            + self.channel_type.size
+            + self.currency.size
+            + 1  # log1p(amount)
+        )
+
+
+def _split_user_ids(
+    user_ids: Sequence[int],
+    split_seed: int,
+    n_train: int = ROSBANK_TRAIN_USERS,
+    n_val: int = ROSBANK_VAL_USERS,
+    n_test: int = ROSBANK_TEST_USERS,
+) -> tuple[list[int], list[int], list[int]]:
+    """Seeded 4000/500/500 user split (spec §4/§6): `user_ids` is first
+    canonicalized to ascending-sorted order (so the split does not depend on
+    whatever order the source CSV happened to list users in), then permuted
+    by a `split_seed`-seeded generator and sliced train/val/test in that
+    fixed order -- reproducible given `split_seed` (spec §9: "identical
+    `split_seed` reproduces identical splits").
+
+    Raises
+    ------
+    ValueError
+        If `len(user_ids)` does not equal `n_train + n_val + n_test` -- a
+        silent size mismatch would otherwise either drop users or crash
+        deep inside slicing with a confusing message.
+    """
+    total_needed = n_train + n_val + n_test
+    if len(user_ids) != total_needed:
+        raise ValueError(
+            f"Rosbank split sizes (train={n_train} + val={n_val} + test={n_test} = "
+            f"{total_needed}) do not match the {len(user_ids)} labeled users available"
+        )
+    canonical = sorted(user_ids)
+    gen = torch.Generator().manual_seed(split_seed)
+    perm = torch.randperm(len(canonical), generator=gen).tolist()
+    shuffled = [canonical[i] for i in perm]
+    train_ids = shuffled[:n_train]
+    val_ids = shuffled[n_train : n_train + n_val]
+    test_ids = shuffled[n_train + n_val : total_needed]
+    return train_ids, val_ids, test_ids
+
+
+def _user_gap_days(timestamps: Sequence) -> list[float]:
+    """Per-position day-gaps for one user's ALREADY chronologically sorted
+    `timestamps` (any subtractable, `.total_seconds()`-yielding-delta type
+    -- `pandas.Timestamp` and `datetime.datetime` both qualify, so this
+    needs no pandas import): position 0 is 0.0 (nothing precedes the first
+    observed event); each later position is the gap since the previous
+    element of `timestamps`, in fractional days."""
+    if not timestamps:
+        return []
+    gaps = [0.0]
+    # pairwise consecutive elements: RHS is deliberately one shorter, so
+    # `strict=False` (not the usual `strict=True`) is the correct choice here.
+    for prev, curr in zip(timestamps, timestamps[1:], strict=False):
+        gaps.append((curr - prev).total_seconds() / 86400.0)
+    return gaps
+
+
+def _valid_mask(n_events: int, T: int) -> list[bool]:
+    """`True` at the trailing (real-event) positions of a length-`T`
+    left-padded window, `False` at the leading pad positions -- `n_events`
+    may exceed `T` (truncation, no padding at all) or fall short of it
+    (left-padding fills the remainder)."""
+    kept = min(n_events, T)
+    return [False] * (T - kept) + [True] * kept
+
+
+def _truncate_and_leftpad(seq: Sequence, T: int, pad_value):
+    """Keep the LAST `T` elements of `seq` (spec §4: "truncate each
+    sequence to its last T=256 events") and left-pad with `pad_value` up to
+    length `T` if shorter (spec §4: "left-pad shorter sequences so the
+    final position is always a real event") -- the shared truncate/pad
+    windowing every per-user field (MCC/trx_category/channel_type/currency/
+    amount indices) uses identically; `dt` uses `_window_gap_days` instead,
+    since its pad-boundary value is NOT simply `pad_value` repeated (the
+    first REAL position in the window must reset to 0, not carry the gap
+    from whatever event truncation cut away)."""
+    keep = list(seq[-T:])
+    pad_len = T - len(keep)
+    return [pad_value] * pad_len + keep
+
+
+def _window_gap_days(gap_days_full: Sequence[float], T: int) -> list[float]:
+    """`_truncate_and_leftpad`'s counterpart for `dt`: after keeping the
+    last `T` of a user's full-history day-gaps, the FIRST kept position is
+    forced back to 0.0 -- the window's first real event has no predecessor
+    WITHIN the window (same no-t=0-exemption convention `probes.py`'s
+    `TIMESTAMPED_TASKS` and this module's pendulum section already use),
+    even though `gap_days_full` may have recorded a real (now truncated-
+    away) predecessor for it. Left-padding then fills the remainder with
+    0.0, same as every pad position elsewhere in the batch contract."""
+    kept = list(gap_days_full[-T:])
+    if kept:
+        kept[0] = 0.0
+    pad_len = T - len(kept)
+    return [0.0] * pad_len + kept
+
+
+def _encode_user_sequence(
+    mcc: Sequence[int],
+    trx_category: Sequence[str],
+    channel_type: Sequence[str],
+    currency: Sequence[int],
+    amount: Sequence[float],
+    timestamps: Sequence,
+    vocabs: _RosbankVocabs,
+    T: int,
+) -> tuple[list[int], list[int], list[int], list[int], list[float], list[float], list[bool]]:
+    """One user's raw, already chronologically-sorted event fields -> the
+    seven length-`T` per-user rows `RosbankLoader` stacks into its split
+    tensors: integer-encoded MCC/trx_category/channel_type/currency,
+    `log1p(amount)`, day-gap `dt`, and the real-vs-pad `valid` mask.
+
+    Pure function (no pandas): every argument is a plain sequence, so this
+    is testable directly against hand-built lists.
+    """
+    n = len(mcc)
+    gap_days_full = _user_gap_days(timestamps)
+    mcc_idx = [vocabs.mcc.encode(v) for v in mcc]
+    trxcat_idx = [vocabs.trx_category.encode(v) for v in trx_category]
+    channel_idx = [vocabs.channel_type.encode(v) for v in channel_type]
+    currency_idx = [vocabs.currency.encode(v) for v in currency]
+    amount_log1p = [math.log1p(v) for v in amount]
+
+    return (
+        _truncate_and_leftpad(mcc_idx, T, 0),
+        _truncate_and_leftpad(trxcat_idx, T, 0),
+        _truncate_and_leftpad(channel_idx, T, 0),
+        _truncate_and_leftpad(currency_idx, T, 0),
+        _truncate_and_leftpad(amount_log1p, T, 0.0),
+        _window_gap_days(gap_days_full, T),
+        _valid_mask(n, T),
+    )
+
+
+@dataclass(frozen=True)
+class _RosbankSplitData:
+    """One split's (train/val/test) precomputed, integer-encoded, padded/
+    truncated tensors (spec §5: "integer-encoded sequences are precomputed
+    once, one-hot expansion happens per batch") -- `_rosbank_onehot_batch`
+    expands a row-index slice of these into the `(x, dt, y)` batch
+    contract."""
+
+    mcc: torch.Tensor  # (N, T) int64
+    trx_category: torch.Tensor  # (N, T) int64
+    channel_type: torch.Tensor  # (N, T) int64
+    currency: torch.Tensor  # (N, T) int64
+    amount_log1p: torch.Tensor  # (N, T) float32
+    dt: torch.Tensor  # (N, T) float32
+    valid: torch.Tensor  # (N, T) bool
+    y: torch.Tensor  # (N,) int64
+
+
+def _build_split_data(
+    df, user_ids: Sequence[int], vocabs: _RosbankVocabs, T: int
+) -> _RosbankSplitData:
+    """Group the already parsed/sorted `df` by `cl_id` and encode each of
+    `user_ids`' event sequences via `_encode_user_sequence`, stacking the
+    per-user rows into one `_RosbankSplitData`.
+
+    `df` is expected to carry the `_ts` (parsed `TRDATETIME`, ascending
+    within each user -- `RosbankLoader.__init__`'s stable global sort
+    guarantees this) and `_channel` (NaN-filled `channel_type`) columns
+    `RosbankLoader.__init__` adds before calling this.
+    """
+    grouped = df.groupby("cl_id", sort=False)
+    mcc_rows, trxcat_rows, channel_rows, currency_rows = [], [], [], []
+    amount_rows, dt_rows, valid_rows, y_rows = [], [], [], []
+    for uid in user_ids:
+        g = grouped.get_group(uid)
+        mcc_idx, trxcat_idx, channel_idx, currency_idx, amount_log1p, dt, valid = (
+            _encode_user_sequence(
+                mcc=g["MCC"].tolist(),
+                trx_category=g["trx_category"].tolist(),
+                channel_type=g["_channel"].tolist(),
+                currency=g["currency"].tolist(),
+                amount=g["amount"].tolist(),
+                timestamps=g["_ts"].tolist(),
+                vocabs=vocabs,
+                T=T,
+            )
+        )
+        mcc_rows.append(mcc_idx)
+        trxcat_rows.append(trxcat_idx)
+        channel_rows.append(channel_idx)
+        currency_rows.append(currency_idx)
+        amount_rows.append(amount_log1p)
+        dt_rows.append(dt)
+        valid_rows.append(valid)
+        # target_flag is constant within a user (spec's verified dataset facts).
+        y_rows.append(int(g["target_flag"].iloc[0]))
+    return _RosbankSplitData(
+        mcc=torch.tensor(mcc_rows, dtype=torch.int64),
+        trx_category=torch.tensor(trxcat_rows, dtype=torch.int64),
+        channel_type=torch.tensor(channel_rows, dtype=torch.int64),
+        currency=torch.tensor(currency_rows, dtype=torch.int64),
+        amount_log1p=torch.tensor(amount_rows, dtype=torch.float32),
+        dt=torch.tensor(dt_rows, dtype=torch.float32),
+        valid=torch.tensor(valid_rows, dtype=torch.bool),
+        y=torch.tensor(y_rows, dtype=torch.int64),
+    )
+
+
+def _rosbank_onehot_batch(
+    split: _RosbankSplitData, idx: torch.Tensor, vocabs: _RosbankVocabs
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Expand row-index slice `idx` of `split` into one `last_step_timed`
+    batch (spec §6 feature layout: MCC one-hot || trx_category one-hot ||
+    channel_type one-hot || currency one-hot || log1p(amount)) -- the
+    per-batch one-hot expansion spec §5 calls for, rather than a
+    whole-dataset materialization.
+
+    Pad positions are zeroed AFTER concatenation via `split.valid`, so a
+    pad row is an all-zero feature vector even though its underlying
+    category indices are the arbitrary placeholder 0 (spec §6: "Pad
+    positions are all-zero feature vectors").
+    """
+    mcc = F.one_hot(split.mcc[idx], vocabs.mcc.size)
+    trx_category = F.one_hot(split.trx_category[idx], vocabs.trx_category.size)
+    channel_type = F.one_hot(split.channel_type[idx], vocabs.channel_type.size)
+    currency = F.one_hot(split.currency[idx], vocabs.currency.size)
+    categorical = torch.cat([mcc, trx_category, channel_type, currency], dim=-1).float()
+    amount = split.amount_log1p[idx].unsqueeze(-1)
+    x = torch.cat([categorical, amount], dim=-1)
+    x = x * split.valid[idx].unsqueeze(-1)
+    dt = split.dt[idx]
+    y = split.y[idx]
+    return x, dt, y
+
+
+def _rosbank_ordered_batches(
+    split: _RosbankSplitData, vocabs: _RosbankVocabs, batch_size: int
+) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """`_rosbank_onehot_batch` over fixed (non-shuffled) `batch_size` slices
+    of `split`, in dataset order -- val/test, mirroring psMNIST's
+    `_ordered_batches` reproducibility guarantee for this loader's 3-tuple
+    contract."""
+    n = split.y.shape[0]
+    for start in range(0, n, batch_size):
+        idx = torch.arange(start, min(start + batch_size, n))
+        yield _rosbank_onehot_batch(split, idx, vocabs)
+
+
+def _rosbank_shuffled_batches(
+    split: _RosbankSplitData, vocabs: _RosbankVocabs, batch_size: int, gen: torch.Generator
+) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """`_rosbank_ordered_batches` over a fresh per-call shuffle of `split`'s
+    row order, seeded by `gen` -- training, reshuffled every epoch (mirrors
+    psMNIST's `_shuffled_batches`)."""
+    order = torch.randperm(split.y.shape[0], generator=gen)
+    for start in range(0, order.shape[0], batch_size):
+        idx = order[start : start + batch_size]
+        yield _rosbank_onehot_batch(split, idx, vocabs)
+
+
+class RosbankLoader:
+    """`Loader`-shaped (spec §6, `Loader` Protocol docstring above) loader
+    for the churn task (spec §4): downloads (or reuses a cached)
+    `train.csv.gz` at the pinned HF revision, parses `TRDATETIME`, stable-
+    sorts each user's events by `(timestamp, original row order)`, splits
+    users 4000/500/500 (`split_seed`), builds train-split-derived
+    categorical vocabularies, and precomputes each split's truncated/
+    left-padded integer-encoded tensors -- `train_epoch`/`val`/`test` then
+    one-hot-expand a batch of rows at a time (`_rosbank_onehot_batch`).
+
+    pandas is imported lazily here, not at module level (module docstring
+    for this section) -- constructing this loader is the only thing that
+    requires it installed.
+    """
+
+    def __init__(
+        self,
+        split_seed: int,
+        batch_size: int,
+        root: str = "./data/rosbank",
+        download: bool = True,
+        csv_path: str | None = None,
+        T: int = ROSBANK_T,
+        mcc_cap: int = ROSBANK_MCC_CAP,
+        currency_cap: int = ROSBANK_CURRENCY_CAP,
+        n_train_users: int = ROSBANK_TRAIN_USERS,
+        n_val_users: int = ROSBANK_VAL_USERS,
+        n_test_users: int = ROSBANK_TEST_USERS,
+        expected_labeled_users: int = ROSBANK_EXPECTED_LABELED_USERS,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        split_seed : int
+            Seeds the 4000/500/500 user split (spec §4/§6); recorded in
+            each ledger row's `config` by the (later) driver task.
+        batch_size : int
+            Rows per yielded batch.
+        root : str
+            Cache directory for the downloaded `train.csv.gz` (spec §4:
+            "cached under `./data/rosbank/`"). Ignored if `csv_path` is
+            given.
+        download : bool
+            If the cache is missing, download when true; raise
+            `FileNotFoundError` when false (mirrors `PsMNISTLoader`'s
+            `download` flag). Ignored if `csv_path` is given.
+        csv_path : str | None
+            Load directly from this path instead of the download/cache
+            path -- lets tests point at a synthetic mini-CSV fixture (spec
+            §9/§10) without touching the network or the real cache
+            directory.
+        T : int
+            Truncation/padding window length (256 in production).
+        mcc_cap, currency_cap : int
+            Train-split top-N vocabulary caps (spec §6 feature layout: 100
+            and 5 in production) -- exposed so tests can shrink them
+            against a small synthetic fixture.
+        n_train_users, n_val_users, n_test_users : int
+            User-split sizes (4000/500/500 in production) -- exposed for
+            the same reason.
+        expected_labeled_users : int
+            Schema-drift check target for the total labeled-user count
+            (spec §4) -- exposed so tests can point it at a small
+            synthetic fixture's true user count instead of the production
+            5000.
+        """
+        import pandas as pd  # local import: optional dependency (section docstring)
+
+        self.split_seed = split_seed
+        self.batch_size = batch_size
+        self.T = T
+
+        resolved_path = (
+            Path(csv_path) if csv_path is not None else _ensure_rosbank_csv(Path(root), download)
+        )
+        df = pd.read_csv(resolved_path)
+        _validate_rosbank_schema(df, expected_labeled_users=expected_labeled_users)
+
+        df["_ts"] = pd.to_datetime(df["TRDATETIME"], format=ROSBANK_TRDATETIME_FORMAT)
+        df["_channel"] = df["channel_type"].fillna(ROSBANK_NAN_CHANNEL_TYPE)
+        # Stable global sort by timestamp: `kind="mergesort"` preserves
+        # original row order among ties, so (a) each user's own event
+        # subsequence stays sorted (a subsequence of a sorted sequence is
+        # sorted) and (b) same-user same-timestamp ties (spec's "many
+        # midnight-only timestamps") keep their original CSV row order --
+        # spec §9's "(timestamp, original row order)" stable-sort criterion.
+        df = df.sort_values("_ts", kind="mergesort")
+
+        user_ids = sorted(df["cl_id"].unique().tolist())
+        train_ids, val_ids, test_ids = _split_user_ids(
+            user_ids, split_seed, n_train_users, n_val_users, n_test_users
+        )
+
+        train_df = df[df["cl_id"].isin(train_ids)]
+        self.vocabs = _RosbankVocabs(
+            mcc=_build_vocab(train_df["MCC"].tolist(), cap=mcc_cap),
+            trx_category=_build_vocab(train_df["trx_category"].tolist(), cap=None),
+            channel_type=_build_vocab(train_df["_channel"].tolist(), cap=None),
+            currency=_build_vocab(train_df["currency"].tolist(), cap=currency_cap),
+        )
+
+        self._train = _build_split_data(df, train_ids, self.vocabs, T)
+        self._val = _build_split_data(df, val_ids, self.vocabs, T)
+        self._test = _build_split_data(df, test_ids, self.vocabs, T)
+
+    @property
+    def d_in(self) -> int:
+        """Feature width of `x` (spec §6: 126 for the real dataset)."""
+        return self.vocabs.d_in
+
+    def train_epoch(
+        self, gen: torch.Generator
+    ) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        yield from _rosbank_shuffled_batches(self._train, self.vocabs, self.batch_size, gen)
+
+    def val(self) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        yield from _rosbank_ordered_batches(self._val, self.vocabs, self.batch_size)
+
+    def test(self) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        yield from _rosbank_ordered_batches(self._test, self.vocabs, self.batch_size)
 
 
 # ------------------------------------------------------- canonical TaskSpecs
