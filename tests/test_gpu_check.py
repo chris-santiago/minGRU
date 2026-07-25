@@ -934,7 +934,10 @@ def test_benchmarks_rounds_also_accepts_the_ref_round():
     alongside the pilot, matrix, and probe generations."""
     from experiments.benchmark_tasks import BENCH_REF_ROUND_TAGS
 
-    assert BENCH_REF_ROUND_TAGS == {"psmnist": "bench-psmnist-ref-01", "churn": "bench-churn-ref-01"}
+    assert BENCH_REF_ROUND_TAGS == {
+        "psmnist": "bench-psmnist-ref-01",
+        "churn": "bench-churn-ref-01",
+    }
     for tag in BENCH_REF_ROUND_TAGS.values():
         assert tag in _BENCH_ROUNDS
 
