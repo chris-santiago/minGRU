@@ -560,7 +560,7 @@ def test_unrecognized_probe_variant_under_the_matrix_round_tag_is_silently_dropp
 # byte-identical regardless of whether REF_ARMS rows exist.
 def test_ref_round_tags_match_bench_ref_round_tags():
     assert REF_ROUND_TAGS == BENCH_REF_ROUND_TAGS
-    assert REF_ROUND_TAGS == {"psmnist": "bench-psmnist-ref-01"}
+    assert REF_ROUND_TAGS == {"psmnist": "bench-psmnist-ref-01", "churn": "bench-churn-ref-01"}
 
 
 def test_gru_large_ref_row_never_appears_in_a_minus02_matrix_report():
@@ -669,7 +669,7 @@ def test_write_ref_reports_writes_distinct_filenames_from_the_matched_pair(tmp_p
 # or the reference `bench_psmnist_ref.{json,md}` pair.
 def test_probe_round_tags_match_bench_probe_round_tags():
     assert PROBE_ROUND_TAGS == BENCH_PROBE_ROUND_TAGS
-    assert PROBE_ROUND_TAGS == {"s5": "bench-s5-probe-01"}
+    assert PROBE_ROUND_TAGS == {"s5": "bench-s5-probe-01", "churn": "bench-churn-probe-01"}
 
 
 def test_build_probe_task_report_reads_only_the_probe_round_and_probe_arms():

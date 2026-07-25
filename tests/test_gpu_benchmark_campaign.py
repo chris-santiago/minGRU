@@ -119,7 +119,7 @@ def test_probe_round_tags_match_bench_probe_round_tags():
     from experiments.benchmark_tasks import BENCH_PROBE_ROUND_TAGS
 
     assert _PROBE_ROUND_TAGS == BENCH_PROBE_ROUND_TAGS
-    assert _PROBE_ROUND_TAGS == {"s5": "bench-s5-probe-01"}
+    assert _PROBE_ROUND_TAGS == {"s5": "bench-s5-probe-01", "churn": "bench-churn-probe-01"}
 
 
 @pytest.mark.parametrize("arm", sorted(set(PROBE_ARMS) - {"signed-rotation-k5"}))
@@ -225,7 +225,7 @@ def test_ref_round_tags_match_bench_ref_round_tags():
     from experiments.benchmark_tasks import BENCH_REF_ROUND_TAGS
 
     assert _REF_ROUND_TAGS == BENCH_REF_ROUND_TAGS
-    assert _REF_ROUND_TAGS == {"psmnist": "bench-psmnist-ref-01"}
+    assert _REF_ROUND_TAGS == {"psmnist": "bench-psmnist-ref-01", "churn": "bench-churn-ref-01"}
 
 
 @pytest.mark.parametrize("arm", sorted(REF_ARMS))
