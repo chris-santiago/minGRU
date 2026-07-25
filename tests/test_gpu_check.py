@@ -88,6 +88,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 _SCRIPT_PATH = Path(__file__).resolve().parent.parent / "scripts" / "gpu_check.py"
 _spec = importlib.util.spec_from_file_location("gpu_check", _SCRIPT_PATH)
 assert _spec is not None and _spec.loader is not None
@@ -802,6 +804,15 @@ def _bench_row(round_name: str, task: str, variant: str, seed: int, secs: float 
     }
 
 
+# `_build_benchmarks_sidecar` takes an `_AppendResult`; the merge tests below
+# only care about `_build_benchmarks_sidecar`'s row-shaped output, not any
+# particular dedup outcome, so a fixed "one row appended, nothing skipped"
+# result is reused across them rather than re-deriving one per call site.
+_APPEND_ONE = gpu_check._AppendResult(
+    appended=1, skipped_duplicate=0, skipped_invalid=0, deduped_in_batch=0
+)
+
+
 # --------------------------------------------- build_benchmarks_command
 # Evidence-phase-gate amendment ("Triton everywhere" -- intent ledger
 # Amendments): every seed matrix in this round runs under a uniform
@@ -856,7 +867,19 @@ def test_benchmarks_rounds_accepts_both_pilot_and_current_generations():
     .BENCH_ROUND_TAGS` (pre-matrix technical review, item 1)."""
     from experiments.benchmark_tasks import BENCH_ROUND_TAGS
 
-    pilot_tags = ("bench-s5-01", "bench-mqar-01", "bench-psmnist-01", "bench-pendulum-01")
+    # `bench-churn-01` (Task 6, churn round) is hardcoded here alongside the
+    # four heterogeneous-budget `-01` tags for a different reason (it's
+    # churn's own from-the-start pilot tag, not a superseded population under
+    # the current `BENCH_ROUND_TAGS["churn"]` matrix tag) but gets identical
+    # frozen-forever allow-list treatment -- see `_BENCHMARKS_ROUNDS_PILOT`'s
+    # comment in `scripts/gpu_check.py`.
+    pilot_tags = (
+        "bench-s5-01",
+        "bench-mqar-01",
+        "bench-psmnist-01",
+        "bench-pendulum-01",
+        "bench-churn-01",
+    )
     for tag in pilot_tags:
         assert tag in _BENCH_ROUNDS
     for tag in BENCH_ROUND_TAGS.values():
@@ -1094,6 +1117,109 @@ def test_build_benchmarks_sidecar_keys_per_variant_seed_not_bare_seed():
     assert sidecar["rows_extracted"] == 2
 
 
+# ------------------------------------- sidecar merge (Task 6 hardening)
+# `--shards` calls `_finish_benchmarks` once per shard; each shard's own
+# sidecar write must MERGE onto a prior shard's already-written sidecar
+# rather than clobber it, or a multi-shard round's on-disk sidecar would
+# only ever reflect the last-finishing shard's rows/timings.
+
+
+def test_read_benchmarks_sidecar_missing_file_returns_none(tmp_path):
+    assert gpu_check._read_benchmarks_sidecar(tmp_path / "nope.json") is None
+
+
+def test_read_benchmarks_sidecar_malformed_json_returns_none(tmp_path):
+    path = tmp_path / "bad.json"
+    path.write_text("{not valid json")
+    assert gpu_check._read_benchmarks_sidecar(path) is None
+
+
+def test_read_benchmarks_sidecar_non_object_json_returns_none(tmp_path):
+    path = tmp_path / "list.json"
+    path.write_text("[1, 2, 3]")
+    assert gpu_check._read_benchmarks_sidecar(path) is None
+
+
+def test_read_benchmarks_sidecar_well_formed_parses(tmp_path):
+    path = tmp_path / "ok.json"
+    path.write_text('{"task": "s5", "rows_extracted": 2}')
+    assert gpu_check._read_benchmarks_sidecar(path) == {"task": "s5", "rows_extracted": 2}
+
+
+def test_merge_benchmarks_sidecar_no_existing_returns_fresh_unchanged():
+    fresh = gpu_check._build_benchmarks_sidecar(
+        {"torch": "2.8.0"}, "s5", [_bench_row(_BENCH_ROUNDS[0], "s5", "log", 0)], _APPEND_ONE
+    )
+    assert gpu_check._merge_benchmarks_sidecar(None, fresh) == fresh
+
+
+def test_merge_benchmarks_sidecar_unions_disjoint_seeds_same_variant():
+    existing = gpu_check._build_benchmarks_sidecar(
+        {"torch": "2.8.0"},
+        "s5",
+        [_bench_row(_BENCH_ROUNDS[0], "s5", "log", 0, secs=10.0)],
+        _APPEND_ONE,
+    )
+    fresh = gpu_check._build_benchmarks_sidecar(
+        {"torch": "2.8.0"},
+        "s5",
+        [_bench_row(_BENCH_ROUNDS[0], "s5", "log", 1, secs=20.0)],
+        _APPEND_ONE,
+    )
+    merged = gpu_check._merge_benchmarks_sidecar(existing, fresh)
+    assert merged["per_variant_seed_wall_secs"] == {"log": {"0": 10.0, "1": 20.0}}
+    # Reconciliation counts sum, not just the timing map -- an unsummed
+    # count would silently under-report how many rows the merged sidecar
+    # actually covers.
+    assert merged["rows_extracted"] == 2
+    assert merged["rows_appended"] == 2
+
+
+def test_merge_benchmarks_sidecar_unions_across_different_variants():
+    existing = gpu_check._build_benchmarks_sidecar(
+        {"torch": "2.8.0"},
+        "s5",
+        [_bench_row(_BENCH_ROUNDS[0], "s5", "log", 0, secs=10.0)],
+        _APPEND_ONE,
+    )
+    fresh = gpu_check._build_benchmarks_sidecar(
+        {"torch": "2.8.0"},
+        "s5",
+        [_bench_row(_BENCH_ROUNDS[0], "s5", "signed", 0, secs=30.0)],
+        _APPEND_ONE,
+    )
+    merged = gpu_check._merge_benchmarks_sidecar(existing, fresh)
+    assert merged["per_variant_seed_wall_secs"] == {
+        "log": {"0": 10.0},
+        "signed": {"0": 30.0},
+    }
+
+
+def test_merge_benchmarks_sidecar_malformed_existing_count_treated_as_zero():
+    fresh = gpu_check._build_benchmarks_sidecar(
+        {"torch": "2.8.0"}, "s5", [_bench_row(_BENCH_ROUNDS[0], "s5", "log", 0)], _APPEND_ONE
+    )
+    existing = {"per_variant_seed_wall_secs": {}, "rows_extracted": "not-an-int"}
+    merged = gpu_check._merge_benchmarks_sidecar(existing, fresh)
+    assert merged["rows_extracted"] == fresh["rows_extracted"]
+
+
+def test_merge_benchmarks_sidecar_malformed_existing_timing_map_degrades_not_crashes():
+    # `existing["per_variant_seed_wall_secs"]` isn't a dict (hand-mangled
+    # prior sidecar, or a future schema change) -- must degrade to "nothing
+    # to merge" rather than raising AttributeError on `.items()`.
+    fresh = gpu_check._build_benchmarks_sidecar(
+        {"torch": "2.8.0"},
+        "s5",
+        [_bench_row(_BENCH_ROUNDS[0], "s5", "log", 0, secs=10.0)],
+        _APPEND_ONE,
+    )
+    existing = {"per_variant_seed_wall_secs": "not-a-dict", "rows_extracted": 5}
+    merged = gpu_check._merge_benchmarks_sidecar(existing, fresh)
+    assert merged["per_variant_seed_wall_secs"] == {"log": {"0": 10.0}}
+    assert merged["rows_extracted"] == 5 + fresh["rows_extracted"]
+
+
 class _FakeBenchJob:
     def __init__(self, logs: str) -> None:
         self.logs = logs
@@ -1243,6 +1369,72 @@ def test_finish_benchmarks_retry_is_idempotent_end_to_end(tmp_path, monkeypatch)
     assert sidecar["rows_extracted"] == 2
 
 
+def test_finish_benchmarks_default_clobbers_sidecar_not_merges(tmp_path, monkeypatch):
+    # Task 6 hardening's explicit invariant: the single-job path
+    # (`merge_sidecar` defaults to `False`) must stay byte-identical to
+    # before `--shards` existed -- a second call's sidecar wholly replaces
+    # the first's, it does not accumulate onto it.
+    ledger, out_dir = _patch_benchmarks_paths(monkeypatch, tmp_path)
+    env = {"torch": "2.8.0"}
+
+    first_row = _bench_row(_BENCH_ROUNDS[0], "s5", "log", 0, secs=10.0)
+    logs_first = (
+        f"{_BENCH_ROW_PREFIX}{json.dumps(first_row)}\n{_BENCH_ENV_PREFIX}{json.dumps(env)}\n"
+    )
+    gpu_check._finish_benchmarks(_FakeBenchJob(logs=logs_first), ok=True)
+
+    second_row = _bench_row(_BENCH_ROUNDS[0], "s5", "log", 1, secs=20.0)
+    logs_second = (
+        f"{_BENCH_ROW_PREFIX}{json.dumps(second_row)}\n{_BENCH_ENV_PREFIX}{json.dumps(env)}\n"
+    )
+    gpu_check._finish_benchmarks(_FakeBenchJob(logs=logs_second), ok=True)
+
+    sidecar = json.loads((out_dir / "bench_s5_env.json").read_text())
+    assert sidecar["per_variant_seed_wall_secs"]["log"] == {"1": 20.0}
+    assert sidecar["rows_extracted"] == 1
+
+
+def test_finish_benchmarks_merge_sidecar_unions_disjoint_shard_seed_timings(tmp_path, monkeypatch):
+    # Two sequential finish calls (mirroring two shards of a --shards run,
+    # each covering a disjoint seed slice) with merge_sidecar=True must
+    # leave the union of both shards' timings on disk, not just the last
+    # shard's.
+    ledger, out_dir = _patch_benchmarks_paths(monkeypatch, tmp_path)
+    env = {"torch": "2.8.0"}
+
+    shard0_rows = [
+        _bench_row(_BENCH_ROUNDS[0], "s5", "log", 0, secs=10.0),
+        _bench_row(_BENCH_ROUNDS[0], "s5", "log", 1, secs=11.0),
+    ]
+    logs0 = "".join(f"{_BENCH_ROW_PREFIX}{json.dumps(r)}\n" for r in shard0_rows)
+    logs0 += f"{_BENCH_ENV_PREFIX}{json.dumps(env)}\n"
+    rc0 = gpu_check._finish_benchmarks(_FakeBenchJob(logs=logs0), ok=True, merge_sidecar=True)
+
+    shard1_rows = [
+        _bench_row(_BENCH_ROUNDS[0], "s5", "log", 2, secs=12.0),
+        _bench_row(_BENCH_ROUNDS[0], "s5", "log", 3, secs=13.0),
+    ]
+    logs1 = "".join(f"{_BENCH_ROW_PREFIX}{json.dumps(r)}\n" for r in shard1_rows)
+    logs1 += f"{_BENCH_ENV_PREFIX}{json.dumps(env)}\n"
+    rc1 = gpu_check._finish_benchmarks(_FakeBenchJob(logs=logs1), ok=True, merge_sidecar=True)
+
+    assert (rc0, rc1) == (0, 0)
+    sidecar = json.loads((out_dir / "bench_s5_env.json").read_text())
+    assert sidecar["per_variant_seed_wall_secs"]["log"] == {
+        "0": 10.0,
+        "1": 11.0,
+        "2": 12.0,
+        "3": 13.0,
+    }
+    # Reconciliation counts sum across shards -- an unmerged count field
+    # would silently understate the round's true row coverage.
+    assert sidecar["rows_extracted"] == 4
+    assert sidecar["rows_appended"] == 4
+    # Both shards' rows land in the ledger; merging the sidecar never
+    # touches ledger append semantics (already dedup-idempotent).
+    assert len(ledger.read_text().splitlines()) == 4
+
+
 def test_finish_benchmarks_nonzero_exit_when_job_not_ok_despite_valid_rows(tmp_path, monkeypatch):
     ledger, out_dir = _patch_benchmarks_paths(monkeypatch, tmp_path)
     row = _bench_row(_BENCH_ROUNDS[0], "s5", "log", 0)
@@ -1256,3 +1448,289 @@ def test_finish_benchmarks_nonzero_exit_when_job_not_ok_despite_valid_rows(tmp_p
 
     assert rc == 1
     assert ledger.exists()
+
+
+# --------------------------------------- pandas preamble (Task 6, churn)
+# The churn task's `RosbankLoader` lazy-imports pandas inside the job
+# (mirroring the torchvision/psMNIST precedent) -- `build_benchmarks_command`
+# must install it whenever churn is among the job's tasks, and must NOT
+# install it for a job that never touches churn.
+
+
+def test_build_benchmarks_command_installs_pandas_when_tasks_is_none():
+    # tasks=None means "every task" (the campaign script's own default),
+    # which includes churn -- pandas must be installed.
+    command = build_benchmarks_command("git@example.com/repo.git", "deadbeef", None, None, None)
+    assert "pip install --no-cache-dir pandas" in command
+
+
+def test_build_benchmarks_command_installs_pandas_when_churn_named():
+    command = build_benchmarks_command(
+        "git@example.com/repo.git", "deadbeef", ["s5", "churn"], None, None
+    )
+    assert "pip install --no-cache-dir pandas" in command
+    # Must precede the campaign invocation it's meant to cover.
+    assert command.index("pip install --no-cache-dir pandas") < command.index(
+        "python scripts/gpu_benchmark_campaign.py"
+    )
+
+
+def test_build_benchmarks_command_omits_pandas_when_churn_not_requested():
+    command = build_benchmarks_command(
+        "git@example.com/repo.git", "deadbeef", ["s5", "mqar"], None, None
+    )
+    assert "pandas" not in command
+
+
+def test_build_benchmarks_command_still_installs_torchvision_alongside_pandas():
+    # The pre-existing torchvision install (psMNIST) must survive unchanged
+    # when pandas is also installed.
+    command = build_benchmarks_command("git@example.com/repo.git", "deadbeef", None, None, None)
+    assert "pip install --no-cache-dir torchvision" in command
+    assert command.index("pip install --no-cache-dir torchvision") < command.index(
+        "python scripts/gpu_benchmark_campaign.py"
+    )
+
+
+def test_build_benchmarks_command_preserves_mingru_scan_triton_with_pandas():
+    command = build_benchmarks_command(
+        "git@example.com/repo.git", "deadbeef", ["churn"], None, None
+    )
+    assert "export MINGRU_SCAN=triton" in command
+    assert command.index("pip install --no-cache-dir pandas") < command.index(
+        "export MINGRU_SCAN=triton"
+    )
+
+
+def test_build_benchmarks_command_with_pandas_still_single_foreground_chain():
+    command = build_benchmarks_command(
+        "git@example.com/repo.git", "deadbeef", ["churn"], None, None
+    )
+    assert "&" not in command.replace("&&", "")
+    assert "set -eux" in command
+
+
+# --------------------------------------------- churn round tags (Task 6)
+# `_BENCHMARKS_ROUNDS` must accept both churn's pilot tag (`bench-churn-01`,
+# hardcoded -- see `_BENCHMARKS_ROUNDS_PILOT`'s comment) and its current
+# matrix tag (`bench-churn-02`, read live from `BENCH_ROUND_TAGS`).
+
+
+def test_benchmarks_rounds_accepts_churn_pilot_tag():
+    assert "bench-churn-01" in _BENCH_ROUNDS
+
+
+def test_benchmarks_rounds_accepts_churn_matrix_tag():
+    from experiments.benchmark_tasks import BENCH_ROUND_TAGS
+
+    assert BENCH_ROUND_TAGS["churn"] == "bench-churn-02"
+    assert BENCH_ROUND_TAGS["churn"] in _BENCH_ROUNDS
+
+
+def test_valid_benchmarks_key_accepts_a_churn_pilot_row():
+    row = _bench_row("bench-churn-01", "churn", "signed", 0)
+    assert gpu_check._valid_benchmarks_key(row, _BENCH_ROUNDS) == (
+        "bench-churn-01",
+        "churn",
+        "signed",
+        0,
+    )
+
+
+def test_valid_benchmarks_key_accepts_a_churn_matrix_row():
+    row = _bench_row("bench-churn-02", "churn", "log", 5)
+    assert gpu_check._valid_benchmarks_key(row, _BENCH_ROUNDS) == (
+        "bench-churn-02",
+        "churn",
+        "log",
+        5,
+    )
+
+
+# --------------------------------------------- --shards seed pool (Task 6)
+# `_resolve_shard_seed_pool` mirrors `gpu_benchmark_campaign.py`'s own
+# `_resolve_seeds` seed-source convention: explicit `--seeds` wins outright,
+# otherwise every selected task's own `TaskSpec.seeds` count must agree.
+
+_resolve_shard_seed_pool = gpu_check._resolve_shard_seed_pool
+_shard_seed_lists = gpu_check._shard_seed_lists
+
+
+def test_resolve_shard_seed_pool_explicit_seeds_returned_as_is():
+    assert _resolve_shard_seed_pool(["s5"], [3, 7, 11]) == [3, 7, 11]
+
+
+def test_resolve_shard_seed_pool_explicit_seeds_ignore_task_seed_counts():
+    # An explicit --seeds list applies as given even if it doesn't match
+    # any task's own seed-matrix size -- sharding partitions whatever seeds
+    # were named, mirroring the campaign script's own override semantics.
+    assert _resolve_shard_seed_pool(["psmnist"], [0, 1]) == [0, 1]
+
+
+def test_resolve_shard_seed_pool_single_task_uses_its_seed_count():
+    assert _resolve_shard_seed_pool(["churn"], None) == list(range(36))
+    assert _resolve_shard_seed_pool(["psmnist"], None) == list(range(12))
+
+
+def test_resolve_shard_seed_pool_multiple_tasks_same_count_agree():
+    assert _resolve_shard_seed_pool(["s5", "mqar", "pendulum", "churn"], None) == list(range(36))
+
+
+def test_resolve_shard_seed_pool_mismatched_task_counts_raises():
+    # psmnist (12 seeds) mixed with churn (36 seeds), no explicit --seeds to
+    # disambiguate -- must raise rather than silently sharding by one task's
+    # count and running the wrong seeds for the other.
+    with pytest.raises(ValueError):
+        _resolve_shard_seed_pool(["psmnist", "churn"], None)
+
+
+def test_resolve_shard_seed_pool_none_tasks_means_every_registered_task():
+    # tasks=None mixes psmnist (12) with the four 36-seed tasks -- mismatch.
+    with pytest.raises(ValueError):
+        _resolve_shard_seed_pool(None, None)
+
+
+def test_resolve_shard_seed_pool_unknown_task_raises_value_error_not_key_error():
+    # `TASKS[name]` is unguarded internally -- an unrecognized --tasks name
+    # must degrade to the module's standard ValueError + "error: ..." exit
+    # 2 pattern (main() only catches ValueError around this call), never an
+    # uncaught bare KeyError traceback.
+    with pytest.raises(ValueError):
+        _resolve_shard_seed_pool(["bogus-task"], None)
+
+
+def test_resolve_shard_seed_pool_unknown_task_mixed_with_known_raises():
+    with pytest.raises(ValueError):
+        _resolve_shard_seed_pool(["s5", "bogus-task"], None)
+
+
+# --------------------------------------------- --shards slicing (Task 6)
+
+
+def test_shard_seed_lists_36_into_6_gives_six_of_six():
+    shards = _shard_seed_lists(list(range(36)), 6)
+    assert len(shards) == 6
+    assert all(len(s) == 6 for s in shards)
+
+
+def test_shard_seed_lists_36_into_6_is_disjoint_and_exhaustive():
+    shards = _shard_seed_lists(list(range(36)), 6)
+    flat = [seed for shard in shards for seed in shard]
+    assert sorted(flat) == list(range(36))
+    assert len(flat) == len(set(flat))  # disjoint
+
+
+def test_shard_seed_lists_job_k_gets_seeds_6k_through_6k_plus_5():
+    # Spec: "job k of 6 runs seeds 6k..6k+5".
+    shards = _shard_seed_lists(list(range(36)), 6)
+    for k, shard in enumerate(shards):
+        assert shard == list(range(6 * k, 6 * k + 6))
+
+
+def test_shard_seed_lists_single_shard_returns_the_whole_pool():
+    assert _shard_seed_lists([0, 1, 2], 1) == [[0, 1, 2]]
+
+
+def test_shard_seed_lists_uneven_split_rejected_loudly():
+    with pytest.raises(ValueError):
+        _shard_seed_lists(list(range(36)), 5)
+
+
+def test_shard_seed_lists_zero_shards_rejected_loudly():
+    with pytest.raises(ValueError):
+        _shard_seed_lists(list(range(36)), 0)
+
+
+def test_shard_seed_lists_negative_shards_rejected_loudly():
+    with pytest.raises(ValueError):
+        _shard_seed_lists(list(range(36)), -1)
+
+
+def test_shard_seed_lists_more_shards_than_seeds_uneven_rejected_loudly():
+    with pytest.raises(ValueError):
+        _shard_seed_lists([0, 1, 2], 5)
+
+
+# ------------------------------------- _run_sharded_benchmarks submission
+# (Task 6 hardening) -- KeyboardInterrupt during the multi-submission
+# window (before any job.wait()) must stop every already-submitted shard,
+# not just leave them running, mirroring the wait-loop's existing
+# "avoid orphaned billing" discipline. `_submit_job` is monkeypatched
+# directly (no real lightning_sdk call) so this is a pure control-flow
+# test of `_run_sharded_benchmarks` itself.
+
+
+class _FakeSubmittedJob:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.stopped = False
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+def test_run_sharded_benchmarks_interrupt_during_submission_stops_already_submitted(
+    monkeypatch,
+):
+    submitted: list[_FakeSubmittedJob] = []
+
+    def fake_submit_job(args, machine, owner, ts_name, name, command):
+        if name.endswith("shard2of4"):
+            raise KeyboardInterrupt
+        job = _FakeSubmittedJob(name)
+        submitted.append(job)
+        return job
+
+    monkeypatch.setattr(gpu_check, "_submit_job", fake_submit_job)
+
+    with pytest.raises(KeyboardInterrupt):
+        gpu_check._run_sharded_benchmarks(
+            args=None,
+            machine=None,
+            owner=None,
+            ts_name="ts",
+            commands=["c0", "c1", "c2", "c3"],
+            job_name_prefix="prefix",
+            ref="deadbeef",
+        )
+
+    # Shards 0 and 1 submitted successfully before shard 2's interrupt;
+    # both must be stopped rather than left running/billing.
+    assert len(submitted) == 2
+    assert all(job.stopped for job in submitted)
+
+
+class _FakeWaitableJob(_FakeSubmittedJob):
+    status = "completed"
+
+    def wait(self) -> None:
+        pass
+
+
+def test_run_sharded_benchmarks_no_interrupt_leaves_submitted_jobs_unstopped(monkeypatch):
+    # Sanity converse of the interrupt test above: normal (non-interrupted)
+    # submission must NOT call .stop() on anything during the submission
+    # loop itself -- only an interrupt triggers the stop-everything path.
+    submitted: list[_FakeWaitableJob] = []
+
+    def fake_submit_job(args, machine, owner, ts_name, name, command):
+        job = _FakeWaitableJob(name)
+        submitted.append(job)
+        return job
+
+    monkeypatch.setattr(gpu_check, "_submit_job", fake_submit_job)
+    monkeypatch.setattr(gpu_check, "_finish_benchmarks", lambda job, ok, merge_sidecar=False: 0)
+
+    rc = gpu_check._run_sharded_benchmarks(
+        args=None,
+        machine=None,
+        owner=None,
+        ts_name="ts",
+        commands=["c0", "c1"],
+        job_name_prefix="prefix",
+        ref="deadbeef",
+    )
+
+    assert rc == 0
+    assert len(submitted) == 2
+    assert not any(job.stopped for job in submitted)

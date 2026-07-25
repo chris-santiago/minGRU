@@ -79,26 +79,46 @@ Job modes (``--job``, default ``check``, existing invocations unaffected):
   nothing is appended or written in that case.
 
 ``benchmarks`` (accepted-benchmark validation round, Task 6, consumes Task 5)
-  Runs ``scripts/gpu_benchmark_campaign.py`` instead: the four-task x
-  six-arm benchmark validation round (S5, MQAR, psMNIST, pendulum -- see
+  Runs ``scripts/gpu_benchmark_campaign.py`` instead: the multi-task x
+  multi-arm benchmark validation round (S5, MQAR, psMNIST, pendulum -- see
   ``.claude/output/specs/2026-07-19-benchmark-round-design.md`` sections 4
   and 6, plus the amended sixth ``signed-rotation`` arm recorded in the
-  intent ledger's Amendments). Same clone/checkout/triton-install preamble
-  as ``hetero36``, plus a ``torchvision`` install (psMNIST downloads MNIST
-  inside the job -- see ``build_benchmarks_command``) and an
-  ``export MINGRU_SCAN=triton`` ahead of the campaign invocation (evidence-
-  phase-gate amendment, "Triton everywhere" -- every seed matrix in this
-  round runs under a uniform Triton scan backend on L4; the
-  ``MINGRU_SCAN`` contract itself is unchanged, so a task/arm combination
-  with no Triton path fails loud rather than downgrading silently).
-  ``--tasks``/``--arms``/``--seeds`` pass through to the campaign script's
-  own CLI when given (default: its own defaults, every task/arm/seed); the
-  production command NEVER passes ``--steps`` -- that flag is a
-  local-smoke-only override that shrinks the campaign's eval cadence, not
-  a production budget knob (spec section 7: "no per-arm tuning"; the
-  committed ``TaskSpec`` budgets are frozen). Foreground-only,
-  no-keepalive command chain -- see ``build_delta_probe_command``'s
-  docstring for why.
+  intent ledger's Amendments -- and churn, the real-world event-sequence
+  task added by ``.claude/output/specs/2026-07-25-churn-benchmark-design.md``).
+  Same clone/checkout/triton-install preamble as ``hetero36``, plus a
+  ``torchvision`` install (psMNIST downloads MNIST inside the job), a
+  ``pandas`` install when the job's tasks include churn (its loader
+  downloads and parses the Rosbank churn csv.gz files inside the job -- see
+  ``build_benchmarks_command``), and an ``export MINGRU_SCAN=triton`` ahead
+  of the campaign invocation (evidence-phase-gate amendment, "Triton
+  everywhere" -- every seed matrix in this round runs under a uniform
+  Triton scan backend on L4; the ``MINGRU_SCAN`` contract itself is
+  unchanged, so a task/arm combination with no Triton path fails loud
+  rather than downgrading silently). ``--tasks``/``--arms``/``--seeds``
+  pass through to the campaign script's own CLI when given (default: its
+  own defaults, every task/arm/seed); the production command NEVER passes
+  ``--steps`` -- that flag is a local-smoke-only override that shrinks the
+  campaign's eval cadence, not a production budget knob (spec section 7:
+  "no per-arm tuning"; the committed ``TaskSpec`` budgets are frozen).
+  Foreground-only, no-keepalive command chain -- see
+  ``build_delta_probe_command``'s docstring for why.
+
+  ``--shards N`` (default 1, Task 6 of the churn round) submits ``N``
+  benchmarks jobs up front instead of one -- each running every requested
+  arm against a disjoint, exhaustive slice of the seed pool (the task's own
+  seed count, or ``--seeds`` if given) -- then waits for and collects each
+  sequentially through this exact same finish-handler path (see
+  ``_run_sharded_benchmarks``/``_resolve_shard_seed_pool``/
+  ``_shard_seed_lists``). Submission is concurrent; waiting is sequential
+  (acceptable per the round's constraints); every shard's command chain is
+  still its own single foreground, no-keepalive chain -- ``--shards``
+  changes how many job commands run, never whether any of them background
+  a step. For the churn round's 36-seed x 9-arm matrix, ``--shards 6``
+  gives job ``k`` seeds ``6k..6k+5``, all nine arms. Each task's per-shard
+  ``bench_<task>_env.json`` sidecar is merged onto the prior shard's
+  already-written sidecar rather than overwritten (see
+  ``_merge_benchmarks_sidecar``), so the file left after the last shard
+  discloses the whole round's timings, not just the last shard's.
 
   After the job completes, this script fetches its logs, extracts every
   ``MINGRU_LAB_ROW`` line (guarded parse, malformed lines skipped -- see
@@ -142,6 +162,7 @@ from experiments.benchmark_tasks import (  # noqa: E402
     BENCH_PROBE_ROUND_TAGS,
     BENCH_REF_ROUND_TAGS,
     BENCH_ROUND_TAGS,
+    TASKS,
 )
 
 DEFAULT_IMAGE = "pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel"
@@ -195,7 +216,25 @@ _BENCHMARKS_ENV_PREFIX = "MINGRU_LAB_ENV "
 # so a probe, ref, or corrected arm's rows dedup correctly on their own
 # round tag without any further change here. One round per task,
 # independent of which arms/seeds that task's cell selects.
-_BENCHMARKS_ROUNDS_PILOT = ("bench-s5-01", "bench-mqar-01", "bench-psmnist-01", "bench-pendulum-01")
+#
+# `_BENCHMARKS_ROUNDS_PILOT` additionally hardcodes `bench-churn-01` (Task
+# 6, `.claude/output/specs/2026-07-25-churn-benchmark-design.md` §6 "Round
+# tags"): unlike the four `-01` tags above, churn's pilot tag was never a
+# heterogeneous-budget population under `BENCH_ROUND_TAGS["churn"]`
+# (`bench-churn-02`) -- it's churn's own from-the-start pilot tag (see
+# `experiments.benchmark_tasks.BENCH_ROUND_TAGS`'s comment on the
+# `"churn"` entry) -- but it gets the identical hardcoded treatment here
+# for the identical reason: a frozen tag this allow-list must keep
+# accepting forever so pilot job logs/sidecars stay parseable, even though
+# `BENCH_ROUND_TAGS` (unioned in below) only ever carries churn's current
+# `-02` matrix tag.
+_BENCHMARKS_ROUNDS_PILOT = (
+    "bench-s5-01",
+    "bench-mqar-01",
+    "bench-psmnist-01",
+    "bench-pendulum-01",
+    "bench-churn-01",
+)
 _BENCHMARKS_ROUNDS = (
     _BENCHMARKS_ROUNDS_PILOT
     + tuple(BENCH_ROUND_TAGS.values())
@@ -312,10 +351,16 @@ def build_benchmarks_command(
     ``torchvision`` (Task 6 brief -- the psMNIST task downloads MNIST inside
     the job; no other job mode needs it, so this install is appended here
     rather than folded into ``_job_preamble_steps`` itself, keeping every
-    other job mode's preamble unchanged), then runs
-    ``scripts/gpu_benchmark_campaign.py`` with ``--tasks``/``--arms``/
-    ``--seeds`` passthrough when given (omitted entirely when ``None``, so
-    the campaign script's own defaults -- every task/arm/seed -- apply).
+    other job mode's preamble unchanged). When ``tasks`` includes ``churn``
+    (or is ``None``, meaning every task -- churn included), a second
+    ``pip install --no-cache-dir pandas`` step is appended the same way
+    (churn round, Task 6 of this round: ``RosbankLoader`` lazy-imports
+    pandas inside the job, mirroring the ``torchvision``/psMNIST
+    precedent -- see ``experiments/benchmark_tasks.py``'s ``RosbankLoader``
+    docstring). Then runs ``scripts/gpu_benchmark_campaign.py`` with
+    ``--tasks``/``--arms``/``--seeds`` passthrough when given (omitted
+    entirely when ``None``, so the campaign script's own defaults -- every
+    task/arm/seed -- apply).
     Deliberately NEVER passes ``--steps``: that flag is the campaign
     script's local-smoke-only override (shrinks its eval cadence via
     ``_resolve_eval_every``) -- production budgets are the committed
@@ -341,6 +386,8 @@ def build_benchmarks_command(
     """
     steps = _job_preamble_steps(repo, ref)
     steps.append("pip install --no-cache-dir torchvision")
+    if tasks is None or "churn" in tasks:
+        steps.append("pip install --no-cache-dir pandas")
     steps.append("export MINGRU_SCAN=triton")
     command = "cd /tmp/minGRU && python scripts/gpu_benchmark_campaign.py"
     if tasks:
@@ -351,6 +398,66 @@ def build_benchmarks_command(
         command += " --seeds " + " ".join(str(s) for s in seeds)
     steps.append(command)
     return " && ".join(steps)
+
+
+def _resolve_shard_seed_pool(tasks: list[str] | None, seeds: list[int] | None) -> list[int]:
+    """The full seed pool ``--shards`` splits into disjoint per-job slices.
+
+    Mirrors ``gpu_benchmark_campaign.py``'s own ``_resolve_seeds`` seed-
+    source convention (an explicit ``--seeds`` override applies uniformly
+    to every selected task; otherwise each task's own ``TaskSpec.seeds``
+    count) so a shard's ``--seeds`` passthrough selects exactly the seeds
+    the unsharded run would have used, just partitioned.
+
+    An explicit ``seeds`` list is returned as given (sharding partitions
+    whatever seeds were named). Without one, every task in ``tasks`` (or
+    every registered task, when ``tasks`` is ``None``) must share the same
+    seed count -- sharding a mixed-count task set would need a different
+    slice per task, which the campaign script's flat ``--seeds`` passthrough
+    (one list shared by every task in the job) can't express. A mismatch
+    raises ``ValueError`` rather than silently sharding by one task's count
+    and running the wrong seeds for another. An unrecognized task name in
+    ``tasks`` also raises ``ValueError`` (rather than an unguarded
+    ``TASKS[name]`` bare ``KeyError``): ``main`` only catches ``ValueError``
+    around the shard-resolution call, so a ``--tasks`` typo must degrade to
+    the module's standard "error: ..." + exit 2 pattern, not an uncaught
+    traceback.
+    """
+    if seeds is not None:
+        return list(seeds)
+    task_names = tasks if tasks is not None else list(TASKS)
+    unknown = [name for name in task_names if name not in TASKS]
+    if unknown:
+        raise ValueError(f"unknown task(s) {unknown} (known tasks: {sorted(TASKS)})")
+    seed_counts = {TASKS[name].seeds for name in task_names}
+    if len(seed_counts) != 1:
+        counts = {name: TASKS[name].seeds for name in task_names}
+        raise ValueError(
+            f"cannot shard tasks with differing seed counts ({counts}) "
+            "without an explicit --seeds list"
+        )
+    return list(range(seed_counts.pop()))
+
+
+def _shard_seed_lists(pool: list[int], shards: int) -> list[list[int]]:
+    """Split ``pool`` into ``shards`` disjoint, exhaustive, contiguous slices.
+
+    Job ``k`` of ``shards`` gets ``pool[k * size : (k + 1) * size]`` --
+    e.g. the churn round's 36-seed pool split 6 ways gives job ``k`` seeds
+    ``6k..6k+5`` (Task 6 brief). Requires ``pool`` to divide evenly by
+    ``shards``: rejected loudly (``ValueError``) rather than silently
+    dropping seeds or distributing them unevenly, since a dropped seed
+    would silently shrink the matrix below its committed size.
+    """
+    if shards < 1:
+        raise ValueError(f"--shards must be >= 1, got {shards}")
+    if len(pool) % shards != 0:
+        raise ValueError(
+            f"cannot evenly split {len(pool)} seeds into {shards} shards "
+            f"({len(pool)} % {shards} != 0)"
+        )
+    size = len(pool) // shards
+    return [pool[i * size : (i + 1) * size] for i in range(shards)]
 
 
 def _extract_last(prefix: str, text: str) -> dict[str, Any] | None:
@@ -912,6 +1019,99 @@ def _bench_sidecar_path(task: str) -> Path:
     return _DELTA_PROBE_OUT_DIR / f"bench_{task}_env.json"
 
 
+def _read_benchmarks_sidecar(sidecar_path: Path) -> dict[str, Any] | None:
+    """Best-effort guarded read of a previously-written per-task sidecar.
+
+    ``--shards`` (Task 6 hardening): each shard's ``_finish_benchmarks``
+    call only sees that shard's own rows, so a later shard needs to read
+    back an earlier shard's already-written sidecar before merging onto it
+    (see ``_merge_benchmarks_sidecar``). Guarded parse -- a missing file,
+    unreadable JSON, or a JSON value that isn't an object all degrade to
+    ``None`` (never raise) -- mirrors the house convention already used for
+    ledger/log parsing elsewhere in this module (e.g.
+    ``_existing_keys_by_key``): a malformed or absent prior artifact is
+    "nothing to merge onto", not a crash.
+    """
+    if not sidecar_path.exists():
+        return None
+    try:
+        parsed = json.loads(sidecar_path.read_text())
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _int_field(payload: dict[str, Any], key: str) -> int:
+    """``payload[key]`` if a non-bool ``int``, else ``0``.
+
+    Guards ``_merge_benchmarks_sidecar``'s count-summing against a prior
+    sidecar that's structurally a JSON object but has a malformed/missing
+    count field (hand-edited, truncated, or from a future schema version)
+    -- summing must never raise on a field that isn't the ``int`` it
+    contracts to.
+    """
+    value = payload.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _merge_benchmarks_sidecar(
+    existing: dict[str, Any] | None, fresh: dict[str, Any]
+) -> dict[str, Any]:
+    """Union ``fresh`` (this shard's own sidecar payload) onto ``existing``
+    (an earlier shard's already-written sidecar for the same task), or
+    return ``fresh`` unchanged when there's no valid prior sidecar.
+
+    ``--shards`` (Task 6 hardening): writing each shard's sidecar wholesale
+    would leave only the LAST-finishing shard's ``per_variant_seed_wall_secs``
+    on disk, silently covering a fraction of the round's timing disclosure
+    (rows themselves are unaffected -- the ledger append is already
+    idempotent dedup-by-key). Two-level union of
+    ``per_variant_seed_wall_secs`` (per-variant, then per-seed) so seeds
+    from every shard accumulate rather than overwrite. The four
+    reconciliation counts (``rows_extracted``/``rows_appended``/
+    ``rows_skipped_duplicate``/``rows_skipped_invalid``/
+    ``rows_deduped_in_batch``) are SUMMED across shards too, not just the
+    timing map -- leaving them at one shard's value while the timing map
+    reflects every shard would break ``_build_benchmarks_sidecar``'s own
+    documented reconciliation invariant on the merged artifact and actively
+    mislead a reader about how many rows the round covers. ``env``/``task``
+    are taken from ``fresh`` (identical across shards under the round's
+    single-stratum invariant, spec section 7). A malformed
+    ``per_variant_seed_wall_secs`` in ``existing`` (not a dict -- hand-
+    edited, truncated, or from a future schema version) degrades to "no
+    prior timings to merge" rather than raising, the same guard class as
+    ``_int_field``'s count-field guard above.
+    """
+    if existing is None:
+        return fresh
+
+    existing_secs = existing.get("per_variant_seed_wall_secs", {})
+    if not isinstance(existing_secs, dict):
+        existing_secs = {}
+    merged_secs: dict[str, dict[str, float]] = {}
+    for variant, seed_secs in existing_secs.items():
+        if isinstance(seed_secs, dict):
+            merged_secs[variant] = dict(seed_secs)
+    for variant, seed_secs in fresh["per_variant_seed_wall_secs"].items():
+        merged_secs.setdefault(variant, {}).update(seed_secs)
+
+    return {
+        **fresh,
+        "rows_extracted": _int_field(existing, "rows_extracted") + fresh["rows_extracted"],
+        "rows_appended": _int_field(existing, "rows_appended") + fresh["rows_appended"],
+        "rows_skipped_duplicate": (
+            _int_field(existing, "rows_skipped_duplicate") + fresh["rows_skipped_duplicate"]
+        ),
+        "rows_skipped_invalid": (
+            _int_field(existing, "rows_skipped_invalid") + fresh["rows_skipped_invalid"]
+        ),
+        "rows_deduped_in_batch": (
+            _int_field(existing, "rows_deduped_in_batch") + fresh["rows_deduped_in_batch"]
+        ),
+        "per_variant_seed_wall_secs": merged_secs,
+    }
+
+
 def _row_task(row: Any) -> str | None:
     """The row's ``task`` bucket key, or ``None`` if it can't be attributed.
 
@@ -932,7 +1132,7 @@ def _row_task(row: Any) -> str | None:
     return task if isinstance(task, str) and task else None
 
 
-def _finish_benchmarks(job: Any, ok: bool) -> int:
+def _finish_benchmarks(job: Any, ok: bool, *, merge_sidecar: bool = False) -> int:
     """Post-``job.wait()`` handling for ``--job benchmarks``.
 
     Fetches the job's logs (best-effort -- see ``_fetch_job_logs``),
@@ -964,6 +1164,18 @@ def _finish_benchmarks(job: Any, ok: bool) -> int:
     tasks are order-independent (tasks may even run as separate parallel
     jobs), so only membership and per-task relative order are guaranteed,
     unlike ``_finish_hetero36``'s single round-agnostic global pass.
+
+    ``merge_sidecar`` (default ``False``, Task 6 hardening for ``--shards``):
+    when ``False`` (every non-sharded call, including the single-job
+    ``--job benchmarks`` path -- unchanged, byte-identical to before this
+    flag existed), each task's sidecar is written wholesale from THIS
+    call's own rows only, exactly as always. When ``True`` (every call from
+    ``_run_sharded_benchmarks``), each task's sidecar is instead merged onto
+    whatever a prior shard already wrote for that task (see
+    ``_read_benchmarks_sidecar``/``_merge_benchmarks_sidecar``) before being
+    written whole -- otherwise a multi-shard round's sidecar would silently
+    retain only the LAST-finishing shard's rows/timings, covering a
+    fraction of the round.
     """
     logs, exc = _fetch_job_logs(job)
     if exc is not None:
@@ -1013,6 +1225,8 @@ def _finish_benchmarks(job: Any, ok: bool) -> int:
             )
         sidecar = _build_benchmarks_sidecar(env, task, task_rows, result)
         sidecar_path = _bench_sidecar_path(task)
+        if merge_sidecar:
+            sidecar = _merge_benchmarks_sidecar(_read_benchmarks_sidecar(sidecar_path), sidecar)
         sidecar_path.write_text(json.dumps(sidecar, indent=2) + "\n")
         print(
             f"[{task}] appended {result.appended} new row(s), skipped "
@@ -1020,6 +1234,214 @@ def _finish_benchmarks(job: Any, ok: bool) -> int:
             f"and {result.deduped_in_batch} intra-batch duplicate(s); wrote {sidecar_path}"
         )
     return 0 if ok else 1
+
+
+class _PreflightFailure(Exception):
+    """Raised by ``_resolve_submission_context`` when a submission prereq fails.
+
+    The error message is already printed to stderr at the raise site (same
+    text the single-job path always printed); this carries only the exit
+    code so both call sites (single-job and ``--shards``) can ``return`` it
+    without re-deriving or re-printing anything.
+    """
+
+    def __init__(self, exit_code: int) -> None:
+        super().__init__(f"preflight check failed (exit {exit_code})")
+        self.exit_code = exit_code
+
+
+def _resolve_submission_context(args: argparse.Namespace) -> tuple[Any, str | None, str]:
+    """Validate teamspace/credentials and resolve ``(machine, owner, ts_name)``.
+
+    Shared by the single-job and ``--shards`` sharded submission paths
+    (Task 6): teamspace presence, ``LIGHTNING_USER_ID``/``LIGHTNING_API_KEY``
+    credentials, ``--machine`` name resolution against the SDK's ``Machine``
+    enum, and the ``"owner/teamspace"`` splitting were previously inlined
+    once directly in ``main`` -- pulled out here rather than duplicated a
+    second time for the sharded path, which would otherwise drift the two
+    copies apart the way ad hoc duplication always does. Raises
+    ``_PreflightFailure`` (message already printed to stderr) rather than
+    returning a mixed success/error shape.
+    """
+    if not args.teamspace:
+        print(
+            "error: no teamspace (set MINGRU_LIGHTNING_TEAMSPACE or pass --teamspace)",
+            file=sys.stderr,
+        )
+        raise _PreflightFailure(2)
+    for var in ("LIGHTNING_USER_ID", "LIGHTNING_API_KEY"):
+        if not os.environ.get(var):
+            print(f"error: {var} not set (lightning.ai Settings -> Keys)", file=sys.stderr)
+            raise _PreflightFailure(2)
+
+    from lightning_sdk import Machine
+
+    try:
+        machine = getattr(Machine, args.machine)
+    except AttributeError:
+        names = [m for m in dir(Machine) if not m.startswith("_")]
+        print(f"error: unknown machine {args.machine!r}; available: {names}", file=sys.stderr)
+        raise _PreflightFailure(2) from None
+
+    # The SDK takes the teamspace NAME plus a separate org=/user= owner kwarg;
+    # our config uses the UI's "owner/teamspace" form. Split it and try the
+    # owner as an org first, then as a user.
+    if "/" in args.teamspace:
+        owner, ts_name = args.teamspace.split("/", 1)
+    else:
+        owner, ts_name = None, args.teamspace
+    return machine, owner, ts_name
+
+
+def _submit_job(
+    args: argparse.Namespace,
+    machine: Any,
+    owner: str | None,
+    ts_name: str,
+    name: str,
+    command: str,
+) -> Any:
+    """Submit one Lightning job (studio or image mode); return its handle.
+
+    Factored out of ``main`` so ``--shards`` (Task 6) can submit several
+    jobs -- one per disjoint seed slice -- through the exact same studio-
+    vs-image and org/user teamspace-owner-fallback logic the single-job
+    path already used, parameterized by ``name``/``command`` per call
+    rather than duplicated per shard. Raises ``RuntimeError`` (never prints
+    or exits itself) when both the org and user teamspace-owner attempts
+    fail, so every call site -- single-job or per-shard -- reports the
+    failure in its own existing style.
+    """
+    from lightning_sdk import Job, Studio
+
+    if args.studio:
+        # Explicit if/else rather than `**({"org": owner} if owner else {})`
+        # (the original inline call's shape): identical runtime behavior
+        # (org is passed only when `owner` is truthy), but avoids a pyright
+        # false-positive -- once `owner` carries an explicit `str | None`
+        # parameter annotation (needed here since this is now a shared
+        # helper, not inlined in `main`), pyright can no longer special-case
+        # the literal dict's ``"org"`` key against `Studio.__init__`'s
+        # `org` parameter specifically, and instead validates the unpacked
+        # dict's value type against every other keyword parameter in the
+        # signature too (including the unrelated bool-typed `create_ok`/
+        # `disable_secrets`), reporting a spurious `reportArgumentType`.
+        if owner:
+            studio = Studio(args.studio, teamspace=ts_name, org=owner)
+        else:
+            studio = Studio(args.studio, teamspace=ts_name)
+        return studio.run_job(
+            name=name, machine=machine, command=command, interruptible=args.interruptible
+        )
+
+    def _run(**owner_kw):
+        return Job.run(
+            name=name,
+            teamspace=ts_name,
+            machine=machine,
+            image=args.image,
+            command=command,
+            interruptible=args.interruptible,
+            **owner_kw,
+        )
+
+    if owner is None:
+        return _run()
+    try:
+        return _run(org=owner)
+    except Exception as org_exc:
+        try:
+            return _run(user=owner)
+        except Exception as user_exc:
+            raise RuntimeError(
+                f"teamspace resolution failed as org ({org_exc}) and as user ({user_exc})"
+            ) from user_exc
+
+
+def _run_sharded_benchmarks(
+    args: argparse.Namespace,
+    machine: Any,
+    owner: str | None,
+    ts_name: str,
+    commands: list[str],
+    job_name_prefix: str,
+    ref: str,
+) -> int:
+    """Submit ``len(commands)`` benchmarks jobs concurrently, wait/collect sequentially.
+
+    Task 6 (``--shards``): submission is concurrent -- every job is
+    submitted via ``_submit_job`` in this loop, before any ``job.wait()``,
+    so no shard's submission blocks another's -- but waiting and per-job
+    collection stay strictly sequential ("submission concurrent, waiting
+    sequential is acceptable"). Each shard's rows are independently
+    dedup-appended through the exact same ``_finish_benchmarks`` path the
+    single-job run uses, so retrying any subset of shards stays idempotent
+    the same way retrying a single job already does. Calls
+    ``_finish_benchmarks(..., merge_sidecar=True)`` for every shard (Task 6
+    hardening): each shard's own per-task sidecar is merged onto whatever an
+    earlier shard already wrote for that task, rather than clobbering it, so
+    the sidecar left on disk after the last shard reflects the WHOLE round's
+    ``per_variant_seed_wall_secs`` and row counts, not just the
+    last-finishing shard's slice (see ``_merge_benchmarks_sidecar``). A
+    shard that fails to even submit is reported and treated as a failed
+    shard (not a crash); the remaining shards still submit and run.
+    ``KeyboardInterrupt`` is handled in BOTH windows this function can be
+    interrupted in, not just the wait loop: during submission, every
+    already-submitted shard (i.e. every non-``None`` entry already in
+    ``jobs``) is stopped before re-raising; during waiting, the in-flight
+    shard AND every not-yet-waited shard are stopped before re-raising --
+    either way mirroring the single-job path's "avoid orphaned billing"
+    contract across all concurrently-running shards, not just the one
+    directly being awaited.
+    """
+    jobs: list[Any] = []
+    try:
+        for i, command in enumerate(commands):
+            name = f"{job_name_prefix}-{ref[:7]}-shard{i}of{len(commands)}"
+            try:
+                job = _submit_job(args, machine, owner, ts_name, name, command)
+            except RuntimeError as exc:
+                print(f"error: shard {i}: {exc}", file=sys.stderr)
+                jobs.append(None)
+                continue
+            print(f"submitted shard {i}: {job.name}")
+            jobs.append(job)
+    except KeyboardInterrupt:
+        print(
+            "interrupted during submission -- stopping every already-submitted "
+            "shard to avoid orphaned billing",
+            file=sys.stderr,
+        )
+        for submitted in jobs:
+            if submitted is not None:
+                submitted.stop()
+        raise
+
+    overall_rc = 0
+    for i, job in enumerate(jobs):
+        if job is None:
+            overall_rc = 2
+            continue
+        print(f"waiting on shard {i}: {job.name}...")
+        try:
+            job.wait()
+        except KeyboardInterrupt:
+            print(
+                "interrupted -- stopping this and remaining shards to avoid orphaned billing",
+                file=sys.stderr,
+            )
+            job.stop()
+            for remaining in jobs[i + 1 :]:
+                if remaining is not None:
+                    remaining.stop()
+            raise
+        status = str(job.status)
+        print(f"shard {i} status: {status}")
+        ok = "completed" in status.lower() or "succe" in status.lower()
+        rc = _finish_benchmarks(job, ok, merge_sidecar=True)
+        if rc != 0:
+            overall_rc = rc
+    return overall_rc
 
 
 def main() -> int:
@@ -1072,10 +1494,77 @@ def main() -> int:
         help="'benchmarks' job mode only: seed subset passthrough to "
         "gpu_benchmark_campaign.py's --seeds (default: each task's own seed-matrix size)",
     )
+    ap.add_argument(
+        "--shards",
+        type=int,
+        default=1,
+        help="'benchmarks' job mode only: submit this many jobs concurrently, "
+        "each running every requested arm against a disjoint slice of the "
+        "seed pool (the task's own seed count, or --seeds if given), then "
+        "wait/collect each sequentially; default 1 (unsharded, existing "
+        "single-job behavior)",
+    )
     args = ap.parse_args()
+
+    if args.shards < 1:
+        print(f"error: --shards must be >= 1, got {args.shards}", file=sys.stderr)
+        return 2
+    if args.shards > 1 and args.job != "benchmarks":
+        print("error: --shards > 1 is only supported for --job benchmarks", file=sys.stderr)
+        return 2
 
     ref = args.ref or _sh(["git", "rev-parse", "HEAD"])
     repo = args.repo or _sh(["git", "remote", "get-url", "origin"])
+
+    # `--shards` (Task 6) branches into its own fully self-contained
+    # workflow -- command building, spec printing, dry-run, preflight, and
+    # submission -- with its own `return`, rather than sharing a
+    # `command`/`spec` binding with the single-job path below via a second,
+    # separately-re-checked conditional. Pyright's possibly-unbound check
+    # (correctly) can't prove two independent `if` guards on different
+    # variables stay correlated; one guard with an early return sidesteps
+    # the ambiguity entirely and keeps the unsharded path exactly as it
+    # was (unchanged control flow, byte-identical output).
+    if args.job == "benchmarks" and args.shards > 1:
+        job_name_prefix = _BENCHMARKS_JOB_NAME
+        try:
+            pool = _resolve_shard_seed_pool(args.tasks, args.seeds)
+            shard_commands = [
+                build_benchmarks_command(repo, ref, args.tasks, args.arms, shard_seeds)
+                for shard_seeds in _shard_seed_lists(pool, args.shards)
+            ]
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+        specs = [
+            {
+                "name": f"{job_name_prefix}-{ref[:7]}-shard{i}of{len(shard_commands)}",
+                "teamspace": args.teamspace,
+                "machine": args.machine,
+                "mode": f"studio:{args.studio}" if args.studio else f"image:{args.image}",
+                "interruptible": args.interruptible,
+                "command": shard_command,
+            }
+            for i, shard_command in enumerate(shard_commands)
+        ]
+        for i, shard_spec in enumerate(specs):
+            print(f"--- shard {i} ---")
+            for k, v in shard_spec.items():
+                print(f"{k}: {v}")
+        if args.dry_run:
+            print("\n--dry-run: not submitting.")
+            return 0
+
+        try:
+            machine, owner, ts_name = _resolve_submission_context(args)
+        except _PreflightFailure as exc:
+            return exc.exit_code
+        return _run_sharded_benchmarks(
+            args, machine, owner, ts_name, shard_commands, job_name_prefix, ref
+        )
+
+    # --- single-job path (unsharded): unchanged behavior ---
     if args.job == "delta-probe":
         command = build_delta_probe_command(repo, ref)
         job_name_prefix = _DELTA_PROBE_JOB_NAME
@@ -1104,72 +1593,16 @@ def main() -> int:
         print("\n--dry-run: not submitting.")
         return 0
 
-    if not args.teamspace:
-        print(
-            "error: no teamspace (set MINGRU_LIGHTNING_TEAMSPACE or pass --teamspace)",
-            file=sys.stderr,
-        )
-        return 2
-    for var in ("LIGHTNING_USER_ID", "LIGHTNING_API_KEY"):
-        if not os.environ.get(var):
-            print(f"error: {var} not set (lightning.ai Settings -> Keys)", file=sys.stderr)
-            return 2
-
-    from lightning_sdk import Job, Machine, Studio
+    try:
+        machine, owner, ts_name = _resolve_submission_context(args)
+    except _PreflightFailure as exc:
+        return exc.exit_code
 
     try:
-        machine = getattr(Machine, args.machine)
-    except AttributeError:
-        names = [m for m in dir(Machine) if not m.startswith("_")]
-        print(f"error: unknown machine {args.machine!r}; available: {names}", file=sys.stderr)
+        job = _submit_job(args, machine, owner, ts_name, spec["name"], command)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
-
-    # The SDK takes the teamspace NAME plus a separate org=/user= owner kwarg;
-    # our config uses the UI's "owner/teamspace" form. Split it and try the
-    # owner as an org first, then as a user.
-    if "/" in args.teamspace:
-        owner, ts_name = args.teamspace.split("/", 1)
-    else:
-        owner, ts_name = None, args.teamspace
-
-    def _run(**owner_kw):
-        return Job.run(
-            name=spec["name"],
-            teamspace=ts_name,
-            machine=machine,
-            image=args.image,
-            command=command,
-            interruptible=args.interruptible,
-            **owner_kw,
-        )
-
-    if args.studio:
-        studio = Studio(
-            args.studio,
-            teamspace=ts_name,
-            **({"org": owner} if owner else {}),
-        )
-        job = studio.run_job(
-            name=spec["name"],
-            machine=machine,
-            command=command,
-            interruptible=args.interruptible,
-        )
-    elif owner is None:
-        job = _run()
-    else:
-        try:
-            job = _run(org=owner)
-        except Exception as org_exc:
-            try:
-                job = _run(user=owner)
-            except Exception as user_exc:
-                print(
-                    f"error: teamspace resolution failed as org ({org_exc}) "
-                    f"and as user ({user_exc})",
-                    file=sys.stderr,
-                )
-                return 2
     print(f"submitted: {job.name}; waiting...")
     try:
         job.wait()
