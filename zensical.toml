@@ -1,7 +1,7 @@
 [project]
 
 site_name        = "mingru-scans"
-site_description = "Parallel-scan minGRU variants with rotation-family mixers and an optional Triton kernel backend"
+site_description = "Parallel-scan minGRU variants with rotation-family and delta-rule mixers and an optional Triton kernel backend"
 site_author      = "Chris Santiago"
 site_url         = "https://chris-santiago.github.io/minGRU/"
 docs_dir         = "docs"
