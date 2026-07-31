@@ -6,7 +6,7 @@ layer whose gates depend only on the current input, so the whole sequence
 trains in one parallel scan instead of step-by-step backpropagation through
 time (BPTT). The library is the `mingru` package (pip name `mingru-scans`); pure PyTorch, no dependencies beyond `torch`.
 
-> **[Benchmark validation — visual summary](https://chris-santiago.github.io/minGRU/slides/benchmark-validation.html)**: nine mixer arms on four public tasks (S5, MQAR, psMNIST, irregular-time pendulum), fit rates and generalization against a depth-matched GRU control, on one disclosed GPU stratum.
+> **[Benchmark validation](https://chris-santiago.github.io/minGRU/slides/benchmark-validation.html)**: nine mixer arms on four public tasks (S5, MQAR, psMNIST, irregular-time pendulum), fit rates and generalization against a depth-matched GRU control, on one disclosed GPU stratum.
 
 This repo ships the base minGRU plus four variants that each fix a specific
 gap in it: **`SignedMinGRU`** (state can flip sign, not just decay toward
