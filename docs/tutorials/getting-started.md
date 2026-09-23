@@ -111,7 +111,7 @@ with torch.no_grad():
 acc @ T=256 (trained at T=64): 1.000
 ```
 
-A model that had merely memorized a depth-64 shortcut would decay here. Holding at 1.000 four times out is the signature of the exact recurrent solution — the property these mixers are built for.
+A model that had merely memorized a depth-64 shortcut would decay here. Holding at 1.000 four times out is the signature of the exact recurrent solution: the property these mixers are built for.
 
 ## Step 4: Stream one step at a time
 

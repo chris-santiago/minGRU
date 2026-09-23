@@ -14,7 +14,7 @@ Every number on this page is the **L4 stratum**: NVIDIA L4, torch 2.8.0+cu128, t
 
 Nine arms run on each task: the six packaged single-stack mixers (`log`, `signed`, `rotation`, `signed-rotation`, `givens`, `delta`), the two promoted heterogeneous stacks (`signed-givens`, `signed-delta`), and a depth-matched classical `gru` control (2-layer `nn.GRU`, $d_{model}=64$). Seed budget is tiered: 36 seeds for S5/MQAR/pendulum, 12 for psMNIST. Each task's fit bar was fixed before the matrices ran: S5 `val128` $\ge 0.99$, MQAR `val_qacc` $\ge 0.99$, psMNIST `val_acc` $\ge 0.90$, pendulum `val_mse` $\le 0.0014$. The Fisher reference arm is `log` throughout.
 
-On the generator tasks (S5, MQAR, pendulum) a "fit" is **trainability** — the seed reached its own validation-metric bar — not length generalization. The raw and fit-only accuracy columns carry the generalization read separately: raw pools all seeds, fit-only conditions on the fitting seeds. Both are always reported together.
+On the generator tasks (S5, MQAR, pendulum) a "fit" is **trainability** (the seed reached its own validation-metric bar), not length generalization. The raw and fit-only accuracy columns carry the generalization read separately: raw pools all seeds, fit-only conditions on the fitting seeds. Both are always reported together.
 
 ## Master fit matrix
 

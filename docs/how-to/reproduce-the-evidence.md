@@ -83,7 +83,7 @@ What you *can* verify locally, on CPU, without any GPU or Lightning access:
 uv run python experiments/benchmark_lab.py --selftest
 ```
 
-This runs a tiny few-step, small-batch sweep of all four tasks under the `log` arm, dry-run only. It confirms the driver's wiring (data generation, model construction, checkpoint selection, all four loss modes) but is **not evidence** — it does not reproduce a recorded number, only that the code path runs.
+This runs a tiny few-step, small-batch sweep of all four tasks under the `log` arm, dry-run only. It confirms the driver's wiring (data generation, model construction, checkpoint selection, all four loss modes) but is **not evidence**. It does not reproduce a recorded number, only that the code path runs.
 
 The report artifacts (`experiments/bench/bench_{s5,mqar,psmnist,pendulum}.{json,md}`) are regenerated whole from `experiments/lab_results.jsonl` by:
 

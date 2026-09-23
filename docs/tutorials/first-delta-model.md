@@ -97,7 +97,7 @@ step 300  loss 0.0002  acc 1.000
 
 The delta composer solves the task exactly, the same signature as the `signed`-only stack in Getting started, just with a richer composer underneath.
 
-## Step 3: The trap — `step` does not always return one tensor
+## Step 3: The trap: `step` does not always return one tensor
 
 Getting started's Step 1 showed `layer.step(x_t)` returning a single tensor, the new hidden state. That is true for `MinGRU`, `SignedMinGRU`, `RotationMinGRU`, and `GivensMinGRU`. It is **not** true for `DeltaMinGRU`: its `step` returns a 2-tuple, `(y_t, h_t)`.
 
