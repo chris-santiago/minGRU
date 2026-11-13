@@ -1218,3 +1218,115 @@ class TestMixerOracles:
         x = torch.randn(B, T, D_IN)
         ref = _ref_delta_forward(layer, x)
         assert torch.allclose(layer(x), ref, atol=1e-5)
+
+
+# ===========================================================================
+# delta_t dtype reconciliation (block/stack/delta entry points)
+# ===========================================================================
+
+_DECAY_MIXERS = ["log", "signed", "rotation", "givens", "delta"]
+
+
+def _decay_stack(mixer: str) -> MinGRUStack:
+    torch.manual_seed(SEED)
+    kwargs = {"n_heads": 2} if mixer == "delta" else {}
+    if mixer == "givens":
+        kwargs = {"block_size": 2}
+    return MinGRUStack(
+        input_size=D_IN,
+        d_model=D_H,
+        n_layers=2,
+        mixer=mixer,
+        mixer_kwargs={"decay": "fixed", "decay_rate": 0.7, **kwargs},
+    )
+
+
+def _stack_stream(model, x, delta_t):
+    state = model.init_state()
+    outs = []
+    for t in range(x.size(1)):
+        y, state = model.step(x[:, t], state, delta_t[:, t])
+        outs.append(y)
+    return torch.stack(outs, dim=1)
+
+
+class TestDeltaTDtypeReconciliation:
+    @pytest.mark.parametrize("mixer", _DECAY_MIXERS)
+    @pytest.mark.parametrize("dtype", [torch.float64, torch.int64])
+    def test_stack_forward_and_step_match_float32_delta_t(self, mixer, dtype):
+        model = _decay_stack(mixer)
+        x = torch.randn(B, T, D_IN)
+        ref_dt = torch.randint(0, 4, (B, T)).to(torch.float32)
+        dt = ref_dt.to(dtype)
+        ref_out, _ = model(x, delta_t=ref_dt)
+        out, _ = model(x, delta_t=dt)
+        assert out.dtype == torch.float32
+        assert torch.equal(out, ref_out)
+        assert torch.equal(_stack_stream(model, x, dt), _stack_stream(model, x, ref_dt))
+
+    @pytest.mark.parametrize("mixer", _DECAY_MIXERS)
+    def test_bool_delta_t_converts_without_error(self, mixer):
+        model = _decay_stack(mixer)
+        x = torch.randn(B, T, D_IN)
+        dt = torch.rand(B, T) > 0.5
+        out, _ = model(x, delta_t=dt)
+        ref, _ = model(x, delta_t=dt.to(torch.float32))
+        assert out.dtype == torch.float32
+        assert torch.equal(out, ref)
+
+    @pytest.mark.parametrize("mixer", _DECAY_MIXERS)
+    def test_float64_nan_inf_overflow_gives_finite_output(self, mixer):
+        model = _decay_stack(mixer)
+        x = torch.randn(B, T, D_IN)
+        dt = torch.ones(B, T, dtype=torch.float64)
+        dt[0, 0] = float("nan")
+        dt[0, 1] = float("inf")
+        dt[1, 0] = 1e300  # above float32 max
+        out, _ = model(x, delta_t=dt)
+        assert out.dtype == torch.float32
+        assert torch.isfinite(out).all()
+
+    def test_standalone_delta_forward_and_step_float32(self):
+        torch.manual_seed(SEED)
+        layer = DeltaMinGRU(D_IN, D_H, n_heads=2, decay="fixed", decay_rate=0.7)
+        x = torch.randn(B, T, D_IN)
+        dt64 = torch.rand(B, T, dtype=torch.float64)
+        y, h = layer(x, delta_t=dt64, return_state=True)
+        assert y.dtype == torch.float32 and h.dtype == torch.float32
+        y_ref, h_ref = layer(x, delta_t=dt64.to(torch.float32), return_state=True)
+        assert torch.equal(y, y_ref) and torch.equal(h, h_ref)
+        y_t, h_t = layer.step(x[:, 0], None, dt64[:, 0])
+        y_tr, h_tr = layer.step(x[:, 0], None, dt64[:, 0].to(torch.float32))
+        assert y_t.dtype == torch.float32 and h_t.dtype == torch.float32
+        assert torch.equal(y_t, y_tr) and torch.equal(h_t, h_tr)
+
+    @pytest.mark.parametrize("mixer", _DECAY_MIXERS)
+    def test_float32_delta_t_into_float64_model(self, mixer):
+        model = _decay_stack(mixer).double()
+        x = torch.randn(B, T, D_IN, dtype=torch.float64)
+        out, _ = model(x, delta_t=torch.rand(B, T))
+        assert out.dtype == torch.float64
+
+    def test_helper_contract(self):
+        from mingru.min_gru import _match_delta_t_dtype
+
+        f32 = torch.rand(B, T)
+        assert _match_delta_t_dtype(None, f32) is None
+        assert _match_delta_t_dtype(f32, f32) is f32
+        assert _match_delta_t_dtype(f32, f32.to(torch.bfloat16)) is f32
+        assert _match_delta_t_dtype(f32, f32.to(torch.float16)) is f32
+        assert _match_delta_t_dtype(f32, f32.double()).dtype == torch.float64
+
+    def test_pairing_errors_unchanged(self):
+        torch.manual_seed(SEED)
+        x = torch.randn(B, T, D_IN)
+        plain = MinGRUBlock(d_model=D_IN, mixer="log")
+        with pytest.raises(ValueError):
+            plain(x, delta_t=torch.rand(B, T, dtype=torch.float64))
+        with pytest.raises(ValueError):
+            plain.step(x[:, 0], None, torch.rand(B, dtype=torch.float64))
+        decayed = MinGRUBlock(d_model=D_IN, mixer="log", mixer_kwargs={"decay": "fixed"})
+        with pytest.raises(ValueError):
+            decayed(x)
+        with pytest.raises(ValueError):
+            decayed.step(x[:, 0], None)
