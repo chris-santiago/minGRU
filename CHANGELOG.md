@@ -4,7 +4,9 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.1] - 2026-11-13
+
+Bug-fix release for `DeltaMinGRU` time decay, `delta_t` handling, and zero-length input, with documentation corrections. No API changes; decay-active float32 `DeltaMinGRU` outputs change (see Changed).
 
 ### Fixed
 
@@ -15,7 +17,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - **Decay-active float32 outputs of `DeltaMinGRU` change.** Outputs differ from 0.2.0 at rounding level, and by up to the old error on bursty inputs with several large gaps in one chunk. `decay=None` is bit-identical.
-- **Documentation.** The delta kernel's `MINGRU_SCAN=auto` region is described as extrapolated from one measured L4 cell, not a measured region. The chunked-vs-sequential tolerance figures are qualified as measured on a randomly initialized layer and larger as $\beta \to 2$. The README and time-decay how-to now state that the float32 `mixer="log"` forward loses accuracy as the running total of $\lambda f(\Delta t)$ grows (a sanitized `+inf` gap in raw mode corrupts the rest of the sequence), that `log1p_delta=True` or gaps in units comparable to $1/\lambda$ keep it accurate, and that `step` and the signed, rotation, and Givens mixers are unaffected. `DeltaMinGRU`'s departures from DeltaNet are disclosed in its docstring.
+- **Documentation.** The delta kernel's `MINGRU_SCAN=auto` region is described as extrapolated from one measured L4 cell, not a measured region. The chunked-vs-sequential tolerance figures are qualified as measured on a randomly initialized layer and larger as $\beta \to 2$. The README and time-decay how-to now state that the float32 `mixer="log"` forward loses accuracy as the running total of $\lambda f(\Delta t)$ grows (a sanitized `+inf` gap in raw mode corrupts the rest of the sequence), that `log1p_delta=True` or gaps in units comparable to $1/\lambda$ keep it accurate, and that `step` and the signed, rotation, and Givens mixers are unaffected (a code fix for the `mixer="log"` forward is tracked in [#1](https://github.com/chris-santiago/minGRU/issues/1)). `DeltaMinGRU`'s departures from DeltaNet are disclosed in its docstring.
 
 ## [0.2.0] - 2026-07-21
 
@@ -88,5 +90,6 @@ Initial release of `mingru-scans`.
   conformance (590/590), benchmark, and memory artifacts.
 - **Slides.** The parallel-GRUs deck and appendix published on the docs site.
 
+[0.2.1]: https://github.com/chris-santiago/minGRU/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/chris-santiago/minGRU/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/chris-santiago/minGRU/releases/tag/v0.1.0
