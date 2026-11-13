@@ -3483,7 +3483,10 @@ class DeltaMinGRU(DecayMixin, nn.Module):
         -------
         torch.Tensor or tuple of torch.Tensor
             ``y``, shape ``(B, T, hidden_size)``; or ``(y, h_T)`` when
-            ``return_state=True``.
+            ``return_state=True``. For ``T == 0`` the output is empty,
+            ``(B, 0, hidden_size)``, and ``h_T`` is the resolved initial
+            state (``h_0``, or zeros); arguments are still validated and
+            no scan dispatch is attempted.
 
         Raises
         ------
@@ -3502,6 +3505,11 @@ class DeltaMinGRU(DecayMixin, nn.Module):
             if tuple(h_0.shape) != expected:
                 raise ValueError(f"h_0 must have shape {expected} (got {tuple(h_0.shape)})")
             H = h_0.reshape(B, self.n_heads, self.d_k, self.d_v)
+        if T == 0:
+            # Empty sequence: nothing to scan, so no dispatch (and no
+            # MINGRU_SCAN read) happens; the state passes through unchanged.
+            y = self.out_proj(x.new_zeros(B, 0, self.n_heads * self.d_v))
+            return (y, H.reshape(*expected)) if return_state else y
         if dt is not None:
             # Decay active: eager-only gated forward (span-sum decay
             # weighting of the same UT solve). Triton is decay-free, so the

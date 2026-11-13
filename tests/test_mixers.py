@@ -1330,3 +1330,88 @@ class TestDeltaTDtypeReconciliation:
             decayed(x)
         with pytest.raises(ValueError):
             decayed.step(x[:, 0], None)
+
+
+class TestDeltaZeroLength:
+    """``DeltaMinGRU.forward`` accepts T=0 and returns an empty output."""
+
+    def _layer(self, **kw):
+        torch.manual_seed(SEED)
+        return DeltaMinGRU(D_IN, D_H, n_heads=2, **kw)
+
+    def test_empty_output_default_state_zeros(self):
+        layer = self._layer()
+        x = torch.randn(B, 0, D_IN)
+        y = layer(x)
+        assert y.shape == (B, 0, D_H) and y.dtype == torch.float32
+        y, h = layer(x, return_state=True)
+        assert h.shape == (B, 1, layer.n_heads * layer.d_k * layer.d_v)
+        assert torch.equal(h, torch.zeros_like(h))
+
+    def test_h0_returned_unchanged(self):
+        layer = self._layer()
+        h0 = torch.randn(B, 1, layer.n_heads * layer.d_k * layer.d_v)
+        _, h = layer(torch.randn(B, 0, D_IN), h_0=h0, return_state=True)
+        assert torch.equal(h, h0)
+
+    @pytest.mark.parametrize("dt_shape", [(B, 0), (B, 0, 1)])
+    def test_decay_active_empty(self, dt_shape):
+        layer = self._layer(decay="fixed", decay_rate=0.7)
+        y, h = layer(torch.randn(B, 0, D_IN), delta_t=torch.zeros(dt_shape), return_state=True)
+        assert y.shape == (B, 0, D_H)
+        assert torch.equal(h, torch.zeros_like(h))
+
+    def test_validation_errors_fire_first(self):
+        x = torch.randn(B, 0, D_IN)
+        with pytest.raises(ValueError):
+            self._layer(decay="fixed", decay_rate=0.7)(x)
+        with pytest.raises(ValueError):
+            self._layer()(x, delta_t=torch.zeros(B, 0))
+        with pytest.raises(ValueError):
+            self._layer()(x, h_0=torch.zeros(B, 1, 3))
+
+    def test_zero_batch_and_zero_length(self):
+        assert self._layer()(torch.randn(0, 0, D_IN)).shape == (0, 0, D_H)
+
+    def test_float64(self):
+        layer = self._layer().double()
+        y = layer(torch.randn(B, 0, D_IN, dtype=torch.float64))
+        assert y.shape == (B, 0, D_H) and y.dtype == torch.float64
+
+    @pytest.mark.parametrize("mode", ["triton", "not-a-mode"])
+    @pytest.mark.parametrize("decay", [False, True])
+    def test_scan_mode_not_consulted(self, monkeypatch, mode, decay):
+        monkeypatch.setenv("MINGRU_SCAN", mode)
+        x = torch.randn(B, 0, D_IN)
+        if decay:
+            y = self._layer(decay="fixed", decay_rate=0.7)(x, delta_t=torch.zeros(B, 0))
+        else:
+            y = self._layer()(x)
+        assert y.shape == (B, 0, D_H)
+
+    def test_backward_does_not_raise(self):
+        layer = self._layer()
+        layer(torch.randn(B, 0, D_IN, requires_grad=True)).sum().backward()
+
+    def test_block_and_stack(self):
+        torch.manual_seed(SEED)
+        x = torch.randn(B, 0, D_IN)
+        stack = MinGRUStack(
+            input_size=D_IN,
+            d_model=D_H,
+            n_layers=2,
+            mixer="delta",
+            mixer_kwargs={"n_heads": 2},
+        )
+        out, states = stack(x)
+        assert out.shape == (B, 0, D_H)
+        mixer = stack.blocks[0].mingru
+        want = (B, 1, mixer.n_heads * mixer.d_k * mixer.d_v)
+        assert len(states) == 2 and all(tuple(s.shape) == want for s in states)
+
+    def test_block(self):
+        torch.manual_seed(SEED)
+        block = MinGRUBlock(d_model=D_H, mixer="delta", mixer_kwargs={"n_heads": 2})
+        out = block(torch.randn(B, 0, D_H))
+        out = out[0] if isinstance(out, tuple) else out
+        assert out.shape == (B, 0, D_H)
