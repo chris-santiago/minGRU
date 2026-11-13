@@ -9,7 +9,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - **Float32 decay accuracy in `DeltaMinGRU`.** The decay-active forward formed each decay ratio as a difference of two running log-decay sums, which lost float32 precision once several large gaps shared a chunk and made accuracy depend on `chunk_size`. Each ratio is now a direct sum over only the tokens it spans, so the forward matches the sequential `step` oracle at every `chunk_size`. This replaces the internal saturation clamp and its floor constant, and also fixes the same loss in float64 after a sanitized `+inf` gap. The saturation warning remains, now worded as a modeling signal.
-- **Mismatched `delta_t` dtype.** A float64 `delta_t` (the numpy and pandas default) passed to a float32 stack crashed with a dtype error that never named `delta_t`. `delta_t` is now converted to the input's dtype, never narrower than float32, at `MinGRUBlock` and `DeltaMinGRU` `forward` and `step`.
+- **Mismatched `delta_t` dtype.** A float64 `delta_t` (the numpy and pandas default) passed to a float32 stack crashed with a dtype error that never named `delta_t`. `delta_t` is now converted to the dtype of the module's own parameters at `MinGRUBlock` and `DeltaMinGRU` `forward` and `step`, so a float64 `delta_t` into a float32 model becomes float32, models cast wholly to bfloat16 or float16 keep working with a matching-dtype `delta_t`, and `torch.autocast` keeps float32.
 - **Zero-length sequences in `DeltaMinGRU`.** `forward` raised `ValueError` when $T = 0$. It now returns an empty `(B, 0, hidden)` output with the state unchanged, as the other four mixers do.
 
 ### Changed

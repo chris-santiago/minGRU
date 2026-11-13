@@ -1328,11 +1328,66 @@ class TestDeltaTDtypeReconciliation:
         from mingru.min_gru import _match_delta_t_dtype
 
         f32 = torch.rand(B, T)
-        assert _match_delta_t_dtype(None, f32) is None
-        assert _match_delta_t_dtype(f32, f32) is f32
-        assert _match_delta_t_dtype(f32, f32.to(torch.bfloat16)) is f32
-        assert _match_delta_t_dtype(f32, f32.to(torch.float16)) is f32
-        assert _match_delta_t_dtype(f32, f32.double()).dtype == torch.float64
+        f32_module = torch.nn.Linear(2, 2)
+        assert _match_delta_t_dtype(None, f32_module) is None
+        assert _match_delta_t_dtype(f32, f32_module) is f32
+        assert _match_delta_t_dtype(f32.double(), f32_module).dtype == torch.float32
+        assert _match_delta_t_dtype(torch.ones(B, T, dtype=torch.int64), f32_module).dtype == (
+            torch.float32
+        )
+        assert _match_delta_t_dtype(f32, f32_module.double()).dtype == torch.float64
+        for half in (torch.bfloat16, torch.float16):
+            half_module = torch.nn.Linear(2, 2).to(half)
+            half_dt = f32.to(half)
+            assert _match_delta_t_dtype(half_dt, half_module) is half_dt
+            assert _match_delta_t_dtype(f32, half_module).dtype == half
+
+    @pytest.mark.parametrize("mixer", [m for m in _DECAY_MIXERS if m != "delta"])
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    def test_whole_model_half_precision_stack_forward(self, mixer, dtype):
+        # The delta stack's half-precision forward is excluded: it fails on
+        # main too (the CPU triangular solve has no half-precision kernel).
+        model = _decay_stack(mixer).to(dtype)
+        x = torch.randn(B, T, D_IN).to(dtype)
+        out, _ = model(x, delta_t=torch.rand(B, T).to(dtype))
+        assert out.dtype == dtype
+
+    @pytest.mark.parametrize("mixer", _DECAY_MIXERS)
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    def test_whole_model_half_precision_stack_step(self, mixer, dtype):
+        model = _decay_stack(mixer).to(dtype)
+        x = torch.randn(B, T, D_IN).to(dtype)
+        y_t, _ = model.step(x[:, 0], model.init_state(), torch.rand(B).to(dtype))
+        assert y_t.dtype == dtype
+
+    @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+    def test_whole_model_half_precision_standalone_delta_step(self, dtype):
+        torch.manual_seed(SEED)
+        layer = DeltaMinGRU(D_IN, D_H, n_heads=2, decay="fixed", decay_rate=0.7).to(dtype)
+        x = torch.randn(B, T, D_IN).to(dtype)
+        dt = torch.rand(B, T).to(dtype)
+        y_t, h_t = layer.step(x[:, 0], None, dt[:, 0])
+        assert y_t.dtype == dtype and h_t.dtype == dtype
+
+    @pytest.mark.parametrize("mixer", _DECAY_MIXERS)
+    def test_autocast_keeps_float32_delta_t(self, mixer, monkeypatch):
+        import mingru.min_gru as mg
+
+        seen = []
+        real = mg._normalize_delta_t
+
+        def spy(delta_t, *args, **kwargs):
+            seen.append(delta_t)
+            return real(delta_t, *args, **kwargs)
+
+        monkeypatch.setattr(mg, "_normalize_delta_t", spy)
+        model = _decay_stack(mixer)
+        x = torch.randn(B, T, D_IN)
+        dt = torch.rand(B, T)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            model(x, delta_t=dt)
+        assert seen and all(got.dtype == torch.float32 for got in seen)
+        assert all(torch.equal(got, dt) for got in seen)
 
     def test_pairing_errors_unchanged(self):
         torch.manual_seed(SEED)
@@ -1398,16 +1453,22 @@ class TestDeltaZeroLength:
         y = layer(torch.randn(B, 0, D_IN, dtype=torch.float64))
         assert y.shape == (B, 0, D_H) and y.dtype == torch.float64
 
-    @pytest.mark.parametrize("mode", ["triton", "not-a-mode"])
-    @pytest.mark.parametrize("decay", [False, True])
-    def test_scan_mode_not_consulted(self, monkeypatch, mode, decay):
-        monkeypatch.setenv("MINGRU_SCAN", mode)
+    def _zero_length_call(self, decay):
         x = torch.randn(B, 0, D_IN)
         if decay:
-            y = self._layer(decay="fixed", decay_rate=0.7)(x, delta_t=torch.zeros(B, 0))
-        else:
-            y = self._layer()(x)
-        assert y.shape == (B, 0, D_H)
+            return self._layer(decay="fixed", decay_rate=0.7)(x, delta_t=torch.zeros(B, 0))
+        return self._layer()(x)
+
+    @pytest.mark.parametrize("decay", [False, True])
+    def test_triton_mode_neither_dispatches_nor_raises(self, monkeypatch, decay):
+        monkeypatch.setenv("MINGRU_SCAN", "triton")
+        assert self._zero_length_call(decay).shape == (B, 0, D_H)
+
+    @pytest.mark.parametrize("decay", [False, True])
+    def test_invalid_scan_mode_raises(self, monkeypatch, decay):
+        monkeypatch.setenv("MINGRU_SCAN", "not-a-mode")
+        with pytest.raises(ValueError):
+            self._zero_length_call(decay)
 
     def test_backward_does_not_raise(self):
         layer = self._layer()

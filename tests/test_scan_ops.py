@@ -1059,9 +1059,9 @@ class TestDeltaGatedForwardFloat32Robustness:
         A float32 forward whose ``(lambda*dt).max()`` exceeds the pathological
         threshold (``_DECAY_SATURATION_WARN_THRESHOLD = 1e4``) emits exactly
         one ``UserWarning`` naming ``log1p_delta`` across repeated calls (warn-
-        once). A moderate float32 forward, a forward whose gaps sit between
-        ``lambda*dt = 88`` and the threshold, and an fp64 forward at the same
-        extreme emit none. The warning never alters the returned numbers; its
+        once). A moderate float32 forward, a forward whose largest gap sits
+        at half the threshold, and an fp64 forward at the same extreme emit
+        none. The warning never alters the returned numbers; its
         text names ``log1p_delta`` and never mentions a clamp. Uses a finite
         ``dt = 1e5`` so the pre-existing invalid-``delta_t`` warn-once does
         not also fire; the counter filters on the ``log1p_delta`` message
@@ -1070,14 +1070,8 @@ class TestDeltaGatedForwardFloat32Robustness:
         T = 16
         x = torch.randn(self.B, T, self.D_IN)
         torch.manual_seed(SEED + 21)
-        dt_base = 0.2 + 0.6 * torch.rand(self.B, T)  # moderate; bound below the mid band next
-
-        # Case 3 needs a band of lambda*dt values between 88 and the warn
-        # threshold. Bind it so a threshold retune that empties the band fails
-        # here, not silently.
-        mid_band_floor = 88.0
-        assert mid_band_floor < _DECAY_SATURATION_WARN_THRESHOLD
-        assert dt_base.max().item() < mid_band_floor  # case 2 stays a genuine moderate case
+        dt_base = 0.2 + 0.6 * torch.rand(self.B, T)  # moderate, far below the threshold
+        assert dt_base.max().item() < 0.5 * _DECAY_SATURATION_WARN_THRESHOLD
 
         # (1) Extreme float32 (lambda*dt an order past the warn threshold):
         # exactly one warning, and warn-once across two calls.
@@ -1102,9 +1096,9 @@ class TestDeltaGatedForwardFloat32Robustness:
             self._fresh_layer()(x, delta_t=dt_base)
         assert self._count_saturation_warnings(rec) == 0
 
-        # (3) Between 88 and the warn threshold (midpoint of the band): no warning.
+        # (3) Half the warn threshold: no warning.
         dt_mid = dt_base.clone()
-        dt_mid[:, 10] = mid_band_floor + 0.5 * (_DECAY_SATURATION_WARN_THRESHOLD - mid_band_floor)
+        dt_mid[:, 10] = 0.5 * _DECAY_SATURATION_WARN_THRESHOLD
         with warnings.catch_warnings(record=True) as rec:
             warnings.simplefilter("always")
             self._fresh_layer()(x, delta_t=dt_mid)
@@ -1362,37 +1356,7 @@ class TestDeltaGatedSpanSumAccuracy:
         assert torch.isfinite(y).all()
         assert self._rel_dev(y, y_ref) <= self.TOL
 
-    def test_float32_saturation_warning_is_modeling_signal_only(self):
-        layer = self._make(nh=1, decay="fixed", chunk_size=64)
-        T = 64
-        x = self._inputs(T)
-        dt = self._bursty_dt(60.0, T)
-        dt[:, 10] = 10.0 * _DECAY_SATURATION_WARN_THRESHOLD
-        with warnings.catch_warnings(record=True) as rec:
-            warnings.simplefilter("always")
-            layer(x, delta_t=dt)
-            layer(x, delta_t=dt)
-        sat = [r for r in rec if "log1p_delta" in str(r.message)]
-        assert len(sat) == 1
-        assert issubclass(sat[0].category, UserWarning)
-        assert "clamp" not in str(sat[0].message).lower()
-
-    def test_below_threshold_and_fp64_do_not_warn(self):
-        T = 64
-        x = self._inputs(T)
-        dt = self._bursty_dt(60.0, T)
-        dt[:, 10] = 0.5 * (88.0 + _DECAY_SATURATION_WARN_THRESHOLD)
-        with warnings.catch_warnings(record=True) as rec:
-            warnings.simplefilter("always")
-            self._make(nh=1, decay="fixed", chunk_size=64)(x, delta_t=dt)
-            dt[:, 10] = 10.0 * _DECAY_SATURATION_WARN_THRESHOLD
-            self._as_fp64(self._make(nh=1, decay="fixed", chunk_size=64))(
-                x.double(), delta_t=dt.double()
-            )
-        assert not [r for r in rec if "log1p_delta" in str(r.message)]
-
     def test_log_gamma_floor_constant_is_gone(self):
-        # Name assembled at runtime so the repo-wide retired-name search stays clean.
-        retired = "_LOG_GAMMA_FLOAT32" + "_FLOOR"
-        with pytest.raises(ImportError):
-            exec(f"from mingru.min_gru import {retired}")
+        import mingru.min_gru
+
+        assert not hasattr(mingru.min_gru, "_LOG_GAMMA_FLOAT32_FLOOR")

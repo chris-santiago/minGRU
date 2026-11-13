@@ -668,24 +668,6 @@ def _delta_decay_dispatch_guard(is_cuda: bool) -> None:
         _warned_delta_decay_fallback = True
 
 
-def _match_delta_t_dtype(delta_t: torch.Tensor | None, like: torch.Tensor) -> torch.Tensor | None:
-    """Convert ``delta_t`` to the working dtype of ``like``, floored at float32.
-
-    The working dtype is ``torch.promote_types(like.dtype, torch.float32)``, so
-    float64 timestamps (numpy/pandas) work with a float32 model, integer and
-    bool gaps become floating point, and a half-precision model still receives
-    float32 gaps. ``None`` passes through unchanged, and a ``delta_t`` that
-    already has the working dtype is returned as the same object (no copy), so
-    matching-dtype calls stay bit-identical.
-    """
-    if delta_t is None:
-        return None
-    dtype = torch.promote_types(like.dtype, torch.float32)
-    if delta_t.dtype == dtype:
-        return delta_t
-    return delta_t.to(dtype)
-
-
 def _cached_plane_meta_per_device(obj, attr: str, device: torch.device, build):
     """Return ``build()``'s ``(perm, sgn, p2p)`` tensors on ``device``, cached.
 
@@ -858,11 +840,40 @@ _DECAY_MIXER_KWARGS = ("decay", "decay_rate", "log1p_delta")
 # decay factors are direct span sums, so a saturated gap needs no special
 # handling for accuracy: its factor underflows to an exact 0, wiping carried
 # memory just as the sequential step does, and no other token is affected.
-# The warning is purely a modeling signal: past this threshold (one decade
-# below where float32 resolves gap magnitudes at all) saturated gaps become
-# indistinguishable from one another, and a once-per-instance warning advises
-# log1p_delta=True or gap rescaling. fp64 never warns.
+# The warning is purely a modeling signal: once-per-instance advice to use
+# log1p_delta=True or rescale gaps, because saturated gaps become
+# indistinguishable from one another. The value 1e4 is a historical constant
+# kept unchanged by owner decision; it is not derived from float32 resolution.
+# Saturation (exact gamma == 0) actually begins near lambda*dt ~ 103 in float32
+# and ~ 745 in float64, so the threshold fires well after saturation starts.
+# fp64 never warns.
 _DECAY_SATURATION_WARN_THRESHOLD = 1e4
+
+
+def _match_delta_t_dtype(delta_t: torch.Tensor | None, module: nn.Module) -> torch.Tensor | None:
+    """Convert ``delta_t`` to the dtype of ``module``'s own parameters.
+
+    The decay arithmetic runs at the dtype of a mixer's parameters and
+    buffers, so that is the dtype ``delta_t`` is reconciled to: float64
+    timestamps (numpy/pandas) and integer or bool gaps become the model's
+    dtype (float32 for a default model, float64 for ``.double()``), and a model
+    cast wholly to bfloat16 or float16 receives half-precision gaps as it did
+    before this helper existed. Under ``torch.autocast`` the parameters stay
+    float32, so ``delta_t`` is never narrowed. ``None`` passes through
+    unchanged, and a ``delta_t`` that already has the parameter dtype is
+    returned as the same object (no copy), so matching-dtype calls stay
+    bit-identical.
+
+    This runs at the caller of the frozen ``_normalize_delta_t`` pipeline
+    (``MinGRUBlock`` and ``DeltaMinGRU``), because that pipeline is frozen.
+    The four frozen mixers called directly, outside a block, do not reconcile.
+    """
+    if delta_t is None:
+        return None
+    dtype = next(module.parameters()).dtype
+    if delta_t.dtype == dtype:
+        return delta_t
+    return delta_t.to(dtype)
 
 
 def _normalize_delta_t(
@@ -3461,8 +3472,8 @@ class DeltaMinGRU(DecayMixin, nn.Module):
             the same pairing contract as the other mixers (``ValueError``
             in either direction -- see ``DecayMixin._prepare_decay``).
             Any real dtype is accepted (float64, integer, bool): it is
-            converted to ``x``'s dtype, never narrower than float32, before
-            any decay arithmetic.
+            converted to the dtype of the layer's parameters before any decay
+            arithmetic.
             When decay is active, a non-``None`` ``delta_t`` routes to
             the eager gated chunked forward (``_forward_chunked_gated``),
             which threads the per-token gate through the same UT solve
@@ -3501,8 +3512,8 @@ class DeltaMinGRU(DecayMixin, nn.Module):
             ``y``, shape ``(B, T, hidden_size)``; or ``(y, h_T)`` when
             ``return_state=True``. For ``T == 0`` the output is empty,
             ``(B, 0, hidden_size)``, and ``h_T`` is the resolved initial
-            state (``h_0``, or zeros); arguments are still validated and
-            no scan dispatch is attempted.
+            state (``h_0``, or zeros); arguments and ``MINGRU_SCAN`` are
+            still validated and no scan dispatch is attempted.
 
         Raises
         ------
@@ -3511,7 +3522,7 @@ class DeltaMinGRU(DecayMixin, nn.Module):
             is given without decay enabled; or if ``h_0``'s shape does
             not match ``(B, 1, n_heads*d_k*d_v)``.
         """
-        delta_t = _match_delta_t_dtype(delta_t, x)
+        delta_t = _match_delta_t_dtype(delta_t, self)
         dt = self._prepare_decay(delta_t, canonical_ndim=2)
         B, T, _ = x.shape
         expected = (B, 1, self.n_heads * self.d_k * self.d_v)
@@ -3522,12 +3533,14 @@ class DeltaMinGRU(DecayMixin, nn.Module):
                 raise ValueError(f"h_0 must have shape {expected} (got {tuple(h_0.shape)})")
             H = h_0.reshape(B, self.n_heads, self.d_k, self.d_v)
         if T == 0:
-            # Empty sequence: nothing to scan, so no dispatch (and no
-            # MINGRU_SCAN read) happens; the state passes through unchanged but
-            # is cloned so, as for T >= 1, it never aliases the caller's h_0.
-            y = self.out_proj(x.new_zeros(B, 0, self.n_heads * self.d_v))
-            return (y, H.reshape(*expected).clone()) if return_state else y
-        if dt is not None:
+            # Empty sequence: nothing to scan, so nothing is dispatched. The
+            # MINGRU_SCAN value is still validated (as for the other mixers),
+            # then the output is empty and the state flows to the shared tail,
+            # cloned so, as for T >= 1, it never aliases the caller's h_0.
+            _resolve_scan_mode(x.is_cuda)
+            y = x.new_zeros(B, 0, self.n_heads * self.d_v)
+            H = H.clone()
+        elif dt is not None:
             # Decay active: eager-only gated forward (span-sum decay
             # weighting of the same UT solve). Triton is decay-free, so the
             # fused path is intentionally bypassed here (spec section 4) --
@@ -3625,8 +3638,8 @@ class DeltaMinGRU(DecayMixin, nn.Module):
             pairing contract as the other mixers (``ValueError`` in
             either direction -- see ``DecayMixin._prepare_decay``).
             Any real dtype is accepted (float64, integer, bool): it is
-            converted to ``x_t``'s dtype, never narrower than float32,
-            before any decay arithmetic.
+            converted to the dtype of the layer's parameters before any
+            decay arithmetic.
             When decay is active, the incoming state is decayed by this
             token's per-head gamma once, at the token boundary
             (``H <- gamma_t * H``), before the token's ``nh``
@@ -3652,7 +3665,7 @@ class DeltaMinGRU(DecayMixin, nn.Module):
             is given without decay enabled; or if ``h_prev``'s shape
             does not match ``(B, n_heads*d_k*d_v)``.
         """
-        delta_t = _match_delta_t_dtype(delta_t, x_t)
+        delta_t = _match_delta_t_dtype(delta_t, self)
         dt = self._prepare_decay(delta_t, canonical_ndim=1)
         B = x_t.size(0)
         expected = (B, self.n_heads * self.d_k * self.d_v)
@@ -3824,7 +3837,7 @@ class MinGRUBlock(nn.Module):
             Time gaps preceding each event, shape ``(B, T)`` or
             ``(B, T, 1)``; forwarded to this block's mixer after dtype
             conversion: any real dtype (float64, integer, bool) is accepted
-            and converted to ``x``'s dtype, never narrower than float32.
+            and converted to the dtype of the block's parameters.
             Required iff the mixer's ``decay`` is enabled — the mixer's
             own pairing contract raises ``ValueError`` otherwise (see
             ``_validate_delta_t_pairing``); this method adds no
@@ -3844,7 +3857,7 @@ class MinGRUBlock(nn.Module):
             If the mixer's ``decay`` is enabled without ``delta_t``, or
             ``delta_t`` is given without decay enabled.
         """
-        delta_t = _match_delta_t_dtype(delta_t, x)
+        delta_t = _match_delta_t_dtype(delta_t, self)
         if getattr(self.mingru, "carries_matrix_state", False):
             h_seq, state = self.mingru(self.norm1(x), h_0, delta_t, return_state=True)
         else:
@@ -3877,8 +3890,8 @@ class MinGRUBlock(nn.Module):
         delta_t : torch.Tensor, optional
             Time gap preceding this event, shape ``(B,)`` or ``(B, 1)``;
             forwarded to this block's mixer after dtype conversion (any
-            real dtype is accepted and converted to ``x_t``'s dtype, never
-            narrower than float32). Same required-iff-decay-enabled
+            real dtype is accepted and converted to the dtype of the block's
+            parameters). Same required-iff-decay-enabled
             contract as ``forward``.
 
         Returns
@@ -3894,7 +3907,7 @@ class MinGRUBlock(nn.Module):
             If the mixer's ``decay`` is enabled without ``delta_t``, or
             ``delta_t`` is given without decay enabled.
         """
-        delta_t = _match_delta_t_dtype(delta_t, x_t)
+        delta_t = _match_delta_t_dtype(delta_t, self)
         if getattr(self.mingru, "carries_matrix_state", False):
             y_t, state = self.mingru.step(self.norm1(x_t), h_prev, delta_t)
         else:
