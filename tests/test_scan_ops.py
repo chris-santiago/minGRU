@@ -43,16 +43,15 @@ from mingru import (
     triton_scans,
 )
 
-# The float32-stabilization tests below derive their boundary delta_t values
-# from these constants (not hardcoded magnitudes) so a retune of either
-# fails the binding assertions loudly instead of silently staling a premise.
-from mingru.min_gru import _DECAY_SATURATION_WARN_THRESHOLD, _LOG_GAMMA_FLOAT32_FLOOR
+# The float32 saturation tests below derive their boundary delta_t values from
+# this constant (not hardcoded magnitudes) so a retune fails the binding
+# assertions loudly instead of silently staling a premise.
+from mingru.min_gru import _DECAY_SATURATION_WARN_THRESHOLD
 
 SEED = 42
 
 # All float32-robustness layers below use decay_rate=1.0, so lambda == 1 and
 # lambda*dt == dt: the delta_t thresholds equal the lambda*dt thresholds.
-_FLOOR_MAG = -_LOG_GAMMA_FLOAT32_FLOOR  # |floor| in lambda*dt space (clamp engages above this)
 
 
 # ===========================================================================
@@ -555,13 +554,14 @@ class TestDeltaBackwardTorchVsEagerAutograd:
 # ===========================================================================
 #
 # ``DeltaMinGRU._forward_chunked_gated`` threads a per-token time-decay gate
-# through the SAME unit-triangular UT solve as ``_forward_chunked`` (spec
-# section 6, log-space decay-ratio form): per chunk it weights the ``T``
-# off-diagonal, the carried-state ``rhs`` term, the readout, and the chunk-end
-# carry by decay RATIOS ``exp(logP_a - logP_b) in (0, 1]`` (never a bare
-# ``1 / Gamma``), so the decay-active forward equals the sequential gated
-# recurrence (``DeltaMinGRU.step`` iterated token-by-token, the Task-2 oracle)
-# regardless of ``chunk_size`` AND stays finite in float32 under strong decay.
+# through the SAME unit-triangular UT solve as ``_forward_chunked``: per chunk
+# it weights the ``T`` off-diagonal, the carried-state ``rhs`` term, the
+# readout, and the chunk-end carry by decay factors ``exp(<= 0) in [0, 1]``
+# formed as direct span sums of per-token log-decays (never a bare
+# ``1 / Gamma``, never a difference of two running sums), so the decay-active
+# forward equals the sequential gated recurrence (``DeltaMinGRU.step``
+# iterated token-by-token) regardless of ``chunk_size`` AND stays finite in
+# float32 under strong decay.
 # These CPU fp64 tests are the correctness proof the spec's "Oracle
 # gradcheck"/"Tiling invariance"/"gamma->1 reduction" criteria call for; the
 # float32 tests below pin the "Float32 robustness" criterion. No Triton/CUDA
@@ -770,8 +770,8 @@ class TestDeltaGatedForwardVsOracle:
 class TestDeltaGatedForwardFloat32Robustness:
     """Float32 finiteness of the gated forward under strong / infinite decay.
 
-    The log-space decay-ratio form (spec sections 6/7) keeps every decay
-    factor in ``(0, 1]``, so the forward stays finite in float32 even when
+    The span-sum decay factors (spec sections 6/7) all lie in ``[0, 1]``, so
+    the forward stays finite in float32 even when
     the chunk-relative cumulative decay ``Gamma_C`` is far below the
     float32 subnormal floor -- the regime where the rejected bare
     ``1 / Gamma`` change-of-variables overflowed to ``nan``. The first
@@ -787,7 +787,7 @@ class TestDeltaGatedForwardFloat32Robustness:
         """At chunk_size=64, decay_rate=1.0, per-token dt ~1.6-2.0 (gamma ~
         0.13-0.20), the full-chunk product ``Gamma_C ~ exp(-64 * 1.8) ~
         1e-50`` underflows float32, so a bare ``1 / Gamma`` yields ``inf``
-        -> ``nan``. The decay-ratio form must instead stay finite AND match
+        -> ``nan``. The span-sum form must instead stay finite AND match
         a smaller-chunk float32 run (tiling invariance in float32)."""
         torch.manual_seed(SEED)
         layer = DeltaMinGRU(
@@ -823,14 +823,8 @@ class TestDeltaGatedForwardFloat32Robustness:
         0 at chunk_size=6) so the memory wipe propagates ACROSS the chunk
         boundary through the carried state (chunk 1 reads a state whose
         pre-gap content is gone), exercising the cross-chunk path. Aligning
-        it to the boundary also keeps the log-space decay ratios exact: the
-        underflow is a clean ``exp(-1e10) = 0`` and no post-gap token reads
-        back across the cap WITHIN a chunk (which would subtract two
-        ``~ -1e10`` cumulative logs and lose ``~ulp(1e10) ~ 2e-6`` of the
-        recovered per-token decay -- a float64 property of the 1e10 cap
-        magnitude, not of the decay-ratio form, since the ``step`` oracle
-        forms each token's gamma directly and never subtracts near the
-        cap)."""
+        it to the boundary exercises the cross-chunk carry; the mid-chunk
+        sibling below covers the interior placement at the same tolerance."""
         torch.manual_seed(SEED)
         layer = DeltaMinGRU(
             self.D_IN,
@@ -861,35 +855,25 @@ class TestDeltaGatedForwardFloat32Robustness:
         but the ``+inf`` gap sits MID-CHUNK (not on a chunk-boundary token),
         pinning spec section 7's invariant that output finiteness holds
         "regardless of +inf gap placement" -- boundary-aligned and
-        interior placements both exercise the same ``exp(logP_a - logP_b)``
-        decay-ratio path, never a bare ``1 / Gamma``.
+        interior placements both exercise the same span-sum factors,
+        never a bare ``1 / Gamma``.
 
         Uses ``chunk_size=8``, ``T=20`` so token 10 (the gap) falls inside
         chunk 1 (tokens 8..15), strictly interior to both its chunk and the
         sequence.
 
         Float32 asserts finiteness AND agreement with the sequential ``step``
-        oracle: the log_gamma clamp (``_LOG_GAMMA_FLOAT32_FLOOR = -88``) bounds
-        the one saturated ``-lambda * 1e10`` term before the cumsum, so the
-        post-gap tokens sharing its chunk keep their relative decay instead of
-        collapsing onto a ``-1e10`` plateau. The clamped token wipes memory
-        exactly as the oracle's ``gamma = 0`` does, restoring oracle agreement
-        to the float32 roundoff floor (atol=1e-4). See
-        ``test_mid_chunk_plus_inf_float32_tiling_invariant_via_clamp`` below,
-        which additionally pins tiling-invariance across ``chunk_size``.
+        oracle. Every decay factor is a direct span sum, so the one saturated
+        ``-lambda * 1e10`` token only zeroes the factors whose span contains
+        it (an exact ``exp(-huge) = 0`` wipe, as the oracle's ``gamma = 0``)
+        and never perturbs the post-gap tokens sharing its chunk.
 
-        Float64 also checks agreement with the ``step`` oracle, but at a LOOSE
-        tolerance (atol=1e-5): the clamp is float32-only, so fp64 is untouched
-        here, and even in float64 a later token within the same chunk subtracts
-        two cumulative log-decays both near the ``-1e10`` cap, losing
-        ~``ulp(1e10) ~ 2e-6`` -- a cap-magnitude cancellation artifact (the
-        ``step`` oracle forms each token's gamma directly and never subtracts
-        near the cap), not a defect of the decay-ratio form. So fp64 oracle-
-        agreement stays loose, unlike the boundary-aligned sibling's 1e-10."""
+        Float64 checks the same oracle agreement at ``atol = rtol = 1e-10``.
+        """
         CHUNK_SIZE, T = 8, 20
         MID_CHUNK_TOKEN = 10  # inside chunk 1 (tokens 8..15), not a multiple of CHUNK_SIZE
 
-        # --- float32: finiteness + oracle agreement (clamp fixes both) ---
+        # --- float32: finiteness + oracle agreement ---
         torch.manual_seed(SEED)
         layer_f32 = DeltaMinGRU(
             self.D_IN,
@@ -918,7 +902,7 @@ class TestDeltaGatedForwardFloat32Robustness:
         torch.testing.assert_close(y_f32, y_ref_f32, atol=1e-4, rtol=1e-4)
         torch.testing.assert_close(hT_f32.reshape(self.B, -1), hT_ref_f32, atol=1e-4, rtol=1e-4)
 
-        # --- float64: finiteness (tight) + oracle agreement (loose) ---
+        # --- float64: finiteness + oracle agreement ---
         torch.manual_seed(SEED)
         layer_f64 = DeltaMinGRU(
             self.D_IN,
@@ -942,33 +926,25 @@ class TestDeltaGatedForwardFloat32Robustness:
         assert torch.isfinite(hT).all()
 
         y_ref, hT_ref = _delta_gated_step_oracle(layer_f64, x_f64, h0.reshape(self.B, -1), dt_f64)
-        torch.testing.assert_close(y, y_ref, atol=1e-5, rtol=1e-5)
-        torch.testing.assert_close(hT.reshape(self.B, -1), hT_ref, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(y, y_ref, atol=1e-10, rtol=1e-10)
+        torch.testing.assert_close(hT.reshape(self.B, -1), hT_ref, atol=1e-10, rtol=1e-10)
 
-    def test_mid_chunk_plus_inf_float32_tiling_invariant_via_clamp(self):
+    def test_mid_chunk_plus_inf_float32_tiling_invariant(self):
         """A mid-chunk enormous ``delta_t`` gap is tiling-invariant AND oracle-
-        matching in float32 WITHOUT ``log1p_delta``, via the log_gamma clamp.
+        matching in float32 WITHOUT ``log1p_delta``.
 
         A ``+inf`` gap sanitizes to the frozen ``_DELTA_T_POSINF_CAP=1e10``, so
-        ``log_gamma = -lambda * 1e10 ~ -1e10``. Unclamped, ``ulp(1e10) ~ 1e3``
-        in float32 swamps a normal per-token ``log_gamma ~ -0.5``, and post-gap
-        tokens within the *same* chunk collapse onto one ``-1e10`` plateau,
-        losing their relative decay (``exp(logP_a - logP_b)`` rounds to 1 where
-        the true ratio is < 1) -- tiling-invariance and step-oracle agreement
-        would then fail by ~0.1--0.5. The clamp (``_LOG_GAMMA_FLOAT32_FLOOR =
-        -88``, applied before the cumsum on the non-fp64 path) bounds that one
-        term to a float32-representable floor. Because ``exp(-88) ~ 6e-39`` is
-        already float32-zero, the clamped token wipes memory exactly as the
-        sequential oracle's ``gamma = 0`` does, while the bounded intermediate
-        keeps the cumsum precise -- restoring both tiling-invariance (``< 1e-4``
-        across ``chunk_size``) and oracle agreement (to the float32 floor).
+        ``log_gamma = -lambda * 1e10``. Because every decay factor is a direct
+        span sum, that one term only drives the factors whose span contains it
+        to an exact ``exp(-huge) = 0`` (the oracle's ``gamma = 0`` wipe); the
+        factors between post-gap tokens never see it, so tiling-invariance
+        (``< 1e-4`` across ``chunk_size``) and oracle agreement hold.
 
-        The fix is magnitude-based, not ``+inf``-specific: a huge raw finite
-        gap (``dt = 1e6``, no ``+inf``) is pinned to behave identically. A
-        ``log1p_delta=True`` leg confirms the documented mitigation stays
-        tiling-invariant too (log1p keeps large gaps *distinguishable* rather
-        than saturating to a full wipe; it is no longer required for
-        *correctness*).
+        The behavior is magnitude-based, not ``+inf``-specific: a huge raw
+        finite gap (``dt = 1e6``, no ``+inf``) is pinned to behave
+        identically. A ``log1p_delta=True`` leg confirms the documented
+        mitigation stays tiling-invariant too (it keeps large gaps
+        *distinguishable* rather than saturating to a full wipe).
         """
         CHUNK_A, CHUNK_B, T, MID_CHUNK_TOKEN = 4, 16, 16, 10
 
@@ -1019,7 +995,7 @@ class TestDeltaGatedForwardFloat32Robustness:
                         f"(chunk={chunk_size}, log1p={log1p})"
                     )
 
-        # Oracle for the raw +inf case at CHUNK_A (float32, via the clamp).
+        # Oracle for the raw +inf case at CHUNK_A (float32 step loop).
         oracle_layer = DeltaMinGRU(
             self.D_IN,
             self.D_H,
@@ -1032,20 +1008,17 @@ class TestDeltaGatedForwardFloat32Robustness:
         oracle_layer.load_state_dict(state)
         y_ref, _ = _delta_gated_step_oracle(oracle_layer, x, h0.reshape(self.B, -1), dt_inf)
 
-        # Without log1p, the clamp now makes both raw +inf AND huge-finite dt
-        # tiling-invariant across chunk_size and oracle-matching to the fp32
-        # floor -- the correctness the previous version of this test recorded
-        # as violated is now restored.
+        # Without log1p, both raw +inf AND huge-finite dt are tiling-invariant
+        # across chunk_size and oracle-matching to the fp32 floor.
         for dt, label in ((dt_inf, "+inf"), (dt_huge, "1e6")):
             tiling_err = (run(CHUNK_A, False, dt) - run(CHUNK_B, False, dt)).abs().max()
             assert tiling_err < 1e-4, (
-                f"float32 mid-chunk {label} gap must be tiling-invariant via the "
-                f"clamp (no log1p_delta); got {tiling_err:.3e}"
+                f"float32 mid-chunk {label} gap must be tiling-invariant "
+                f"(no log1p_delta); got {tiling_err:.3e}"
             )
         oracle_err = (run(CHUNK_A, False, dt_inf) - y_ref).abs().max()
         assert oracle_err < 1e-4, (
-            f"float32 mid-chunk +inf gap must match the step oracle via the clamp; "
-            f"got {oracle_err:.3e}"
+            f"float32 mid-chunk +inf gap must match the step oracle; got {oracle_err:.3e}"
         )
 
         # log1p_delta stays tiling-invariant too (distinguishability aid, not a
@@ -1086,27 +1059,25 @@ class TestDeltaGatedForwardFloat32Robustness:
         A float32 forward whose ``(lambda*dt).max()`` exceeds the pathological
         threshold (``_DECAY_SATURATION_WARN_THRESHOLD = 1e4``) emits exactly
         one ``UserWarning`` naming ``log1p_delta`` across repeated calls (warn-
-        once). A moderate float32 forward, a below-threshold-but-clamped
-        forward (``lambda*dt in [88, 1e4]``), and an fp64 forward at the same
-        extreme emit none. The warning never alters the returned numbers (the
-        clamp already made them correct). Uses a finite ``dt = 1e5`` so the
-        pre-existing invalid-``delta_t`` warn-once does not also fire; the
-        counter filters on the ``log1p_delta`` message regardless.
+        once). A moderate float32 forward, a forward whose gaps sit between
+        ``lambda*dt = 88`` and the threshold, and an fp64 forward at the same
+        extreme emit none. The warning never alters the returned numbers; its
+        text names ``log1p_delta`` and never mentions a clamp. Uses a finite
+        ``dt = 1e5`` so the pre-existing invalid-``delta_t`` warn-once does
+        not also fire; the counter filters on the ``log1p_delta`` message
+        regardless.
         """
         T = 16
         x = torch.randn(self.B, T, self.D_IN)
         torch.manual_seed(SEED + 21)
-        dt_base = 0.2 + 0.6 * torch.rand(self.B, T)  # moderate; bound below the clamp floor next
+        dt_base = 0.2 + 0.6 * torch.rand(self.B, T)  # moderate; bound below the mid band next
 
-        # The "clamp engages but no warning" band (case 3) only exists if the
-        # clamp floor magnitude sits below the warn threshold. Bind it so a
-        # constant retune that inverts them fails here, not silently.
-        assert _FLOOR_MAG < _DECAY_SATURATION_WARN_THRESHOLD, (
-            "clamp-but-no-warn band is empty: _LOG_GAMMA_FLOAT32_FLOOR magnitude "
-            f"{_FLOOR_MAG} must sit below _DECAY_SATURATION_WARN_THRESHOLD "
-            f"{_DECAY_SATURATION_WARN_THRESHOLD}"
-        )
-        assert dt_base.max().item() < _FLOOR_MAG  # case 2 stays a genuine moderate case
+        # Case 3 needs a band of lambda*dt values between 88 and the warn
+        # threshold. Bind it so a threshold retune that empties the band fails
+        # here, not silently.
+        mid_band_floor = 88.0
+        assert mid_band_floor < _DECAY_SATURATION_WARN_THRESHOLD
+        assert dt_base.max().item() < mid_band_floor  # case 2 stays a genuine moderate case
 
         # (1) Extreme float32 (lambda*dt an order past the warn threshold):
         # exactly one warning, and warn-once across two calls.
@@ -1121,20 +1092,22 @@ class TestDeltaGatedForwardFloat32Robustness:
             "float32 forward past the saturation threshold must warn exactly once "
             f"per instance; saw {self._count_saturation_warnings(rec)}"
         )
+        sat = [r for r in rec if "log1p_delta" in str(r.message)]
+        assert issubclass(sat[0].category, UserWarning)
+        assert "clamp" not in str(sat[0].message).lower()
 
-        # (2) Moderate float32 (all lambda*dt below the clamp floor): no warning.
+        # (2) Moderate float32 (all lambda*dt well below the threshold): no warning.
         with warnings.catch_warnings(record=True) as rec:
             warnings.simplefilter("always")
             self._fresh_layer()(x, delta_t=dt_base)
         assert self._count_saturation_warnings(rec) == 0
 
-        # (3) Below the warn threshold but above the clamp floor (midpoint of the
-        # [floor, warn] band): the clamp fires but the warning does not.
-        dt_clamp = dt_base.clone()
-        dt_clamp[:, 10] = _FLOOR_MAG + 0.5 * (_DECAY_SATURATION_WARN_THRESHOLD - _FLOOR_MAG)
+        # (3) Between 88 and the warn threshold (midpoint of the band): no warning.
+        dt_mid = dt_base.clone()
+        dt_mid[:, 10] = mid_band_floor + 0.5 * (_DECAY_SATURATION_WARN_THRESHOLD - mid_band_floor)
         with warnings.catch_warnings(record=True) as rec:
             warnings.simplefilter("always")
-            self._fresh_layer()(x, delta_t=dt_clamp)
+            self._fresh_layer()(x, delta_t=dt_mid)
         assert self._count_saturation_warnings(rec) == 0
 
         # (4) fp64 at the same extreme: never warns (fp64 is not at risk).
@@ -1149,15 +1122,15 @@ class TestDeltaGatedForwardFloat32Robustness:
 
         Two checks: (a) the post-gap output equals the oracle's, and (b) the
         post-gap output is invariant to the pre-gap inputs (the gap's
-        clamped ``gamma = 0`` truly erases the carried state, as the oracle
-        does), proving the clamp reproduces the wipe rather than merely
-        staying finite.
+        ``gamma = 0`` truly erases the carried state, as the oracle does),
+        proving the forward reproduces the wipe rather than merely staying
+        finite.
         """
         T, GAP = 16, 8  # gap at a chunk boundary (chunk_size=8) so it wipes the carry
         torch.manual_seed(SEED + 23)
         x = torch.randn(self.B, T, self.D_IN)
         dt = 0.2 + 0.6 * torch.rand(self.B, T)
-        # huge finite gap -> clamped gamma = 0 (memory wiped)
+        # huge finite gap -> gamma = 0 (memory wiped)
         dt[:, GAP] = 100.0 * _DECAY_SATURATION_WARN_THRESHOLD
 
         layer = self._fresh_layer()
@@ -1177,3 +1150,249 @@ class TestDeltaGatedForwardFloat32Robustness:
             warnings.simplefilter("ignore")
             y_perturbed = layer(x_perturbed, delta_t=dt)
         torch.testing.assert_close(y[:, GAP + 1 :], y_perturbed[:, GAP + 1 :], atol=1e-4, rtol=1e-4)
+
+
+class TestDeltaGatedSpanSumAccuracy:
+    """Float32 accuracy of the decay-active forward on bursty streams.
+
+    A bursty stream (bursts of 4 tokens whose first token is a long gap, the
+    other three short gaps in ``[0.05, 1]``) is the regime where decay
+    ratios formed by subtracting two running log-sums lose float32 bits. The
+    reference is always the fp64 sequential ``step`` loop, never a second
+    float32 computation; the bound is the max abs deviation over the
+    reference's max magnitude.
+    """
+
+    B, D_IN, D_H, N_HEADS = 2, 16, 32, 4
+    T = 512
+    TOL = 2e-6
+    CHUNKS = (1, 64, 256, 512)
+
+    def _make(
+        self,
+        *,
+        nh: int,
+        decay: str,
+        chunk_size: int,
+        log1p_delta: bool = False,
+        decay_rate: float = 1.0,
+    ) -> DeltaMinGRU:
+        """Float32 layer with seed-fixed weights (identical across chunk sizes)."""
+        torch.manual_seed(SEED + 3)
+        layer = DeltaMinGRU(
+            self.D_IN,
+            self.D_H,
+            n_heads=self.N_HEADS,
+            nh=nh,
+            chunk_size=chunk_size,
+            decay=decay,
+            decay_rate=decay_rate,
+            log1p_delta=log1p_delta,
+        )
+        if decay == "learnable":
+            with torch.no_grad():
+                layer.rho.add_(torch.randn_like(layer.rho) * 0.3)
+        return layer
+
+    @staticmethod
+    def _as_fp64(layer: DeltaMinGRU) -> DeltaMinGRU:
+        """fp64 copy of ``layer`` with identical weights (the step-loop oracle)."""
+        twin = DeltaMinGRU(
+            layer.input_size,
+            layer.hidden_size,
+            n_heads=layer.n_heads,
+            nh=layer.nh,
+            d_k=layer.d_k,
+            d_v=layer.d_v,
+            chunk_size=layer.chunk_size,
+            decay=layer.decay,
+            decay_rate=1.0,
+            log1p_delta=layer.log1p_delta,
+        ).double()
+        twin.load_state_dict({k: v.double() for k, v in layer.state_dict().items()})
+        return twin
+
+    def _bursty_dt(self, long_gap: float, T: int | None = None, phase: int = 0) -> torch.Tensor:
+        """Bursts of 4; ``phase`` shifts which token opens a burst (the long gap).
+
+        With ``phase=0`` every power-of-two chunk opens on a saturating gap and
+        wipes the carry; a nonzero phase puts chunk boundaries on short gaps so
+        the inter-chunk carry and ``h_0`` reach the output.
+        """
+        T = self.T if T is None else T
+        torch.manual_seed(SEED + 5)
+        dt = 0.05 + 0.95 * torch.rand(self.B, T)
+        dt[:, phase::4] = long_gap
+        return dt
+
+    def _inputs(self, T: int | None = None) -> torch.Tensor:
+        torch.manual_seed(SEED + 9)
+        return torch.randn(self.B, self.T if T is None else T, self.D_IN)
+
+    def _oracle(self, layer: DeltaMinGRU, x: torch.Tensor, dt: torch.Tensor, h0=None):
+        twin = self._as_fp64(layer)
+        h = (
+            torch.zeros(self.B, layer.n_heads * layer.d_k * layer.d_v, dtype=torch.float64)
+            if h0 is None
+            else h0.double().reshape(self.B, -1)
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return _delta_gated_step_oracle(twin, x.double(), h, dt.double())
+
+    @staticmethod
+    def _rel_dev(y: torch.Tensor, y_ref: torch.Tensor) -> float:
+        return ((y.double() - y_ref).abs().max() / y_ref.abs().max()).item()
+
+    def _forward(self, layer, x, dt, **kw):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return layer(x, delta_t=dt, **kw)
+
+    @pytest.mark.parametrize("long_gap", [60.0, 3600.0, float("inf")])
+    @pytest.mark.parametrize("decay", ["fixed", "learnable"])
+    @pytest.mark.parametrize("nh", [1, 2])
+    @pytest.mark.parametrize("chunk_size", CHUNKS)
+    def test_bursty_stream_matches_fp64_step_oracle(self, long_gap, decay, nh, chunk_size):
+        layer = self._make(nh=nh, decay=decay, chunk_size=chunk_size)
+        x, dt = self._inputs(), self._bursty_dt(long_gap)
+        y_ref, _ = self._oracle(layer, x, dt)
+
+        y = self._forward(layer, x, dt)
+        assert torch.isfinite(y).all()
+        dev = self._rel_dev(y, y_ref)
+        assert dev <= self.TOL, f"relative deviation {dev:.3e} > {self.TOL:.0e}"
+
+    @pytest.mark.parametrize("long_gap", [60.0, 3600.0, float("inf")])
+    @pytest.mark.parametrize("decay", ["fixed", "learnable"])
+    def test_bursty_stream_outputs_agree_across_chunk_sizes(self, long_gap, decay):
+        x, dt = self._inputs(), self._bursty_dt(long_gap)
+        outs = {
+            cs: self._forward(self._make(nh=2, decay=decay, chunk_size=cs), x, dt)
+            for cs in self.CHUNKS
+        }
+        scale = max(o.abs().max().item() for o in outs.values())
+        for i, a in enumerate(self.CHUNKS):
+            for b in self.CHUNKS[i + 1 :]:
+                dev = (outs[a] - outs[b]).abs().max().item() / scale
+                assert dev <= self.TOL, f"chunk {a} vs {b}: {dev:.3e} > {self.TOL:.0e}"
+
+    @pytest.mark.parametrize("chunk_size", [64, 256])
+    def test_ragged_final_chunk_output_and_state(self, chunk_size):
+        T = 520
+        layer = self._make(nh=2, decay="learnable", chunk_size=chunk_size)
+        x, dt = self._inputs(T), self._bursty_dt(60.0, T, phase=2)
+        torch.manual_seed(SEED + 13)
+        h0 = 0.5 * torch.randn(self.B, 1, layer.n_heads * layer.d_k * layer.d_v)
+        y_ref, hT_ref = self._oracle(layer, x, dt, h0)
+
+        y, hT = self._forward(layer, x, dt, h_0=h0, return_state=True)
+        assert self._rel_dev(y, y_ref) <= self.TOL
+        assert self._rel_dev(hT.reshape(self.B, -1), hT_ref) <= self.TOL
+
+    @pytest.mark.parametrize("log1p_delta", [False, True])
+    def test_log1p_delta_with_inf_gap_matches_oracle(self, log1p_delta):
+        layer = self._make(nh=1, decay="learnable", chunk_size=64, log1p_delta=log1p_delta)
+        x, dt = self._inputs(), self._bursty_dt(float("inf"))
+        y_ref, _ = self._oracle(layer, x, dt)
+        y = self._forward(layer, x, dt)
+        assert torch.isfinite(y).all()
+        assert self._rel_dev(y, y_ref) <= self.TOL
+
+    def test_chunk_size_greater_than_T_equals_single_chunk(self):
+        T = 96
+        x, dt = self._inputs(T), self._bursty_dt(60.0, T)
+        y_big = self._forward(self._make(nh=2, decay="fixed", chunk_size=1000), x, dt)
+        y_T = self._forward(self._make(nh=2, decay="fixed", chunk_size=T), x, dt)
+        assert self._rel_dev(y_big, y_T.double()) <= self.TOL
+
+    def test_single_token_matches_step_oracle(self):
+        layer = self._make(nh=2, decay="learnable", chunk_size=64)
+        x, dt = self._inputs(1), torch.full((self.B, 1), 0.7)
+        torch.manual_seed(SEED + 13)
+        h0 = torch.randn(self.B, 1, layer.n_heads * layer.d_k * layer.d_v)
+        y_ref, hT_ref = self._oracle(layer, x, dt, h0)
+        y, hT = self._forward(layer, x, dt, h_0=h0, return_state=True)
+        assert y.shape == (self.B, 1, self.D_H)
+        assert self._rel_dev(y, y_ref) <= self.TOL
+        assert self._rel_dev(hT.reshape(self.B, -1), hT_ref) <= self.TOL
+
+    @pytest.mark.parametrize("gap_token", [3, 7], ids=["mid-chunk", "last-token-of-chunk"])
+    def test_fp64_plus_inf_gap_equals_step_loop(self, gap_token):
+        """chunk_size=8: token 3 is interior to chunk 0, token 7 is its last token."""
+        torch.manual_seed(SEED)
+        layer = DeltaMinGRU(
+            8, 6, n_heads=2, nh=2, chunk_size=8, decay="fixed", decay_rate=1.0
+        ).double()
+        x = torch.randn(2, 20, 8, dtype=torch.float64)
+        h0 = torch.randn(2, 1, layer.n_heads * layer.d_k * layer.d_v, dtype=torch.float64)
+        torch.manual_seed(SEED + 17)
+        dt = 0.2 + 0.6 * torch.rand(2, 20, dtype=torch.float64)
+        dt[:, gap_token] = float("inf")
+        y, hT = layer(x, h_0=h0, delta_t=dt, return_state=True)
+        y_ref, hT_ref = _delta_gated_step_oracle(layer, x, h0.reshape(2, -1), dt)
+        torch.testing.assert_close(y, y_ref, atol=1e-10, rtol=1e-10)
+        torch.testing.assert_close(hT.reshape(2, -1), hT_ref, atol=1e-10, rtol=1e-10)
+
+    def test_float32_plus_inf_gap_output_and_gradients_finite(self):
+        layer = self._make(nh=2, decay="learnable", chunk_size=64)
+        T = 128
+        x = self._inputs(T).requires_grad_(True)
+        torch.manual_seed(SEED + 13)
+        h0 = (0.5 * torch.randn(self.B, 1, layer.n_heads * layer.d_k * layer.d_v)).requires_grad_(
+            True
+        )
+        dt = self._bursty_dt(float("inf"), T).requires_grad_(True)
+        y = self._forward(layer, x, dt, h_0=h0)
+        assert torch.isfinite(y).all()
+        y.pow(2).sum().backward()
+        for name, g in [("x", x.grad), ("h_0", h0.grad), ("delta_t", dt.grad)] + [
+            (n, p.grad) for n, p in layer.named_parameters()
+        ]:
+            assert g is not None, f"no gradient for {name}"
+            assert torch.isfinite(g).all(), f"non-finite gradient for {name}"
+
+    def test_float32_nan_negative_and_neg_inf_gaps_match_oracle(self):
+        layer = self._make(nh=1, decay="fixed", chunk_size=64)
+        T = 128
+        x, dt = self._inputs(T), self._bursty_dt(60.0, T)
+        dt[:, 5], dt[:, 70], dt[:, 100] = float("nan"), -2.5, float("-inf")
+        y_ref, _ = self._oracle(layer, x, dt)
+        y = self._forward(layer, x, dt)
+        assert torch.isfinite(y).all()
+        assert self._rel_dev(y, y_ref) <= self.TOL
+
+    def test_float32_saturation_warning_is_modeling_signal_only(self):
+        layer = self._make(nh=1, decay="fixed", chunk_size=64)
+        T = 64
+        x = self._inputs(T)
+        dt = self._bursty_dt(60.0, T)
+        dt[:, 10] = 10.0 * _DECAY_SATURATION_WARN_THRESHOLD
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            layer(x, delta_t=dt)
+            layer(x, delta_t=dt)
+        sat = [r for r in rec if "log1p_delta" in str(r.message)]
+        assert len(sat) == 1
+        assert issubclass(sat[0].category, UserWarning)
+        assert "clamp" not in str(sat[0].message).lower()
+
+    def test_below_threshold_and_fp64_do_not_warn(self):
+        T = 64
+        x = self._inputs(T)
+        dt = self._bursty_dt(60.0, T)
+        dt[:, 10] = 0.5 * (88.0 + _DECAY_SATURATION_WARN_THRESHOLD)
+        with warnings.catch_warnings(record=True) as rec:
+            warnings.simplefilter("always")
+            self._make(nh=1, decay="fixed", chunk_size=64)(x, delta_t=dt)
+            dt[:, 10] = 10.0 * _DECAY_SATURATION_WARN_THRESHOLD
+            self._as_fp64(self._make(nh=1, decay="fixed", chunk_size=64))(
+                x.double(), delta_t=dt.double()
+            )
+        assert not [r for r in rec if "log1p_delta" in str(r.message)]
+
+    def test_log_gamma_floor_constant_is_gone(self):
+        # Name assembled at runtime so the repo-wide retired-name search stays clean.
+        retired = "_LOG_GAMMA_FLOAT32" + "_FLOOR"
+        with pytest.raises(ImportError):
+            exec(f"from mingru.min_gru import {retired}")

@@ -830,30 +830,15 @@ _DELTA_T_POSINF_CAP = 1e10
 # last-layer-only decay.
 _DECAY_MIXER_KWARGS = ("decay", "decay_rate", "log1p_delta")
 
-# Float32 stabilization floor for the gated DeltaMinGRU forward's per-token
-# log_gamma (= -lambda * dt) before the per-chunk cumulative sum (see
-# DeltaMinGRU._forward_chunked_gated). A token whose lambda*dt is enormous
-# (raw gap >~ 1e6, or a sanitized +inf -> the frozen _DELTA_T_POSINF_CAP of
-# 1e10) makes one log_gamma term so large that, in float32, it destroys the
-# cumulative-log precision of its chunk-mates -- their post-gap RELATIVE
-# decay collapses, breaking tiling-invariance and step-oracle agreement by
-# ~0.1-0.5 (finiteness still holds). Because exp(-88) ~ 6e-39 is already
-# float32-zero, clamping log_gamma to this floor is a log-sum-exp-style
-# stabilization: the clamped token's memory is wiped exactly as the
-# sequential oracle wipes it (gamma = 0), while the bounded intermediate
-# keeps the cumsum precise (restores oracle agreement to ~6e-7). -88 measured
-# best in a sweep (safe band [-1000, -40]; deeper re-plateaus). fp64 needs no
-# clamp -- its exponent range absorbs the 1e10 cap -- so it is left unclamped
-# and bit-identical.
-_LOG_GAMMA_FLOAT32_FLOOR = -88.0
-
 # Pathological-saturation warn threshold on lambda*dt for the float32 gated
-# DeltaMinGRU forward (see DeltaMinGRU._forward_chunked_gated). float32 error
-# crosses 1e-3 at lambda*dt ~ 1e5; this threshold sits one decade below that
-# knee. Past it, a once-per-instance warning advises log1p_delta=True or gap
-# rescaling. The clamp above already keeps the result correct; the warning is
-# a modeling signal, not a correctness crutch. fp64's equivalent knee is
-# ~1e14 (safe under the 1e10 cap for moderate lambda), so fp64 never warns.
+# DeltaMinGRU forward (see DeltaMinGRU._forward_chunked_gated). The forward's
+# decay factors are direct span sums, so a saturated gap needs no special
+# handling for accuracy: its factor underflows to an exact 0, wiping carried
+# memory just as the sequential step does, and no other token is affected.
+# The warning is purely a modeling signal: past this threshold (one decade
+# below where float32 resolves gap magnitudes at all) saturated gaps become
+# indistinguishable from one another, and a once-per-instance warning advises
+# log1p_delta=True or gap rescaling. fp64 never warns.
 _DECAY_SATURATION_WARN_THRESHOLD = 1e4
 
 
@@ -2862,7 +2847,7 @@ class DeltaMinGRU(DecayMixin, nn.Module):
     by that token's ``gamma`` once at the token boundary, before the
     token's ``nh`` micro-steps run undecayed (``step``, spec "Sequential
     gated recurrence"). The chunked-WY ``forward`` realizes the same
-    gated recurrence in parallel via log-space decay-ratio weighting of
+    gated recurrence in parallel via span-sum decay weighting of
     the same UT-transform solve (``_forward_chunked_gated``), so it stays
     tiling-invariant and matches ``step`` token-by-token. The decay-active
     forward is eager-only (no Triton decay path yet). ``decay=None`` (the
@@ -2919,8 +2904,8 @@ class DeltaMinGRU(DecayMixin, nn.Module):
         always sanitized to finite, non-negative values (with a
         once-per-instance courtesy warning; CPU only), shared with the
         other mixers via ``_normalize_delta_t``. See ``forward`` for the
-        additional float32 large-gap saturation clamp/warning specific to
-        the gated delta forward.
+        float32 large-gap saturation warning specific to the gated delta
+        forward.
 
     Raises
     ------
@@ -3028,7 +3013,7 @@ class DeltaMinGRU(DecayMixin, nn.Module):
             nn.Linear(input_size, n_heads, bias=bias) for _ in range(nh)
         )
         self.out_proj = nn.Linear(n_heads * self.d_v, hidden_size, bias=bias)
-        # Warn-once flag for the float32 gated-forward saturation guard (see
+        # Warn-once flag for the float32 gated-forward saturation warning (see
         # _forward_chunked_gated). A plain bool attr, not a param/buffer, so it
         # never touches the decay=None state_dict layout or bit-identity. Set
         # BEFORE _init_decay to preserve the construct-decay-last discipline.
@@ -3221,55 +3206,89 @@ class DeltaMinGRU(DecayMixin, nn.Module):
         y = torch.cat(y_chunks, dim=2).permute(0, 2, 1, 3)  # (B, T, n_heads, d_v)
         return y, H
 
+    @staticmethod
+    def _span_log_decay(log_gamma: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Direct span sums of per-token log-decay within one chunk.
+
+        With ``l_s`` the chunk's per-token log-decay, returns
+        ``span[..., i, l] = sum_{s=l+1}^{i} l_s`` for ``l <= i`` (so
+        ``span[..., i, i] = 0``) and ``logP[..., i] = sum_{s=0}^{i} l_s``.
+        Each entry accumulates only its own span's terms (a reverse
+        cumulative sum over a row that holds ``l_s`` for ``s <= i`` and
+        ``0`` elsewhere); no entry is the difference of two running sums,
+        so a huge saturated term affects exactly the spans that contain it.
+        Entries with ``l > i`` are ``0`` here and are excluded by the
+        caller's ``-inf`` fill before ``exp``.
+
+        Parameters
+        ----------
+        log_gamma : torch.Tensor
+            Per-token log-decay for one chunk, shape ``(B, H_dim, C)``,
+            all ``<= 0``.
+
+        Returns
+        -------
+        tuple of torch.Tensor
+            ``(span, logP)`` with shapes ``(B, H_dim, C, C)`` and
+            ``(B, H_dim, C)``, in ``log_gamma``'s dtype.
+        """
+        C = log_gamma.shape[-1]
+        rows = log_gamma.unsqueeze(-2).expand(*log_gamma.shape[:-1], C, C)
+        causal_terms = torch.tril(rows)  # [i, s] = l_s for s <= i, else 0 (selection)
+        tail = causal_terms.flip(-1).cumsum(-1).flip(-1)  # [i, a] = sum_{s=a}^{i} l_s
+        span = torch.cat([tail[..., 1:], tail.new_zeros(*tail.shape[:-1], 1)], dim=-1)
+        return span, tail[..., 0]
+
     def _forward_chunked_gated(
         self, x: torch.Tensor, H: torch.Tensor, dt: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Gated chunked-WY forward: per-token time decay via log-space ratios.
+        """Gated chunked-WY forward: per-token time decay via span-sum factors.
 
         Threads a per-token time-decay gate through the *same* unit-
         triangular UT-transform solve as ``_forward_chunked`` (spec
-        section 6 "Parallel gated forward", log-space decay-ratio form).
-        Deliberately mirrors that method's structure -- the ``KK`` /
-        ``strict_lower`` / ``read_mask`` / ``eye_M`` pieces and the
-        ``solve_triangular`` call are the same -- adding only the decay
-        weighting, so the two forwards diff cleanly and the decay-free
-        path stays physically the same code (spec section 8).
+        section 6 "Parallel gated forward"). Deliberately mirrors that
+        method's structure -- the ``KK`` / ``strict_lower`` / ``read_mask``
+        / ``eye_M`` pieces and the ``solve_triangular`` call are the same
+        -- adding only the decay weighting, so the two forwards diff
+        cleanly and the decay-free path stays physically the same code
+        (spec section 8).
 
         The sequential gated recurrence (``step``'s math) decays carried
         memory once per token *before* that token's ``nh`` micro-steps
         run undecayed: ``H_t = gamma_t * A_t H_{t-1} + B_t``, where
         ``A_t``/``B_t`` are the token's Householder product and writes.
-        With the chunk-relative cumulative log-decay ``logP_t = sum_{s in
-        [start, t]} log gamma_s`` (reset to 0 at each chunk start, so
-        ``P_t = exp(logP_t) in (0, 1]``), decay enters the solve, readout,
-        and carry ONLY as ratios ``exp(logP_a - logP_b)`` with ``a >= b``
-        (exponent ``<= 0``, value in ``(0, 1]``) -- the state is never
-        rescaled by a bare ``1 / Gamma`` (which underflows/overflows to
-        ``nan`` in float32 under strong decay). Concretely, per chunk:
+        Within a chunk, with ``l_s = log gamma_s`` the per-token
+        log-decay, every decay factor is ``exp`` of a *span sum*
+        ``span[i, l] = sum_{s=l+1}^{i} l_s`` (see ``_span_log_decay``)
+        accumulated from only that span's own terms, never obtained by
+        subtracting two running sums. Each exponent is ``<= 0``, so each
+        factor lies in ``[0, 1]`` and the state is never rescaled by a
+        bare ``1 / Gamma``. ``tau`` maps a micro-step to its token.
+        Concretely, per chunk:
 
         - the ``T`` off-diagonal ``beta_l (k_l . k_i)`` (``l < i``) is
-          weighted by ``exp(logP_i - logP_l)``;
-        - ``rhs_i = v_i - exp(logP_i) * (K H_0)_i`` (the carried-state
-          term scaled by ``P_i <= 1``; values ``v_i`` are NOT divided), so
+          weighted by ``exp(span[tau(i), tau(l)])`` (``1`` for two
+          micro-steps of the same token, which run undecayed);
+        - ``rhs_i = v_i - exp(logP_tau(i)) * (K H_0)_i`` (the carried-state
+          term scaled by ``P <= 1``; values ``v_i`` are NOT divided), so
           ``U`` holds the true pseudo-values (not tilde-rescaled);
-        - the readout is ``y_t = exp(logP_t) * (q_t . H_0) + sum_{l <= t}
-          exp(logP_t - logP_l) * beta_l (q_t . k_l) u_l``;
-        - the chunk-end carry is ``H_M = exp(logP_C) * H_0 + sum_l
-          exp(logP_C - logP_l) * beta_l k_l u_l^T`` with ``logP_C`` the
-          full chunk's cumulative log-decay; ``H_M`` carries to the next
-          chunk (whose ``logP`` resets to 0 -- no cross-chunk product).
+        - the readout is ``y_t = exp(logP_t) * (q_t . H_0) + sum_{l: tau(l)
+          <= t} exp(span[t, tau(l)]) * beta_l (q_t . k_l) u_l``;
+        - the chunk-end carry is ``H_M = exp(logP_{C-1}) * H_0 + sum_l
+          exp(span[C-1, tau(l)]) * beta_l k_l u_l^T``; ``H_M`` carries to
+          the next chunk (whose spans restart -- no cross-chunk product).
 
-        Every decay factor is ``exp(<= 0) in (0, 1]``, so no intermediate
-        exceeds the inputs' magnitude and the output is finite in float32
-        across long sequences and strong decay. The unused upper triangle
-        / non-causal region (where the ratio's exponent would be positive)
-        is filled with ``-inf`` BEFORE ``exp`` so it becomes a clean ``0``
-        rather than ``inf`` (a masked ``0 * inf`` would be ``nan``); the
-        used region's genuine ``exp(<= 0)`` values pass through untouched.
+        A token whose ``lambda * dt`` is so large that ``gamma``
+        underflows drives only the factors whose span contains it to an
+        exact ``0`` (a full memory wipe, as in ``step``) and leaves every
+        other factor untouched, in float32 and float64 alike. No tensor
+        is wider than the inputs' dtype. The non-causal region of each
+        factor matrix is filled with ``-inf`` BEFORE ``exp`` so it becomes
+        a clean ``0`` (a masked ``0 * non-finite`` would be ``nan``).
 
         Only permitted division: the ``solve_triangular`` implicit unit
         diagonal (as in ``_forward_chunked``). Decay carries no division
-        -- it is entirely multiplicative ``exp(<= 0)`` ratios.
+        -- it is entirely multiplicative ``exp(<= 0)`` factors.
 
         Parameters
         ----------
@@ -3301,42 +3320,32 @@ class DeltaMinGRU(DecayMixin, nn.Module):
         # lines up with K_all's (B, n_heads, T, ...) axes. H_dim is 1 for
         # fixed decay (scalar lambda, broadcasts across heads) or n_heads
         # for learnable decay (one rate per head). log gamma <= 0 (lambda,
-        # dt >= 0), so all cumulative sums below are non-positive and every
-        # decay ratio exp(diff) with diff <= 0 lies in (0, 1].
+        # dt >= 0), so every span sum below is non-positive and every decay
+        # factor exp(span) lies in [0, 1].
         lam = self._decay_lambda()  # () (fixed) or (n_heads,) (learnable)
         log_gamma = -lam.reshape(1, -1, 1) * dt.unsqueeze(1)  # (B, H_dim, T)
 
-        # Float32 stabilization (spec sections 6/8). One token whose lambda*dt
-        # is enormous (raw gap >~ 1e6, or a sanitized +inf -> the frozen 1e10
-        # cap) makes a single log_gamma term large enough to wipe the
-        # cumulative-log precision of its chunk-mates in float32, collapsing
-        # their post-gap relative decay (breaks tiling-invariance / oracle
-        # agreement by ~0.1-0.5; finiteness still holds). On the low-precision
-        # (non-fp64) path: (1) warn once on the PRE-clamp magnitude -- it must
-        # see the raw huge value -- CPU-only to avoid a CUDA host sync (the
-        # same posture as _normalize_delta_t); (2) clamp the already-saturated
-        # (float32-zero) term to a representable floor before the cumsum, a
-        # log-sum-exp stabilization returning the correct fully-decayed answer.
-        # fp64 is left bit-identical: its exponent range absorbs the 1e10 cap,
-        # so neither the warn nor the clamp engages.
-        if log_gamma.dtype != torch.float64:
-            if (
-                not self._warned_fp32_decay_saturation
-                and log_gamma.device.type == "cpu"
-                and bool((log_gamma < -_DECAY_SATURATION_WARN_THRESHOLD).any())
-            ):
-                warnings.warn(
-                    "delta_t gaps are large enough that lambda*delta_t exceeds "
-                    f"{_DECAY_SATURATION_WARN_THRESHOLD:g}, saturating the gated "
-                    "float32 forward: the affected tokens fully wipe memory "
-                    "(handled correctly via an internal clamp) but very large "
-                    "gaps become indistinguishable from one another. Pass "
-                    "log1p_delta=True or rescale delta_t to keep large gaps "
-                    "distinguishable.",
-                    stacklevel=2,
-                )
-                self._warned_fp32_decay_saturation = True
-            log_gamma = log_gamma.clamp(min=_LOG_GAMMA_FLOAT32_FLOOR)
+        # Saturation warning (a modeling signal, not a correctness guard):
+        # past the threshold, saturated gaps are indistinguishable from one
+        # another. Once per instance, CPU only (avoids a CUDA host sync, the
+        # same posture as _normalize_delta_t), non-fp64 only. The factors
+        # themselves are accurate at any magnitude; see the docstring.
+        if (
+            log_gamma.dtype != torch.float64
+            and not self._warned_fp32_decay_saturation
+            and log_gamma.device.type == "cpu"
+            and bool((log_gamma < -_DECAY_SATURATION_WARN_THRESHOLD).any())
+        ):
+            warnings.warn(
+                "delta_t gaps are large enough that lambda*delta_t exceeds "
+                f"{_DECAY_SATURATION_WARN_THRESHOLD:g}, saturating the gated "
+                "float32 forward: the affected tokens fully wipe memory, but "
+                "very large gaps become indistinguishable from one another. "
+                "Pass log1p_delta=True or rescale delta_t to keep large gaps "
+                "distinguishable.",
+                stacklevel=2,
+            )
+            self._warned_fp32_decay_saturation = True
 
         chunk_size = self.chunk_size
         y_chunks = []
@@ -3349,46 +3358,41 @@ class DeltaMinGRU(DecayMixin, nn.Module):
             beta = beta_all[:, :, start:end].reshape(B, n_heads, M)
             Q = Q_all[:, :, start:end]  # (B, n_heads, C, d_k)
 
-            # Chunk-relative cumulative log-decay logP, reset to 0 at chunk
-            # start (logP_tok[..., 0] = log gamma_start). Per micro-step logP
-            # repeats each token's value nh times along M, matching the
-            # token-major/micro-step-minor axis K/V/beta were reshaped into.
-            logP_tok = torch.cumsum(log_gamma[:, :, start:end], dim=-1)  # (B, H_dim, C)
-            logP_micro = logP_tok.repeat_interleave(nh, dim=-1)  # (B, H_dim, M)
+            # Chunk-relative span sums (restart at each chunk). span_cm
+            # repeats each token's column nh times along M, matching the
+            # token-major/micro-step-minor axis K/V/beta were reshaped into;
+            # span_mm additionally repeats rows, giving micro-step x
+            # micro-step spans span[tau(i), tau(l)].
+            span, logP_tok = self._span_log_decay(log_gamma[:, :, start:end])
+            span_cm = span.repeat_interleave(nh, dim=-1)  # (B, H_dim, C, M)
+            span_mm = span_cm.repeat_interleave(nh, dim=-2)  # (B, H_dim, M, M)
+            P_tok = torch.exp(logP_tok)  # (B, H_dim, C), in [0, 1]
+            P_micro = P_tok.repeat_interleave(nh, dim=-1)  # (B, H_dim, M)
 
             KK = K @ K.transpose(-1, -2)  # (B, n_heads, M, M); k_i . k_l
             strict_lower = torch.tril(K.new_ones(M, M), diagonal=-1)
             eye_M = torch.eye(M, dtype=K.dtype, device=K.device)
-            # Off-diagonal decay ratio exp(logP_i - logP_l) on the strict-
-            # lower (i > l) region, where the exponent is <= 0. Fill the
-            # unused upper triangle + diagonal with -inf BEFORE exp so it is
-            # a clean 0 (a positive exponent there would overflow to inf in
-            # float32, and 0 * inf = nan); the diagonal comes from eye_M.
-            logratio_mm = logP_micro.unsqueeze(-1) - logP_micro.unsqueeze(-2)  # (B, H_dim, M, M)
-            decay_lower = torch.exp(logratio_mm.masked_fill(strict_lower == 0, float("-inf")))
+            # Off-diagonal factor exp(span[tau(i), tau(l)]) on the strict-
+            # lower (i > l) region. The unused upper triangle + diagonal is
+            # filled with -inf BEFORE exp so it is a clean 0; the diagonal
+            # comes from eye_M.
+            decay_lower = torch.exp(span_mm.masked_fill(strict_lower == 0, float("-inf")))
             T_mat = eye_M + KK * beta.unsqueeze(-2) * decay_lower  # unit lower-triangular
-            # rhs: carried-state term scaled by P_i = exp(logP_i) <= 1;
-            # values V are NOT divided. U holds the true pseudo-values.
-            rhs = V - torch.exp(logP_micro).unsqueeze(-1) * (K @ H)  # (B, n_heads, M, d_v)
+            # rhs: carried-state term scaled by P_i <= 1; values V are NOT
+            # divided. U holds the true pseudo-values.
+            rhs = V - P_micro.unsqueeze(-1) * (K @ H)  # (B, n_heads, M, d_v)
             U = torch.linalg.solve_triangular(T_mat, rhs, upper=False, unitriangular=True)
 
             R = Q @ K.transpose(-1, -2)  # (B, n_heads, C, M); q_t . k_l
             read_mask = torch.tril(Q.new_ones(C, C)).repeat_interleave(nh, dim=1)  # (C, M)
-            # Readout decay ratio exp(logP_t - logP_l) on the token-causal
-            # region (l up to token t's last micro-step, exponent <= 0);
-            # non-causal columns masked to -inf -> 0 before exp (same
-            # 0 * inf guard as above).
-            logratio_cm = logP_tok.unsqueeze(-1) - logP_micro.unsqueeze(-2)  # (B, H_dim, C, M)
-            decay_read = torch.exp(logratio_cm.masked_fill(read_mask == 0, float("-inf")))
-            y_chunk = (
-                torch.exp(logP_tok).unsqueeze(-1) * (Q @ H)
-                + (R * beta.unsqueeze(-2) * decay_read) @ U
-            )
-            # Chunk-end carry: full-chunk cumulative logP_C = logP at the
-            # last token (the minimum, so logP_C - logP_l <= 0 for all l).
-            logP_C = logP_tok[:, :, -1:]  # (B, H_dim, 1)
-            decay_carry = torch.exp(logP_C - logP_micro)  # (B, H_dim, M), exponent <= 0
-            P_C = torch.exp(logP_tok[:, :, -1]).unsqueeze(-1).unsqueeze(-1)  # (B, H_dim, 1, 1)
+            # Readout factor exp(span[t, tau(l)]) on the token-causal region
+            # (tau(l) <= t); non-causal columns filled with -inf -> 0 before
+            # exp (same 0 * non-finite guard as above).
+            decay_read = torch.exp(span_cm.masked_fill(read_mask == 0, float("-inf")))
+            y_chunk = P_tok.unsqueeze(-1) * (Q @ H) + (R * beta.unsqueeze(-2) * decay_read) @ U
+            # Chunk-end carry: the last token's span row, exp(span[C-1, tau(l)]).
+            decay_carry = torch.exp(span_cm[:, :, -1, :])  # (B, H_dim, M)
+            P_C = P_tok[:, :, -1].unsqueeze(-1).unsqueeze(-1)  # (B, H_dim, 1, 1)
             H = P_C * H + K.transpose(-1, -2) @ ((decay_carry * beta).unsqueeze(-1) * U)
             y_chunks.append(y_chunk)
 
@@ -3437,17 +3441,19 @@ class DeltaMinGRU(DecayMixin, nn.Module):
             unconditionally through ``_delta_scan_should_try``/
             ``_dispatch_delta_scan`` exactly as before.
 
-            Under float32, a token whose ``lambda * delta_t`` is very
-            large (a raw gap of roughly ``1e4`` or more, or a sanitized
-            ``+inf``) saturates the decay: the gated forward then emits a
-            one-time ``UserWarning`` (CPU only) and internally clamps the
-            per-token log-decay to a float32-safe floor. Output stays
-            finite, tiling-invariant, and oracle-matching -- the affected
-            token's memory is fully wiped, exactly as the sequential
-            ``step`` computes it at ``gamma = 0``. Pass
-            ``log1p_delta=True`` or rescale ``delta_t`` to keep very
-            large gaps distinguishable rather than all saturating to a
-            full wipe. fp64 is unaffected (no clamp, no warning).
+            The decay factors are direct span sums of the per-token
+            log-decay, so output, final state, and gradients match the
+            sequential ``step`` to working-precision rounding at every
+            ``chunk_size`` and for any gap pattern, including a sanitized
+            ``+inf``: a token whose ``gamma`` underflows fully wipes
+            carried memory (as ``step`` does at ``gamma = 0``) without
+            affecting any other token. Under float32, a token whose
+            ``lambda * delta_t`` exceeds ``_DECAY_SATURATION_WARN_THRESHOLD``
+            emits a one-time ``UserWarning`` (CPU only): this is a
+            modeling signal, since such saturated gaps are
+            indistinguishable from one another. Pass ``log1p_delta=True``
+            or rescale ``delta_t`` to keep very large gaps distinguishable.
+            fp64 never warns.
         return_state : bool, default=False
             If True, also return the final state ``h_T`` (same
             flattened shape as ``h_0``).
@@ -3475,7 +3481,7 @@ class DeltaMinGRU(DecayMixin, nn.Module):
                 raise ValueError(f"h_0 must have shape {expected} (got {tuple(h_0.shape)})")
             H = h_0.reshape(B, self.n_heads, self.d_k, self.d_v)
         if dt is not None:
-            # Decay active: eager-only gated forward (log-space decay-ratio
+            # Decay active: eager-only gated forward (span-sum decay
             # weighting of the same UT solve). Triton is decay-free, so the
             # fused path is intentionally bypassed here (spec section 4) --
             # the guard below applies the MINGRU_SCAN contract (fail-loud
