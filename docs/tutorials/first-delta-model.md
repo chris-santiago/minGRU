@@ -242,7 +242,7 @@ gap before event:   [0.0, 1.0, 1.0, 20000.0, 1.0, 1.0]
 state norm, gapped:  ['1.383', '1.458', '1.462', '1.383', '1.458', '1.462']
 state norm, control: ['1.383', '1.586', '1.616', '1.621', '1.622', '1.622']
 warnings raised: 1
-warning: delta_t gaps are large enough that lambda*delta_t exceeds 10000, saturating the gated float32 forward: the affected tokens fully wipe memory (handled correctly via an internal clamp) but very large gaps become indistinguishable from one another. Pass log1p_delta=True or rescale delta_t to keep large gaps distinguishable.
+warning: delta_t gaps are large enough that lambda*delta_t exceeds 10000, saturating the gated float32 forward: the affected tokens fully wipe memory, but very large gaps become indistinguishable from one another. Pass log1p_delta=True or rescale delta_t to keep large gaps distinguishable.
 ```
 
 Read the two trajectories side by side. `control` accumulates monotonically and settles as the same token keeps writing into memory. `gapped` tracks `control` for the first three events, then the huge gap resets the norm from `1.462` back down to `1.383`, exactly the norm after the *first* event, and the following two entries (`1.458`, `1.462`) repeat the first two events' values exactly. The gap did not just shrink the state, it wiped it back to a fresh start, and the warning you were told to expect fired right on cue.
@@ -289,5 +289,5 @@ You constructed a `["signed", "delta"]` stack with an explicit `n_heads`/`nh` bu
 
 - [Choose a mixer](../how-to/choose-a-mixer.md#the-two-axis-guidance): the full state-vs-extrapolation trade-off between `DeltaMinGRU` and `GivensMinGRU`.
 - [Enable time decay](../how-to/enable-time-decay.md#delta-decay-eager-only): the how-to recipe for `decay=`/`delta_t`, including the `decay_layers` knob for mixed stacks.
-- [Givens & Delta deep dive](../explanation/givens-delta.md#time-aware-decay-on-the-delta-rule-memory): why the chunked-WY parallel form survives per-token decay, and the float32 clamp's derivation.
+- [Givens & Delta deep dive](../explanation/givens-delta.md#time-aware-decay-on-the-delta-rule-memory): why the chunked-WY parallel form survives per-token decay, and the derivation of the float32 span-sum decay ratios.
 - [Benchmark validation](../explanation/benchmark-validation.md): where delta is the dominant mechanism across public tasks (associative recall, order-sensitive accumulation) and where it is not.

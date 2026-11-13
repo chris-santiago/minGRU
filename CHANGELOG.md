@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Float32 decay accuracy in `DeltaMinGRU`.** The decay-active forward formed each decay ratio as a difference of two running log-decay sums, which lost float32 precision once several large gaps shared a chunk and made accuracy depend on `chunk_size`. Each ratio is now a direct sum over only the tokens it spans, so the forward matches the sequential `step` oracle at every `chunk_size`. This replaces the internal saturation clamp and its floor constant, and also fixes the same loss in float64 after a sanitized `+inf` gap. The saturation warning remains, now worded as a modeling signal.
+- **Mismatched `delta_t` dtype.** A float64 `delta_t` (the numpy and pandas default) passed to a float32 stack crashed with a dtype error that never named `delta_t`. `delta_t` is now converted to the input's dtype, never narrower than float32, at `MinGRUBlock` and `DeltaMinGRU` `forward` and `step`.
+- **Zero-length sequences in `DeltaMinGRU`.** `forward` raised `ValueError` when $T = 0$. It now returns an empty `(B, 0, hidden)` output with the state unchanged, as the other four mixers do.
+
+### Changed
+
+- **Decay-active float32 outputs of `DeltaMinGRU` change.** Outputs differ from 0.2.0 at rounding level, and by up to the old error on bursty inputs with several large gaps in one chunk. `decay=None` is bit-identical.
+- **Documentation.** The delta kernel's `MINGRU_SCAN=auto` region is described as extrapolated from one measured L4 cell, not a measured region. The chunked-vs-sequential tolerance figures are qualified as measured on a randomly initialized layer and larger as $\beta \to 2$. The README and time-decay how-to now state that the float32 `mixer="log"` forward loses accuracy as the running total of $\lambda f(\Delta t)$ grows (a sanitized `+inf` gap in raw mode corrupts the rest of the sequence), that `log1p_delta=True` or gaps in units comparable to $1/\lambda$ keep it accurate, and that `step` and the signed, rotation, and Givens mixers are unaffected. `DeltaMinGRU`'s departures from DeltaNet are disclosed in its docstring.
+
 ## [0.2.0] - 2026-07-21
 
 Adds the `DeltaMinGRU` delta-rule composer and its ecosystem. Backward

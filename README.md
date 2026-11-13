@@ -45,7 +45,7 @@ The optional Triton scan backend is imported lazily on first use of a Triton-bac
 
 An optional Triton backend supplies fused forward+backward GPU kernels for all four scan primitives (`linear_scan`, `matrix_scan`, `matrix_affine_scan`, `parallel_scan_log`) plus an angle-fused rotation path for `GivensMinGRU`. It sits behind a zero-config dispatch seam set by `MINGRU_SCAN`: `auto` (default: use Triton when a CUDA GPU and a working Triton install are present, else the pure-PyTorch eager path), `eager`, or `triton` (force it). CPU-only installs never import Triton.
 
-The win is concentrated in the matrix/block ops. Measured on an NVIDIA L4 (torch 2.8.0+cu128, Triton 3.4.0), forward+backward the Triton kernels run 39x–168x faster than eager on `matrix_scan`/`matrix_affine_scan`, and the angle-fused `GivensMinGRU` backward cuts peak memory from 395 MB to 38 MB. The log-space `parallel_scan_log` is the exception. Its recompute-in-backward kernel is 0.70x–0.80x *slower* than eager forward+backward, so eager stays the right default for the baseline `MinGRU`/`SignedMinGRU` mixers. All 590 CPU-vs-GPU parity checks pass. `DeltaMinGRU`'s chunked-WY `forward` is not one of these scan ops: it has its own Triton kernel (forward trio + torch-composed backward, gated separately), but `torch.compile`, not this kernel, is the recommended CUDA path for `mixer="delta"`. A GPU probe found `torch.compile` recovers 68–89% of the available fusion headroom, while the kernel runs 1.85x–3.79x slower than compile on every probed shape; under `MINGRU_SCAN=auto` the kernel therefore engages only in a narrow measured win region (long sequences, narrow head dims), where it beats eager and saves ~3x memory, and stays eager everywhere else (see "Delta variant," below). Kernel design and the full benchmark tables are in the [Triton scan kernels explanation](https://chris-santiago.github.io/minGRU/explanation/triton-scans/) and `experiments/bench/` (`scan_bench.md`, `scan_memory.md`, `scan_parity.md`).
+The win is concentrated in the matrix/block ops. Measured on an NVIDIA L4 (torch 2.8.0+cu128, Triton 3.4.0), forward+backward the Triton kernels run 39x–168x faster than eager on `matrix_scan`/`matrix_affine_scan`, and the angle-fused `GivensMinGRU` backward cuts peak memory from 395 MB to 38 MB. The log-space `parallel_scan_log` is the exception. Its recompute-in-backward kernel is 0.70x–0.80x *slower* than eager forward+backward, so eager stays the right default for the baseline `MinGRU`/`SignedMinGRU` mixers. All 590 CPU-vs-GPU parity checks pass. `DeltaMinGRU`'s chunked-WY `forward` is not one of these scan ops: it has its own Triton kernel (forward trio + torch-composed backward, gated separately), but `torch.compile`, not this kernel, is the recommended CUDA path for `mixer="delta"`. A GPU probe found `torch.compile` recovers 68–89% of the available fusion headroom, while the kernel runs 1.85x–3.79x slower than compile on every probed shape; under `MINGRU_SCAN=auto` the kernel therefore engages only in a narrow region (long sequences, narrow head dims) extrapolated from one measured L4 cell, where it beat eager and saved ~3x memory at that cell, and stays eager everywhere else (see "Delta variant," below). Kernel design and the full benchmark tables are in the [Triton scan kernels explanation](https://chris-santiago.github.io/minGRU/explanation/triton-scans/) and `experiments/bench/` (`scan_bench.md`, `scan_memory.md`, `scan_parity.md`).
 
 ## Benchmark validation
 
@@ -1134,34 +1134,7 @@ speed. Fit-only length generalization at 16x train length stays small-
 state-favoring on GPU too: givens 0.679, delta@64-matched 0.699, both
 ahead of delta@1024's 0.570.
 
-**The resulting recommendation is conditioned on two axes, not one
-winner.** State free to grow → `mixer="delta"` at native state: the most
-reliable composer measured on either stratum (12/12 CPU, 35/36 GPU), flat
-cost in state size. State that must stay small (a matched 64-element
-budget) → `GivensMinGRU`: decisively more reliable at that budget on the
-stratum with the power to show it, and its small-state fit cohort
-extrapolates further at extreme length than the full-state delta cohort.
-Do not read delta@64's low pooled accuracy as "delta is less accurate":
-its trained models generalize like Givens' when they fit (matched-state
-fit-only 0.721 delta vs 0.733 givens at T=1024); the low pooled mean is a
-fit-rate artifact. Delta@1024 is in fact the most accurate arm at or near
-training length on both strata (CPU: 1.000@64/0.988@256; GPU:
-0.984@64/0.971@256) and only trails on the long-extrapolation tail. On
-GPU, delta's recommended path is `torch.compile`: a fusion-headroom
-probe (`experiments/bench/gpu_delta_probe.md`, NVIDIA L4) found compile
-recovers 68-89% of available headroom. A hand-written Triton chunked-WY
-kernel now exists but does not reach compile-class speed (1.85x-3.79x
-slower than compile on every probed shape; a fully fused Triton backward
-was 8-12x slower and was reverted; the same relative gap holds on an
-A100, a separate stratum), so `MINGRU_SCAN=auto` engages it only in a
-narrow measured win region (long sequences, narrow head dims) where it
-beats eager (0.61x) and saves ~3x peak memory, and stays eager
-otherwise. Remaining caveat: no comparison against the incumbents'
-released tuned kernels has been measured. Full mechanism, tables, and Fisher statistics for both
-composers are at the docs site's
-[Givens & Delta deep dive](https://chris-santiago.github.io/minGRU/explanation/givens-delta/)
-and in `experiments/EXPERIMENTS.md` (rounds `hetero-loop-20-pd64`,
-`hetero-loop-21-pd1024`, `hetero-gpu36-*`).
+**The resulting recommendation is conditioned on two axes, not one winner.** State free to grow → `mixer="delta"` at native state: the most reliable composer measured on either stratum (12/12 CPU, 35/36 GPU), flat cost in state size. State that must stay small (a matched 64-element budget) → `GivensMinGRU`: decisively more reliable at that budget on the stratum with the power to show it, and its small-state fit cohort extrapolates further at extreme length than the full-state delta cohort. Do not read delta@64's low pooled accuracy as "delta is less accurate": its trained models generalize like Givens' when they fit (matched-state fit-only 0.721 delta vs 0.733 givens at T=1024); the low pooled mean is a fit-rate artifact. Delta@1024 is in fact the most accurate arm at or near training length on both strata (CPU: 1.000@64/0.988@256; GPU: 0.984@64/0.971@256) and only trails on the long-extrapolation tail. On GPU, delta's recommended path is `torch.compile`: a fusion-headroom probe (`experiments/bench/gpu_delta_probe.md`, NVIDIA L4) found compile recovers 68-89% of available headroom. A hand-written Triton chunked-WY kernel now exists but does not reach compile-class speed (1.85x-3.79x slower than compile on every probed shape; a fully fused Triton backward was 8-12x slower and was reverted; the same relative gap holds on an A100, a separate stratum), so `MINGRU_SCAN=auto` engages it only in a narrow region (long sequences, narrow head dims) extrapolated from one measured L4 cell (B=128, nh=2, chunk_size=64, d_k=16, T=1024; batch size, nh, and chunk_size were not varied), where it beat eager (0.61x) and saved ~3x peak memory at that cell, and stays eager otherwise. Remaining caveat: no comparison against the incumbents' released tuned kernels has been measured. Full mechanism, tables, and Fisher statistics for both composers are at the docs site's [Givens & Delta deep dive](https://chris-santiago.github.io/minGRU/explanation/givens-delta/) and in `experiments/EXPERIMENTS.md` (rounds `hetero-loop-20-pd64`, `hetero-loop-21-pd1024`, `hetero-gpu36-*`).
 
 `DeltaMinGRU`'s time-decay support — a per-token gate on the carried
 matrix state, distinct from the other mixers' per-step scalar decay —
@@ -1221,38 +1194,7 @@ decayed, in every mixer:
 Because `lambda >= 0` and `delta_t >= 0`, `gamma` is always in `(0,
 1]`: decay can only shrink the transition, never amplify it.
 
-**The `delta_t` contract.** `delta_t` is `(B, T)` or `(B, T, 1)` to
-`forward` (squeezed internally), `(B,)` or `(B, 1)` to `step`.
-`delta_t[:, t]` is the gap *preceding* event `t`. `delta_t = 0` gives
-`gamma = 1` exactly, no discount, and this holds at every position,
-**including `t = 0`**: there is no implicit "first event is exempt
-from decay" special case (see design notes, below); callers
-who want no decay at the start of a sequence pass `delta_t[:, 0] = 0`
-themselves. Negative entries are clamped to `0` with a
-once-per-module-instance warning (a data-quality event, not a hard
-error; the check runs on CPU tensors only; on CUDA it is skipped
-rather than forcing a host sync, though the clamp always applies).
-`log1p_delta=True` applies `log1p` before scaling by `lambda`,
-useful when raw gaps span orders of magnitude, compressing the
-range `lambda` needs to operate over. For `DeltaMinGRU` under
-float32, very large or `+inf` gaps (sentinel or corrupted
-timestamps) are handled correctly automatically: its chunked forward
-carries a per-token cumulative log-decay, and an internal float32
-clamp on that log-decay keeps output finite, chunk-size invariant,
-and matching the sequential `step` oracle even when a gap saturates
-(the affected token's memory is fully wiped, exactly as the oracle
-wipes it at `gamma = 0`). When a gap is large enough to saturate, the
-module emits a once-per-instance warning naming `log1p_delta` (on CPU
-inputs only; the correctness clamp always applies, but the warning is
-skipped on CUDA to avoid a host sync).
-`log1p_delta=True` is then *recommended*, not required for
-correctness, if you want very large gaps to stay *distinguishable*
-from one another rather than all saturating to a full wipe: it maps
-the gap through `log1p` first (`1e10 -> ~23`), keeping distinct large
-gaps distinct. The other four mixers apply decay per step with no
-chunk-cumulative log and are unaffected. Passing `delta_t` with
-decay disabled, or enabling decay without passing `delta_t`, both
-raise `ValueError` at call time.
+**The `delta_t` contract.** `delta_t` is `(B, T)` or `(B, T, 1)` to `forward` (squeezed internally), `(B,)` or `(B, 1)` to `step`. `delta_t[:, t]` is the gap *preceding* event `t`. `delta_t = 0` gives `gamma = 1` exactly, no discount, and this holds at every position, **including `t = 0`**: there is no implicit "first event is exempt from decay" special case (see design notes, below); callers who want no decay at the start of a sequence pass `delta_t[:, 0] = 0` themselves. Negative entries are clamped to `0` with a once-per-module-instance warning (a data-quality event, not a hard error; the check runs on CPU tensors only; on CUDA it is skipped rather than forcing a host sync, though the clamp always applies). `log1p_delta=True` applies `log1p` before scaling by `lambda`, useful when raw gaps span orders of magnitude, compressing the range `lambda` needs to operate over. For `DeltaMinGRU` under float32, very large or `+inf` gaps (sentinel or corrupted timestamps) are handled correctly automatically: its chunked forward builds every decay ratio as a direct sum of the per-token log-decay over only the tokens that ratio spans, never as a difference of two running sums, so output stays finite, chunk-size invariant, and matching the sequential `step` oracle even when a gap saturates (the affected token's memory is fully wiped, exactly as the oracle wipes it at `gamma = 0`, and no other token is affected). When a gap is large enough to saturate, the module emits a once-per-instance warning naming `log1p_delta` (on CPU inputs only; the warning is skipped on CUDA to avoid a host sync). `log1p_delta=True` is then *recommended*, not required for correctness, if you want very large gaps to stay *distinguishable* from one another rather than all saturating to a full wipe: it maps the gap through `log1p` first (`1e10 -> ~23`), keeping distinct large gaps distinct. `step` and the signed, rotation, and Givens mixers are unaffected by large gaps. The float32 `mixer="log"` (`MinGRU`) forward is not: it accumulates decay in a running log-sum over the whole sequence, so its accuracy degrades as the running total of `lambda * f(delta_t)` grows, and a sanitized `+inf` gap in raw mode corrupts the rest of that sequence. Passing `log1p_delta=True`, or expressing gaps in units comparable to `1 / lambda`, keeps it accurate. Passing `delta_t` with decay disabled, or enabling decay without passing `delta_t`, both raise `ValueError` at call time.
 
 **Two modes**, set via `decay=`:
 
