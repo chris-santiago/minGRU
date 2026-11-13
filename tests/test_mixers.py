@@ -1301,11 +1301,28 @@ class TestDeltaTDtypeReconciliation:
         assert torch.equal(y_t, y_tr) and torch.equal(h_t, h_tr)
 
     @pytest.mark.parametrize("mixer", _DECAY_MIXERS)
-    def test_float32_delta_t_into_float64_model(self, mixer):
+    def test_float32_delta_t_into_float64_model(self, mixer, monkeypatch):
+        import mingru.min_gru as mg
+
+        seen = []
+        real = mg._normalize_delta_t
+
+        def spy(delta_t, *args, **kwargs):
+            seen.append(delta_t)
+            return real(delta_t, *args, **kwargs)
+
+        monkeypatch.setattr(mg, "_normalize_delta_t", spy)
         model = _decay_stack(mixer).double()
         x = torch.randn(B, T, D_IN, dtype=torch.float64)
-        out, _ = model(x, delta_t=torch.rand(B, T))
+        dt = torch.rand(B, T)
+        out, _ = model(x, delta_t=dt)
         assert out.dtype == torch.float64
+        # Every mixer must receive the gaps as float64 (not merely produce float64
+        # output through type promotion), and with the exact float32 values.
+        assert len(seen) == 2
+        for got in seen:
+            assert got.dtype == torch.float64
+            assert torch.equal(got, dt.double())
 
     def test_helper_contract(self):
         from mingru.min_gru import _match_delta_t_dtype
