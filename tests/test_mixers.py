@@ -1370,6 +1370,9 @@ class TestDeltaZeroLength:
         h0 = torch.randn(B, 1, layer.n_heads * layer.d_k * layer.d_v)
         _, h = layer(torch.randn(B, 0, D_IN), h_0=h0, return_state=True)
         assert torch.equal(h, h0)
+        assert h.data_ptr() != h0.data_ptr()
+        h.zero_()
+        assert h0.abs().sum() > 0
 
     @pytest.mark.parametrize("dt_shape", [(B, 0), (B, 0, 1)])
     def test_decay_active_empty(self, dt_shape):

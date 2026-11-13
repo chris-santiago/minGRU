@@ -3523,9 +3523,10 @@ class DeltaMinGRU(DecayMixin, nn.Module):
             H = h_0.reshape(B, self.n_heads, self.d_k, self.d_v)
         if T == 0:
             # Empty sequence: nothing to scan, so no dispatch (and no
-            # MINGRU_SCAN read) happens; the state passes through unchanged.
+            # MINGRU_SCAN read) happens; the state passes through unchanged but
+            # is cloned so, as for T >= 1, it never aliases the caller's h_0.
             y = self.out_proj(x.new_zeros(B, 0, self.n_heads * self.d_v))
-            return (y, H.reshape(*expected)) if return_state else y
+            return (y, H.reshape(*expected).clone()) if return_state else y
         if dt is not None:
             # Decay active: eager-only gated forward (span-sum decay
             # weighting of the same UT solve). Triton is decay-free, so the
