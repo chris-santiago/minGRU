@@ -864,8 +864,11 @@ def _match_delta_t_dtype(delta_t: torch.Tensor | None, module: nn.Module) -> tor
     returned as the same object (no copy), so matching-dtype calls stay
     bit-identical.
 
-    This runs at the caller of the frozen ``_normalize_delta_t`` pipeline
-    (``MinGRUBlock`` and ``DeltaMinGRU``), because that pipeline is frozen.
+    ``module`` must be the one whose decay arithmetic consumes ``delta_t``:
+    ``DeltaMinGRU`` passes itself and ``MinGRUBlock`` passes its mixer, so a
+    block whose norms differ in dtype from its mixer follows the mixer. This
+    runs at the caller of the frozen ``_normalize_delta_t`` pipeline, because
+    that pipeline is frozen.
     The four frozen mixers called directly, outside a block, do not reconcile.
     """
     if delta_t is None:
@@ -3837,7 +3840,7 @@ class MinGRUBlock(nn.Module):
             Time gaps preceding each event, shape ``(B, T)`` or
             ``(B, T, 1)``; forwarded to this block's mixer after dtype
             conversion: any real dtype (float64, integer, bool) is accepted
-            and converted to the dtype of the block's parameters.
+            and converted to the dtype of the block's mixer parameters.
             Required iff the mixer's ``decay`` is enabled — the mixer's
             own pairing contract raises ``ValueError`` otherwise (see
             ``_validate_delta_t_pairing``); this method adds no
@@ -3857,7 +3860,7 @@ class MinGRUBlock(nn.Module):
             If the mixer's ``decay`` is enabled without ``delta_t``, or
             ``delta_t`` is given without decay enabled.
         """
-        delta_t = _match_delta_t_dtype(delta_t, self)
+        delta_t = _match_delta_t_dtype(delta_t, self.mingru)
         if getattr(self.mingru, "carries_matrix_state", False):
             h_seq, state = self.mingru(self.norm1(x), h_0, delta_t, return_state=True)
         else:
@@ -3891,7 +3894,7 @@ class MinGRUBlock(nn.Module):
             Time gap preceding this event, shape ``(B,)`` or ``(B, 1)``;
             forwarded to this block's mixer after dtype conversion (any
             real dtype is accepted and converted to the dtype of the block's
-            parameters). Same required-iff-decay-enabled
+            mixer parameters). Same required-iff-decay-enabled
             contract as ``forward``.
 
         Returns
@@ -3907,7 +3910,7 @@ class MinGRUBlock(nn.Module):
             If the mixer's ``decay`` is enabled without ``delta_t``, or
             ``delta_t`` is given without decay enabled.
         """
-        delta_t = _match_delta_t_dtype(delta_t, self)
+        delta_t = _match_delta_t_dtype(delta_t, self.mingru)
         if getattr(self.mingru, "carries_matrix_state", False):
             y_t, state = self.mingru.step(self.norm1(x_t), h_prev, delta_t)
         else:

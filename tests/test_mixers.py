@@ -1389,6 +1389,31 @@ class TestDeltaTDtypeReconciliation:
         assert seen and all(got.dtype == torch.float32 for got in seen)
         assert all(torch.equal(got, dt) for got in seen)
 
+    @pytest.mark.parametrize("mixer", _DECAY_MIXERS)
+    @pytest.mark.parametrize("entry", ["forward", "step"])
+    def test_block_reconciles_to_mixer_dtype_not_norm_dtype(self, mixer, entry):
+        block = _decay_stack(mixer).blocks[0]
+        block.mingru.to(torch.bfloat16)  # norms stay float32
+        assert next(block.parameters()).dtype == torch.float32
+        seen = []
+        real = getattr(block.mingru, entry)
+
+        def spy(x, state, delta_t, *args, **kwargs):
+            seen.append(delta_t.dtype)
+            return real(x, state, delta_t, *args, **kwargs)
+
+        setattr(block.mingru, entry, spy)
+        x = torch.randn(B, T, D_H)
+        dt = torch.rand(B, T)
+        try:
+            if entry == "forward":
+                block(x, None, dt)
+            else:
+                block.step(x[:, 0], None, dt[:, 0])
+        except (RuntimeError, NotImplementedError):
+            pass  # the mixed-dtype computation itself need not run
+        assert seen == [torch.bfloat16]
+
     def test_pairing_errors_unchanged(self):
         torch.manual_seed(SEED)
         x = torch.randn(B, T, D_IN)
