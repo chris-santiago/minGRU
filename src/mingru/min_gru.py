@@ -117,15 +117,18 @@ _warned_angle_fallback = False
 _warned_delta_fallback = False
 _warned_delta_decay_fallback = False
 
-# DeltaMinGRU chunked-WY kernel: the measured win region for `MINGRU_SCAN=auto`.
+# DeltaMinGRU chunked-WY kernel: the `MINGRU_SCAN=auto` region, extrapolated
+# from one measured L4 cell.
 # Basis (stated here directly; measured on an NVIDIA L4, fwd+bwd medians,
 # B=128, on this file's shipping configuration -- Triton forward trio +
 # torch-composed backward): the kernel beat eager only at long sequences with
 # narrow head dims (triton/eager 0.61 at T=1024/d_k=16), was >= 1.02x eager on
 # every other probed shape, and exceeded eager's peak memory at the T=64
-# shape. That win is measured at a single cell (d_k=16, long T); the region
-# below generalizes it to `d_k` in {4, 8} at long T too (smaller tiles, same
-# structure) -- those cells are an extrapolation, not separately measured. A
+# shape. That win is measured at a single cell (B=128, nh=2, chunk_size=64,
+# d_k=16, T=1024); the region below generalizes it to `d_k` in {4, 8} and to
+# other long T (smaller tiles, same structure), so it is an extrapolation, not
+# a measured region. Batch size, `nh`, and `chunk_size` were not varied at all:
+# only the one cell above carries a measurement. A
 # follow-up experiment that fused the backward into Triton kernels measured
 # 8-12x slower than torch.compile on the same grid (shared-memory tiling
 # destroyed dot efficiency on the 101 KB part) and is reverted in this same
@@ -452,7 +455,9 @@ def _delta_scan_should_try(is_cuda: bool, *, T: int, chunk_size: int, d_k: int) 
     ``_dispatch_delta_scan`` relies on).
 
     Region gate (``auto`` only): even on CUDA, ``auto`` engages the kernel
-    ONLY inside the measured win region -- the sequence spans at least
+    ONLY inside the win region (extrapolated from one measured L4 cell:
+    B=128, nh=2, chunk_size=64, d_k=16, T=1024; batch size, ``nh`` and
+    ``chunk_size`` were not varied) -- the sequence spans at least
     ``_DELTA_AUTO_MIN_T_CHUNKS`` chunks (``T >= _DELTA_AUTO_MIN_T_CHUNKS *
     chunk_size``) AND ``d_k <= _DELTA_AUTO_MAX_DK`` (see those constants'
     comment and experiments/bench/gpu_delta_probe.md). An out-of-region
@@ -2812,10 +2817,15 @@ class DeltaMinGRU(DecayMixin, nn.Module):
     mechanism entirely: state is a per-head ``d_k x d_v``
     associative-memory matrix ``H`` (not a vector), updated by ``nh``
     generalized-Householder rank-1 corrections per token rather than a
-    linear/affine scan. Reimplements Yang et al.'s DeltaNet (``nh=1``)
+    linear/affine scan. Follows Yang et al.'s DeltaNet (``nh=1``)
     and Siems et al.'s DeltaProduct generalization (``nh>1``) as a
-    package citizen, mirroring the parameter layout of the lab's
-    ``DeltaNetMixer`` (``experiments/variants.py``, not imported here)
+    package citizen, with three departures from DeltaNet's published
+    form: ``beta`` lies in ``(0, 2)`` via twice the sigmoid (the option
+    the DeltaProduct paper describes, which allows an exact reflection;
+    DeltaNet uses ``(0, 1)``); the query ``q`` is not normalized; and
+    there is no SiLU feature map on ``q`` and ``k`` (``k`` is only
+    L2-normalized). The parameter layout mirrors the lab's
+    ``DeltaNetMixer`` (``experiments/variants.py``, not imported here),
     so state dicts are relatable across lab and package.
 
     Per head, per token ``t``, in order for micro-step ``j = 1..nh``:
@@ -2956,7 +2966,12 @@ class DeltaMinGRU(DecayMixin, nn.Module):
     hand-written Triton kernel for the forward also exists and is
     dispatch-controlled by ``MINGRU_SCAN`` like the other mixers:
     ``auto`` engages it only in a narrow win region, ``triton`` forces
-    the full kernel envelope, and ``eager`` disables it. See the
+    the full kernel envelope, and ``eager`` disables it. That region is
+    extrapolated from a single measured L4 cell (B=128, ``nh=2``,
+    ``chunk_size=64``, ``d_k=16``, ``T=1024``; see
+    ``experiments/bench/gpu_delta_probe.md``): batch size, ``nh`` and
+    ``chunk_size`` were not varied, so other shapes inside it are not
+    separately measured. See the
     "Givens & Delta" explanation deep dive
     (``docs/explanation/givens-delta.md``) for the measured GPU
     execution-path comparison (chunked-WY eager vs. ``torch.compile``
@@ -2967,8 +2982,9 @@ class DeltaMinGRU(DecayMixin, nn.Module):
     ----------
     Yang et al., "Parallelizing Linear Transformers with the Delta
     Rule over Sequence Length" (DeltaNet), arXiv:2406.06484.
-    Siems et al., "DeltaProduct: Increasing the Expressivity of
-    DeltaNet Through Products of Householders" (DeltaProduct).
+    Siems et al., "DeltaProduct: Improving State-Tracking in Linear
+    RNNs via Householder Products", NeurIPS 2025, arXiv:2502.10297
+    (DeltaProduct).
 
     Examples
     --------
@@ -3535,8 +3551,9 @@ class DeltaMinGRU(DecayMixin, nn.Module):
         """CUDA chunked-WY fast path for ``forward`` (returns ``None`` off-path).
 
         On CUDA under ``MINGRU_SCAN=triton`` (full kernel envelope) or under
-        ``MINGRU_SCAN=auto`` inside the measured win region (long sequences,
-        narrow ``d_k`` -- see ``_delta_scan_should_try``), this assembles the
+        ``MINGRU_SCAN=auto`` inside the win region (long sequences, narrow
+        ``d_k``; extrapolated from one measured L4 cell, see
+        ``_delta_scan_should_try``), this assembles the
         same ``q``/``ks``/``vs``/``betas`` heads ``_coeffs`` produces and
         routes them through the Triton chunked-WY kernel via
         ``_dispatch_delta_scan``, which owns the permute into/out of the
